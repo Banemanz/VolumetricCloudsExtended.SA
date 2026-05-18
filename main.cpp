@@ -22,6 +22,7 @@ namespace {
 
     struct CloudSettings {
         int   targetProcClouds = 160;
+        float badWeatherDensityMultiplier = 1.40f;
         float minSpawnZ = 200.0f;
         float spawnRadiusMin = 1500.0f;
         float spawnRadiusMax = 2200.0f;
@@ -31,6 +32,9 @@ namespace {
         float minSpacing2D = 45.0f;
         float spawnFadeInSpeed = 0.02f;
         float quadFacingMin = 0.20f;
+        float farClipFadeRange = 450.0f;
+        float farClipFadeMargin = 80.0f;
+        float timecycFarClipScale = 1.80f;
         bool  useTimecycTint = true;
         float timecycTintStrength = 1.0f;
         float fluffyCloudBottomBlend = 0.0f;
@@ -122,6 +126,7 @@ namespace {
             return;
         out << "; VolumetricCloudsExtended settings\n";
         out << "TargetProcClouds=" << gCfg.targetProcClouds << "\n";
+        out << "BadWeatherDensityMultiplier=" << gCfg.badWeatherDensityMultiplier << "\n";
         out << "MinSpawnZ=" << gCfg.minSpawnZ << "\n";
         out << "SpawnRadiusMin=" << gCfg.spawnRadiusMin << "\n";
         out << "SpawnRadiusMax=" << gCfg.spawnRadiusMax << "\n";
@@ -131,6 +136,9 @@ namespace {
         out << "MinSpacing2D=" << gCfg.minSpacing2D << "\n";
         out << "SpawnFadeInSpeed=" << gCfg.spawnFadeInSpeed << "\n";
         out << "QuadFacingMin=" << gCfg.quadFacingMin << "\n";
+        out << "FarClipFadeRange=" << gCfg.farClipFadeRange << "\n";
+        out << "FarClipFadeMargin=" << gCfg.farClipFadeMargin << "\n";
+        out << "TimecycFarClipScale=" << gCfg.timecycFarClipScale << "\n";
         out << "UseTimecycTint=" << (gCfg.useTimecycTint ? 1 : 0) << "\n";
         out << "TimecycTintStrength=" << gCfg.timecycTintStrength << "\n";
         out << "FluffyCloudBottomBlend=" << gCfg.fluffyCloudBottomBlend << "\n";
@@ -162,6 +170,7 @@ namespace {
             const float f = (float)atof(val.c_str());
 
             if (key == "TargetProcClouds") gCfg.targetProcClouds = (int)f;
+            else if (key == "BadWeatherDensityMultiplier") gCfg.badWeatherDensityMultiplier = f;
             else if (key == "MinSpawnZ") gCfg.minSpawnZ = f;
             else if (key == "SpawnRadiusMin") gCfg.spawnRadiusMin = f;
             else if (key == "SpawnRadiusMax") gCfg.spawnRadiusMax = f;
@@ -171,6 +180,9 @@ namespace {
             else if (key == "MinSpacing2D") gCfg.minSpacing2D = f;
             else if (key == "SpawnFadeInSpeed") gCfg.spawnFadeInSpeed = f;
             else if (key == "QuadFacingMin") gCfg.quadFacingMin = f;
+            else if (key == "FarClipFadeRange") gCfg.farClipFadeRange = f;
+            else if (key == "FarClipFadeMargin") gCfg.farClipFadeMargin = f;
+            else if (key == "TimecycFarClipScale") gCfg.timecycFarClipScale = f;
             else if (key == "UseTimecycTint") gCfg.useTimecycTint = ParseBool(val);
             else if (key == "TimecycTintStrength" || key == "TimecycleTintStrength") gCfg.timecycTintStrength = f;
             else if (key == "FluffyCloudBottomBlend" || key == "TimecycTintSkyInfluence") gCfg.fluffyCloudBottomBlend = f;
@@ -182,6 +194,8 @@ namespace {
 
         if (gCfg.targetProcClouds < 1) gCfg.targetProcClouds = 1;
         if (gCfg.targetProcClouds > kMaxProcClouds) gCfg.targetProcClouds = kMaxProcClouds;
+        if (gCfg.badWeatherDensityMultiplier < 1.0f) gCfg.badWeatherDensityMultiplier = 1.0f;
+        if (gCfg.badWeatherDensityMultiplier > 3.0f) gCfg.badWeatherDensityMultiplier = 3.0f;
         if (gCfg.spawnRadiusMin < 1.0f) gCfg.spawnRadiusMin = 1.0f;
         if (gCfg.spawnRadiusMax < gCfg.spawnRadiusMin + 1.0f) gCfg.spawnRadiusMax = gCfg.spawnRadiusMin + 1.0f;
         if (gCfg.respawnMaxDist < gCfg.renderMaxDist + 50.0f) gCfg.respawnMaxDist = gCfg.renderMaxDist + 50.0f;
@@ -189,6 +203,11 @@ namespace {
         if (gCfg.spawnFadeInSpeed < 0.001f) gCfg.spawnFadeInSpeed = 0.001f;
         if (gCfg.quadFacingMin < 0.0f) gCfg.quadFacingMin = 0.0f;
         if (gCfg.quadFacingMin > 1.0f) gCfg.quadFacingMin = 1.0f;
+        if (gCfg.farClipFadeRange < 50.0f) gCfg.farClipFadeRange = 50.0f;
+        if (gCfg.farClipFadeMargin < 0.0f) gCfg.farClipFadeMargin = 0.0f;
+        if (gCfg.farClipFadeMargin > 500.0f) gCfg.farClipFadeMargin = 500.0f;
+        if (gCfg.timecycFarClipScale < 1.0f) gCfg.timecycFarClipScale = 1.0f;
+        if (gCfg.timecycFarClipScale > 4.0f) gCfg.timecycFarClipScale = 4.0f;
         if (gCfg.timecycTintStrength < 0.0f) gCfg.timecycTintStrength = 0.0f;
         if (gCfg.timecycTintStrength > 1.0f) gCfg.timecycTintStrength = 1.0f;
         if (gCfg.fluffyCloudBottomBlend < 0.0f) gCfg.fluffyCloudBottomBlend = 0.0f;
@@ -207,6 +226,49 @@ namespace {
 
     static unsigned char LerpU8(int a, int b, float t) {
         return ClampU8((int)((float)a + ((float)b - (float)a) * t + 0.5f));
+    }
+
+
+    static float GetCloudFadeReferenceDistance() {
+        const auto& cc = CTimeCycle::m_CurrentColours;
+
+        // GTA SA 1.0 US CDraw::ms_fLODDistance and CDraw::ms_fFarClipZ.
+        // D3D9 fog/far clip can be shorter than the useful sky/cloud draw range, so prefer
+        // the larger LOD/timecycle-derived distance and only use draw far clip as one input.
+        const float lodDistance = *reinterpret_cast<float*>(0xC3EF98);
+        const float drawFarClip = *reinterpret_cast<float*>(0xC3EF9C);
+        const float timecycFarClip = cc.m_fFarClip * gCfg.timecycFarClipScale;
+
+        float referenceDist = gCfg.renderMaxDist;
+        if (lodDistance > 100.0f)
+            referenceDist = std::max(referenceDist, lodDistance);
+        if (timecycFarClip > 100.0f)
+            referenceDist = std::max(referenceDist, timecycFarClip);
+        if (drawFarClip > 100.0f)
+            referenceDist = std::max(referenceDist, drawFarClip);
+
+        return std::max(300.0f, std::min(referenceDist, gCfg.respawnMaxDist));
+    }
+
+    static void GetDistanceFadeWindow(float& fadeBegin, float& fadeEnd) {
+        const auto& cc = CTimeCycle::m_CurrentColours;
+        const float referenceDist = GetCloudFadeReferenceDistance();
+        const float safeFarEnd = std::max(300.0f, referenceDist - gCfg.farClipFadeMargin);
+        const float cfgEnd = std::min(gCfg.respawnMaxDist, safeFarEnd);
+        const float cfgBegin = std::min(gCfg.renderMaxDist - 120.0f, cfgEnd - gCfg.farClipFadeRange);
+
+        fadeEnd = cfgEnd;
+        fadeBegin = cfgBegin;
+
+        // If the active timecycle fog starts before our normal fade, start fading there.
+        // This prevents D3D9 linear fog from making distant procedural clouds look hard-clipped.
+        if (cc.m_fFogStart > 1.0f && cc.m_fFogStart < fadeEnd)
+            fadeBegin = std::min(fadeBegin, cc.m_fFogStart);
+
+        if (fadeBegin > fadeEnd - 50.0f)
+            fadeBegin = fadeEnd - 50.0f;
+        if (fadeBegin < 50.0f)
+            fadeBegin = 50.0f;
     }
 
     static CloudRenderColour GetTimecycCloudColour() {
@@ -341,6 +403,48 @@ namespace {
         return CVector(v.x * invLen, v.y * invLen, v.z * invLen);
     }
 
+
+    static float Clamp01(float v) {
+        if (v < 0.0f)
+            return 0.0f;
+        if (v > 1.0f)
+            return 1.0f;
+        return v;
+    }
+
+    static bool IsCloudyOrRainyWeather(short weatherType) {
+        switch (weatherType) {
+        case WEATHER_CLOUDY_LA:
+        case WEATHER_CLOUDY_SF:
+        case WEATHER_RAINY_SF:
+        case WEATHER_CLOUDY_VEGAS:
+        case WEATHER_CLOUDY_COUNTRYSIDE:
+        case WEATHER_RAINY_COUNTRYSIDE:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    static int GetTargetProcClouds() {
+        const float interp = Clamp01(CWeather::InterpolationValue);
+        const float oldWeatherWeight = IsCloudyOrRainyWeather(CWeather::OldWeatherType) ? 1.0f - interp : 0.0f;
+        const float newWeatherWeight = IsCloudyOrRainyWeather(CWeather::NewWeatherType) ? interp : 0.0f;
+        float badWeatherFactor = std::max(oldWeatherWeight, newWeatherWeight);
+
+        // Rain is already interpolated by the game, so use it to smoothly increase density
+        // for scripted rain and rainy transitions even when weather IDs lag behind.
+        badWeatherFactor = std::max(badWeatherFactor, Clamp01(CWeather::Rain));
+
+        const float scaledTarget = (float)gCfg.targetProcClouds * (1.0f + (gCfg.badWeatherDensityMultiplier - 1.0f) * badWeatherFactor);
+        int target = (int)(scaledTarget + 0.5f);
+        if (target < 1)
+            target = 1;
+        if (target > kMaxProcClouds)
+            target = kMaxProcClouds;
+        return target;
+    }
+
     static CVector MakeSpawnPos(const CVector& centerPos) {
         const float angle = CGeneral::GetRandomNumberInRange(0.0f, 6.2831853f);
         const float rad = CGeneral::GetRandomNumberInRange(gCfg.spawnRadiusMin, gCfg.spawnRadiusMax);
@@ -403,7 +507,8 @@ namespace {
             gProcClouds[i].textureIndex = 0;
         }
 
-        for (int i = 0; i < gCfg.targetProcClouds; i++) {
+        const int targetClouds = GetTargetProcClouds();
+        for (int i = 0; i < targetClouds; i++) {
             RespawnCloud(gProcClouds[i], gCloudWorldCenter);
         }
 
@@ -420,9 +525,10 @@ namespace {
         EnsureCloudPoolInitialized();
 
         const CVector camPos = TheCamera.GetPosition();
+        const int targetClouds = GetTargetProcClouds();
         if (!gWasOutsideLastFrame) {
             gCloudWorldCenter = camPos;
-            for (int i = 0; i < gCfg.targetProcClouds; i++) {
+            for (int i = 0; i < targetClouds; i++) {
                 RespawnCloud(gProcClouds[i], gCloudWorldCenter);
             }
         }
@@ -461,7 +567,7 @@ namespace {
             }
         }
 
-        for (int i = 0; i < kMaxProcClouds && activeCount < gCfg.targetProcClouds; i++) {
+        for (int i = 0; i < kMaxProcClouds && activeCount < targetClouds; i++) {
             ProcCloud& c = gProcClouds[i];
             if (!c.used) {
                 RespawnCloud(c, gCloudWorldCenter);
@@ -547,8 +653,9 @@ namespace {
         RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERLINEAR);
 
         const CVector camPos = TheCamera.GetPosition();
-        const float fadeOutBeginDist = gCfg.renderMaxDist - 120.0f;
-        const float fadeOutEndDist = gCfg.respawnMaxDist;
+        float fadeOutBeginDist = 0.0f;
+        float fadeOutEndDist = 0.0f;
+        GetDistanceFadeWindow(fadeOutBeginDist, fadeOutEndDist);
         const CloudRenderColour cloudColour = GetTimecycCloudColour();
 
         RenderCloudEntry drawList[kMaxProcClouds];
@@ -571,13 +678,15 @@ namespace {
 
             const float dist = drawList[n].dist;
             const float cloudExtent = std::max(c.size.x, std::max(c.size.y, c.size.z));
-            const float nearDist = std::max(0.0f, dist - cloudExtent);
+            const float farEdgeDist = dist + cloudExtent * 0.65f;
             int cloudAlpha = (int)c.alpha;
-            if (nearDist > fadeOutBeginDist) {
-                if (nearDist > fadeOutEndDist)
+            if (farEdgeDist > fadeOutBeginDist) {
+                if (farEdgeDist > fadeOutEndDist)
                     continue;
-                const float t = (fadeOutEndDist - nearDist) / (fadeOutEndDist - fadeOutBeginDist);
-                const int distAlpha = (int)(std::max(0.0f, t) * cloudAlpha);
+                const float denom = std::max(1.0f, fadeOutEndDist - fadeOutBeginDist);
+                const float t = (fadeOutEndDist - farEdgeDist) / denom;
+                const float smoothT = std::max(0.0f, std::min(1.0f, t));
+                const int distAlpha = (int)(smoothT * smoothT * cloudAlpha);
                 cloudAlpha = std::min(cloudAlpha, distAlpha);
             }
             const float spawnFade = c.fadeIn * c.fadeIn;
