@@ -1,12 +1,15 @@
 #pragma once
 // Standalone D3D9 volume backend, also compiled by the Win32 device test.
-// No RenderWare dependency, shader, or direct pipeline-state getters.
+// No RenderWare dependency, pixel shaders, or direct pipeline-state getters.
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <d3d9.h>
 #include <cstring>
 #include "CloudBanks.hpp"
+#ifdef VC_GPU_VERTEX
+#include "CloudBankVS.hpp"
+#endif
 
 namespace vc::d3d9 {
 struct Result {
@@ -242,11 +245,117 @@ struct StateScope {
     }
     ~StateScope(){restore();}
 };
+// Dynamic streaming avoids a driver-side UP copy; DISCARD lets the driver
+// rename busy buffers rather than stall the CPU waiting for the previous frame.
+struct GpuStream {
+    IDirect3DVertexShader9* shader{};
+    IDirect3DVertexDeclaration9* declaration{};
+    IDirect3DVertexBuffer9* vb{};
+    IDirect3DIndexBuffer9* ib{};
+    bool available() const {return shader&&declaration&&vb&&ib;}
+    void release() {
+        if(vb)vb->Release();if(ib)ib->Release();
+        if(shader)shader->Release();if(declaration)declaration->Release();
+        vb=nullptr;ib=nullptr;shader=nullptr;declaration=nullptr;
+    }
+    ~GpuStream(){release();}
+    bool create(IDirect3DDevice9* d,const D3DCAPS9& caps,DWORD behavior) {
+        release();
+#ifdef VC_GPU_VERTEX
+        if(caps.VertexShaderVersion<D3DVS_VERSION(2,0)||!(behavior&D3DCREATE_HARDWARE_VERTEXPROCESSING))return false;
+        const D3DVERTEXELEMENT9 elements[]={
+            {0,0,D3DDECLTYPE_FLOAT3,D3DDECLMETHOD_DEFAULT,D3DDECLUSAGE_POSITION,0},
+            {0,12,D3DDECLTYPE_FLOAT4,D3DDECLMETHOD_DEFAULT,D3DDECLUSAGE_TEXCOORD,0},
+            D3DDECL_END()
+        };
+        // The FXC header is a BYTE array: copy to aligned DWORD storage.
+        static_assert(sizeof(cloudBankVS)%sizeof(DWORD)==0);
+        std::array<DWORD,sizeof(cloudBankVS)/sizeof(DWORD)> code{};
+        std::memcpy(code.data(),cloudBankVS,sizeof(cloudBankVS));
+        if(SUCCEEDED(d->CreateVertexShader(code.data(),&shader))&&
+           SUCCEEDED(d->CreateVertexDeclaration(elements,&declaration))&&
+           SUCCEEDED(d->CreateVertexBuffer(UINT(banks::MaxVertices*sizeof(banks::GpuVertex)),D3DUSAGE_DYNAMIC|D3DUSAGE_WRITEONLY,0,D3DPOOL_DEFAULT,&vb,nullptr))&&
+           SUCCEEDED(d->CreateIndexBuffer(UINT(banks::MaxVertices/4*6*sizeof(std::uint16_t)),D3DUSAGE_WRITEONLY,D3DFMT_INDEX16,D3DPOOL_DEFAULT,&ib,nullptr))) {
+            // Every patch has the same six indices. The tail of this static
+            // reversed index buffer matches any active vertex count exactly.
+            void* data=nullptr;
+            if(SUCCEEDED(ib->Lock(0,0,&data,0))) {
+                auto* dst=static_cast<std::uint16_t*>(data);
+                for(std::size_t p=banks::MaxVertices/4;p>0;--p) {
+                    const auto i=std::uint16_t((p-1)*4);
+                    const std::uint16_t pattern[]={std::uint16_t(i+2),std::uint16_t(i+3),std::uint16_t(i+1),
+                        std::uint16_t(i+2),std::uint16_t(i+1),i};
+                    std::memcpy(dst,pattern,sizeof(pattern));dst+=6;
+                }
+                if(SUCCEEDED(ib->Unlock()))return true;
+            }
+        }
+        release();
+#else
+        (void)d;(void)caps;(void)behavior;
+#endif
+        return false;
+    }
+    Result upload(const banks::GpuMesh& mesh) {
+        void* data=nullptr;
+        const UINT vbytes=UINT(mesh.vertices.size()*sizeof(banks::GpuVertex));
+        HRESULT hr=vb->Lock(0,vbytes,&data,D3DLOCK_DISCARD);
+        if(FAILED(hr))return failed(hr,"cloud VB lock");
+        std::memcpy(data,mesh.vertices.data(),vbytes);
+        return failed(vb->Unlock(),"cloud VB unlock");
+    }
+};
+struct GpuPasses {
+    GpuStream* stream{};
+    std::array<std::array<float,4>,10> constants{};
+    D3DMATRIX scene{},distant{};
+    D3DVIEWPORT9 viewport{};
+    // Hardware clips both sides of the old far plane with complementary
+    // projections. The distant pass flattens only viewport depth; XY and W
+    // remain identical, so clouds never move and near scene geometry wins.
+    bool prepare(const Settings& s,const View& v,const Range& r,const canopy::Drift& drift,
+                 bool farReady,bool vertexFog,float visibility,RGB color,const D3DMATRIX& transform,
+                 const D3DMATRIX& projection,const D3DVIEWPORT9& vp) {
+        if(std::abs(projection._34-1.f)>.0001f||std::abs(projection._44)>.0001f||
+           projection._33<=1.f||projection._43>=0.f||std::abs(projection._13)>.0001f||std::abs(projection._23)>.0001f)return false;
+        const float farClip=projection._43/(1.f-projection._33);
+        if(!std::isfinite(farClip)||farClip<=0.f)return false;
+        scene=transform;distant=transform;viewport=vp;
+        const float extended=std::max(farClip+100.f,2.f*r.end+farClip);
+        const float a=extended/(extended-farClip),b=-a*farClip;
+        distant._13=a*scene._14;distant._23=a*scene._24;distant._33=a*scene._34;distant._43=a*scene._44+b;
+        const auto tex=banks::textureOrigin(s,v,drift);
+        const auto lod=banks::lod(s,r,farReady,v.pos.z-(s.minSpawnZ+s.maxSpawnZ)*.5f);
+        constants[4]={v.pos.x,v.pos.y,v.pos.z,visibility};
+        constants[5]={1.f/tex.tile,tex.u,tex.v,1.f/tex.band};
+        constants[6]={v.nearClip,1.f/std::max(80.f,s.nearFadeDistance),s.interiorHaze*.22f,s.minSpawnZ};
+        constants[7]={r.end,1.f/(r.end-r.begin),lod.start,lod.end>lod.start?1.f/(lod.end-lod.start):0.f};
+        constants[8]={s.cloudFogStart,s.cloudFogEnd-s.cloudFogStart>1.f?1.f/(s.cloudFogEnd-s.cloudFogStart):0.f,vertexFog?1.f:0.f,0.f};
+        constants[9]={byte(color.r)/255.f,byte(color.g)/255.f,byte(color.b)/255.f,1.f};
+        return true;
+    }
+    Result draw(IDirect3DDevice9* d,UINT count,UINT triangles) {
+        HRESULT hr;
+        if(FAILED(hr=d->SetStreamSource(0,stream->vb,0,sizeof(banks::GpuVertex))))return failed(hr,"cloud stream");
+        if(FAILED(hr=d->SetStreamSourceFreq(0,1)))return failed(hr,"cloud stream frequency");
+        if(FAILED(hr=d->SetIndices(stream->ib)))return failed(hr,"cloud indices");
+        for(int pass=0;pass<2;++pass) {
+            const auto& m=pass?scene:distant;
+            for(int i=0;i<4;++i)constants[i]={m.m[0][i],m.m[1][i],m.m[2][i],m.m[3][i]};
+            if(FAILED(hr=d->SetVertexShaderConstantF(0,constants[0].data(),UINT(constants.size()))))break;
+            auto vp=viewport;if(!pass)vp.MinZ=vp.MaxZ;
+            if(FAILED(hr=d->SetViewport(&vp)))break;
+            if(FAILED(hr=d->DrawIndexedPrimitive(D3DPT_TRIANGLELIST,0,0,count,UINT((banks::MaxVertices-count)/4*6),triangles)))break;
+        }
+        const auto restore=d->SetViewport(&viewport);
+        return FAILED(restore)?failed(restore,"cloud viewport restore"):failed(hr,"hardware cloud draw");
+    }
+};
 inline Result drawRaw(IDirect3DDevice9* d,const std::array<IDirect3DBaseTexture9*,2>& textures,
                    const Options& opts,const void* vertices,UINT count,UINT stride,DWORD fvf,
                    const std::uint16_t* indices,UINT triangles,float coverage,bool fog,
                    bool projected,bool mipmaps,DWORD fogColor,
-                   const D3DMATRIX* view=nullptr,const D3DMATRIX* projection=nullptr,bool ownState=true) {
+                   const D3DMATRIX* view=nullptr,const D3DMATRIX* projection=nullptr,bool ownState=true,GpuPasses* gpu=nullptr) {
     if(!count||!triangles)return {};
     StateScope scoped;
     if(ownState){const auto capture=scoped.capture(d);if(!capture)return capture;}
@@ -261,9 +370,10 @@ inline Result drawRaw(IDirect3DDevice9* d,const std::array<IDirect3DBaseTexture9
     if(!projected)check(d->SetTransform(D3DTS_WORLD,&world),"SetTransform(WORLD)");
     if(view)check(d->SetTransform(D3DTS_VIEW,view),"SetTransform(VIEW)");
     if(projection)check(d->SetTransform(D3DTS_PROJECTION,projection),"SetTransform(PROJECTION)");
-    check(d->SetVertexShader(nullptr),"SetVertexShader");
+    check(d->SetVertexShader(gpu?gpu->stream->shader:nullptr),"SetVertexShader");
     check(d->SetPixelShader(nullptr),"SetPixelShader");
-    check(d->SetFVF(fvf),"SetFVF(clouds)");
+    if(gpu)check(d->SetVertexDeclaration(gpu->stream->declaration),"SetVertexDeclaration");
+    else check(d->SetFVF(fvf),"SetFVF(clouds)");
     rs(D3DRS_LIGHTING,FALSE);rs(D3DRS_SPECULARENABLE,FALSE);
     rs(D3DRS_VERTEXBLEND,D3DVBF_DISABLE);rs(D3DRS_INDEXEDVERTEXBLENDENABLE,FALSE);
     rs(D3DRS_FOGENABLE,fog?TRUE:FALSE);
@@ -313,7 +423,8 @@ inline Result drawRaw(IDirect3DDevice9* d,const std::array<IDirect3DBaseTexture9
     }
     ts(blend?3:1,D3DTSS_COLOROP,D3DTOP_DISABLE);
     ts(blend?3:1,D3DTSS_ALPHAOP,D3DTOP_DISABLE);
-    if(result)check(d->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST,0,count,triangles,
+    if(result&&gpu)result=gpu->draw(d,count,triangles);
+    else if(result)check(d->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST,0,count,triangles,
         indices,D3DFMT_INDEX16,vertices,stride),"DrawIndexedPrimitiveUP");
     const auto restore=scoped.restore();
     // Restore failures are higher priority than draw failures.

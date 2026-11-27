@@ -14,6 +14,7 @@ Actions build. Put it in the game directory (or an ASI-loader-supported mod dire
 The plugin creates `VolumetricCloudsExtended.ini` beside the ASI on first load and
 does not overwrite an existing INI. Restart the game after editing the settings.
 The accompanying log reports whether the executable and call target matched.
+Keep the supplied `VolumetricCloudsExtended.cache` beside the ASI for a fast first launch.
 
 An unrecognized executable or an already redirected volumetric-cloud call is left
 untouched. Other graphics modifications that affect the main camera/RenderWare
@@ -37,7 +38,7 @@ pipeline may still need compatibility testing.
   tops, flatter bases, and soft erosion. The nearby field is sampled by
   fixed-world-axis slice patches with absolute world XYZ texture coordinates.
   Neither rotating nor translating the camera moves the density-sampling
-  planes. 3D rendering begins at 90% of the canopy's height, based on the
+  planes. 3D rendering begins at 85% of the canopy's height, based on the
   actual player or occupied vehicle's Z, not the camera.
   `HybridClouds=0` selects the inexpensive original canopy-only renderer.
 - Frustum rejection, independent mode 2 cloud range, smooth range and near fades,
@@ -57,7 +58,7 @@ old draw and fog distances, and any explicit UseAdditionalTextures setting.
 | Setting | Default | Meaning |
 |---|---:|---|
 | RenderMode | 2 | 2 = continuous volume banks + distant layer; 1 = clustered classic cards; 0 = crossed classic cards |
-| HybridClouds | 1 | Mode 2: canopy below 90% of its height, 3D above; 0 keeps canopy everywhere |
+| HybridClouds | 1 | Mode 2: canopy below 85% of its height, 3D above; 0 keeps canopy everywhere |
 | CumulusDetail | 0 | Economy (recommended); 1 = larger textures and more samples |
 | TargetProcClouds | 160 | Sky coverage in mode 2; classic cloud group count otherwise; 0 disables |
 | BadWeatherDensityMultiplier | 1.4 | Cloud density in bad weather relative to clear (0–3) |
@@ -170,9 +171,10 @@ and [pure-device GetViewport documentation](https://learn.microsoft.com/en-us/wi
   Constant-time periodic occupancy prefix sums reject empty blocks.
   Bricks are ordered back to front in their spatial hierarchy. Intersecting
   planes in the diagonal blend have approximate rather than exact
-  per-pixel ordering. The indexed volume remains one fixed-function
-  draw with existing depth testing, no depth writes, no screen render
-  targets, no shaders. Sparse, nested sampling and interpolated vertex
+  per-pixel ordering. The indexed volume uses fixed-function pixel
+  blending; a tiny optional hardware vertex program handles projection,
+  UV, ray weights, opacity and fog. Existing depth testing, no depth
+  writes, and no screen render targets. Sparse, nested sampling and interpolated vertex
   weights can still cause some residual finite-sampling artifacts; this
   is not per-pixel raymarching.
 - **Range:** CloudDrawDistance now controls actual volume geometry.
@@ -200,9 +202,9 @@ and [pure-device GetViewport documentation](https://learn.microsoft.com/en-us/wi
   cards. Directional blending and slab projection are approximations.
 - **Altitude handover:** the default canopy is at
   `MinSpawnZ + 0.52 * (MaxSpawnZ - MinSpawnZ)` (434m for 200–650m).
-  Below 90% of that height (~390.6m), the canopy is the only active
+  Below 85% of that height (~368.9m), the canopy is the only active
   rendering path: no per-frame bank mesh, volume draw or far card draw.
-  From 90% to 100%, the canopy smoothly fades to a faint distant underlay
+  From 85% to 100%, the canopy smoothly fades to a faint distant underlay
   while 3D opacity fades in (eased per-slice alpha to account for
   accumulated optical depth). Above canopy height the volume stays active;
   descending reverses the same curve. The actual player or occupied
@@ -212,23 +214,28 @@ and [pure-device GetViewport documentation](https://learn.microsoft.com/en-us/wi
   never moves/bends the sheet. Standalone `HybridClouds=0` retains its curve.
   For custom zero/negative canopy heights the blend starts below the
   canopy by at least one unit, avoiding an inverted threshold.
-- **Cost:** one 3D draw, one far billboard batch only when needed, and
-  one or two canopy draws. Source geometry is guarded below 44k vertices
-  for unusual view/configurations. At ground level only canopy draws
-  remain (the density/atlas are still baked once to avoid regenerating
-  during flight). GPU volume/atlas uploads are deferred until required.
-  Economy uses fixed coarse texture samples at long range instead of
-  camera-centred shell intersections. At the reference flight pose the
-  source mesh submits ~7850 triangles and 76 distant cards. In a local
-  180-pose CPU mesh benchmark, the fixed lattice averaged 1.46ms vs
-  1.05ms for shells (7717 vs 8400 mean triangles). That slight CPU
-  increase in flight buys fixed sampling locations; ground rendering
-  skips that expense entirely. GPU fill rate still depends on
-  weather and flight height; no old-GPU benchmark is claimed.
-  Economy GPU texture memory in flight: 4 MiB volume + ~2.67 MiB canopy +
-  2 MiB optional far atlas = ~8.67 MiB (detail ~28.67 MiB),
-  excluding driver overhead. CPU source textures retained for reset.
-  No per-frame texture generation, uploads, or full-screen overlay.
+- **Cost (potato hardware):** mode 2 keeps the identical world-density,
+  sampling lattice, weather, optical weights and far atlas. VS 2.0 hardware
+  vertex processing replaces CPU per-corner square roots, fades, projection
+  and polygon clipping. The ordinary game projection clips near clouds;
+  a complementary cloud-only projection and depth-only viewport range
+  draw clouds beyond the map far plane. Hardware clipping, not a flattened
+  entire triangle, preserves occlusion. Both draw passes reuse one
+  DISCARD-streamed vertex buffer and a static reversed quad index buffer.
+  The canopy and far LOD remain fixed-function. No pixel shader, ray
+  marcher, new render target or additional texture fetch is introduced.
+  Pure/software/unsupported devices have the original CPU path; hardware
+  failures switch to that path rather than disabling 3D. No runtime shader
+  compiler or external DLL is needed (FXC runs at build time).
+  Source geometry is bounded below 44k vertices. At the reference pose
+  roughly 7850 triangles and 76 distant cards are preserved. A same-host
+  480-pose Linux mesh-only benchmark: previous mesh 1.23ms, optimized
+  CPU mesh 1.18ms, GPU-input mesh 0.45ms, all ~7275 triangles average
+  (excludes legacy CPU projection and hardware draw). These are not GTA
+  FPS or Intel HD measurements. The GPU still bears the fill-rate cost
+  of translucent clouds. The fixed-index/stream buffer uses <1.4 MiB.
+  Economy GPU textures are ~8.67 MiB in flight; detail ~28.67 MiB.
+  No per-frame density/texture generation, weather uploads or screen copy.
 - **Compatibility:** the direct D3D9 draw carries actual three-component
   texture coordinates, not a RenderWare 2D atlas. SA's normal pure-device
   mode is accepted. The SA 1.0 US device pointer and camera matrices are
@@ -245,10 +252,21 @@ and [pure-device GetViewport documentation](https://learn.microsoft.com/en-us/wi
   logs submitted fixed slice patch/triangle counts. A one-shot optional asynchronous
   GPU occlusion query records depth-passing samples without waiting.
   Device loss/reset and RW shutdown release owned resources.
-- **Initialization:** the original map and volume are generated once on
-  the game thread. The economy volume bake measured ~0.18 s in local Linux
-  release tests (plus canopy generation/upload); high detail takes longer.
-  First-use hitch is possible, unlike the old gradual atlas bake.
+- **Initialization / disk schematic:** `VolumetricCloudsExtended.cache`
+  stores the two exact canopy masks, complete two-endpoint RGBA volume,
+  conservative occupancy tables and the optional far atlas. The default
+  economy file is 8,432,196 bytes (~8.04 MiB). The release ZIP includes a
+  pre-baked default cache. Keep it beside the ASI. At startup the ASI checks
+  the format version, relevant bake settings, fixed expected lengths and
+  checksum; missing, stale or corrupted files rebuild automatically.
+  Replacement is atomic; an unwritable folder simply uses generated data.
+  No per-frame disk traffic, no cache writes on weather transitions, and
+  no need for world-sized files: the immutable periodic schematic repeats
+  seamlessly, with live wind UV offsets and live weather blending.
+  A local run baked the default data in 919ms and reopened it in 29ms
+  (warm filesystem cache, not a physical HDD benchmark).
+  Deleting the cache is safe; the exact same procedural field is rebuilt.
+  GPU texture transfers remain deferred until first flight.
 
 The target is convincing 2013-era cloud volumes at 2004-game budgets,
 not a recreation of Rockstar assets or renderer. References:
@@ -259,8 +277,16 @@ not a recreation of Rockstar assets or renderer. References:
 (weather mask, vertical profile, erosion), and
 [Project V Atmosphere](https://github.com/rsrodev/ProjectVAtmosphere)
 (reference for modern volume costs, not copied code or architecture).
-A future optional simple shader could combine density integration and
-lighting in fewer passes; it is not required in this iteration.
+Additional historical references:
+[Mark Harris, Real-Time Cloud Rendering for Games (GDC 2002)](https://markmark.net/PDFs/RTCloudsForGames_HarrisGDC2002.pdf)
+(impostors to amortize fill rate),
+[SkyX geometry blocks](https://osrf-distributions.s3.amazonaws.com/gazebo/api/4.0.0/GeometryBlock_8h_source.html)
+(spatial subdivision),
+[Direct3D 9 dynamic-buffer performance](https://learn.microsoft.com/en-us/windows/win32/direct3d9/performance-optimizations),
+[vertex fog](https://learn.microsoft.com/en-us/windows/win32/direct3d9/vertex-fog),
+and [viewport and clipping](https://learn.microsoft.com/en-us/windows/win32/direct3d9/viewports-and-clipping).
+The new vertex shader intentionally preserves the existing volumetric look
+instead of adding an expensive pixel-based lighting model.
 
 ### Native weather synchronization
 
@@ -305,7 +331,7 @@ send the new log lines including HRESULT, not only the canopy screenshot.
 
 ### Linux software diagnostics — density/mesh only
 
-| Below 90% canopy height | Mid-handover (412m) |
+| Below 85% canopy height | Mid-handover (412m) |
 |---|---|
 | ![Canopy on the ground](docs/previews/banks_ground.jpg) | ![Entry](docs/previews/banks_entry.jpg) |
 | ![Flight](docs/previews/banks_flight.jpg) | ![Above](docs/previews/banks_above.jpg) |

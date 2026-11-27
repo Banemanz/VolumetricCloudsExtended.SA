@@ -1,5 +1,6 @@
 #pragma once
 #include "Canopy.hpp"
+#include <type_traits>
 
 // Continuous world-space density sampled on fixed world-axis lattices.
 // Camera motion never translates or rotates the sampling planes.
@@ -18,6 +19,17 @@ constexpr std::size_t OccupancyPrefixCount=OccupancySpan*OccupancySpan*(Occupanc
 constexpr float ReferenceStep=90.f; // opacity baked for this path length
 struct Vertex {Vec pos;float u{},v{},w{},alpha{},fog{1.f};};
 struct Mesh {std::vector<Vertex> vertices;std::vector<std::uint16_t> indices;int slices{};};
+// Four corner positions and lattice attributes, no per-frame CPU lighting,
+// UV, fog, opacity or projection. A VS2 program computes the same equations.
+struct GpuVertex {Vec pos;float axis,step,even,fourth;};
+static_assert(sizeof(GpuVertex)==28);
+struct GpuMesh {std::vector<GpuVertex> vertices;std::vector<std::uint16_t> indices;int slices{};};
+struct TextureOrigin {float u,v,tile,band;};
+inline TextureOrigin textureOrigin(const Settings& s,const View& v,const canopy::Drift& drift) {
+    const float tile=canopy::tileWorldSize(s);
+    return {float(drift.x+std::floor(double(v.pos.x)/tile-drift.x)),
+        float(drift.y+std::floor(double(v.pos.y)/tile-drift.y)),tile,s.maxSpawnZ-s.minSpawnZ};
+}
 struct Lod {
     float start{},end{};
     float billboard(float d) const {return end>start?smooth((d-start)/(end-start)):0.f;}
@@ -267,7 +279,8 @@ inline bool axisPossible(const Brick& b,Vec eye,int axis) {
     }
     return maxAxis>=highestMin*.80f;
 }
-inline void buildMesh(Mesh& m,const Settings& s,const View& view,const Range& r,
+template<class MeshType>
+inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range& r,
                       const canopy::Drift& drift,float wx,float wy,const Volume* volume=nullptr,
                       float weather=0.f,bool billboardAvailable=true) {
     m.vertices.clear();m.indices.clear();m.slices=0;
@@ -279,17 +292,28 @@ inline void buildMesh(Mesh& m,const Settings& s,const View& view,const Range& r,
     const float base=s.cumulusDetail?16.f:20.f;
     const int nz=std::max(4,int(std::ceil(band/(base*4.f)))*4);
     const Vec step{base,base,band/nz},origin{0,0,s.minSpawnZ};
-    const float brickSize=BrickSteps*base,tile=canopy::tileWorldSize(s);
-    // Keep the texture coordinate origin near the camera for precision,
-    // but only subtract whole periods. The field does not move.
-    const float uOffset=float(drift.x+std::floor(double(view.pos.x)/tile-drift.x)),
-                vOffset=float(drift.y+std::floor(double(view.pos.y)/tile-drift.y));
+    const float brickSize=BrickSteps*base;
+    const auto tex=textureOrigin(s,view,drift);
+    const float tile=tex.tile,uOffset=tex.u,vOffset=tex.v;
     const auto occupied=[&](Vec lo,Vec hi) {
         return !volume||volume->potentiallyOccupied(lo.x/tile-uOffset,lo.y/tile-vOffset,(lo.z-origin.z)/band,
             hi.x/tile-uOffset,hi.y/tile-vOffset,(hi.z-origin.z)/band,weather);
     };
-    std::vector<Brick> bricks,parents;
-    bricks.reserve(512);parents.reserve(384);
+    const std::array<Vec,5> planes{view.forward,view.forward*wx+view.right,view.forward*wx-view.right,
+        view.forward*wy+view.up,view.forward*wy-view.up};
+    std::array<Vec,5> absPlanes{};
+    for(int i=0;i<5;++i)absPlanes[i]={std::abs(planes[i].x),std::abs(planes[i].y),std::abs(planes[i].z)};
+    const auto inView=[&](const Brick& b){
+        const Vec center=(b.lo+b.hi)*.5f-view.pos,half=(b.hi-b.lo)*.5f;
+        for(int i=0;i<5;++i)if(dot(center,planes[i])+dot(half,absPlanes[i])<-.02f)return false;
+        return true;
+    };
+    // Reuse scratch allocations on the render thread, including on the
+    // legacy backend. No per-frame allocation after the peak capacity.
+    static thread_local std::vector<Brick> bricks,parents;
+    bricks.clear();parents.clear();
+    if(bricks.capacity()<512)bricks.reserve(512);
+    if(parents.capacity()<384)parents.reserve(384);
     const auto closer=[](const Brick& a,const Brick& b) {
         return a.nearest!=b.nearest?a.nearest<b.nearest:a.first<b.first;
     };
@@ -297,7 +321,7 @@ inline void buildMesh(Mesh& m,const Settings& s,const View& view,const Range& r,
     // sides of subdivision. The smaller patches resolve angular weighting
     // and fog accurately where they subtend a large screen area.
     const auto collect=[&](auto&& self,Brick b)->void {
-        if(b.nearest>=levels.end*levels.end||!visible(b,view,wx,wy)||!occupied(b.lo,b.hi))return;
+        if(b.nearest>=levels.end*levels.end||!inView(b)||!occupied(b.lo,b.hi))return;
         const int n=std::max({b.last[0]-b.first[0],b.last[1]-b.first[1],b.last[2]-b.first[2]});
         const int axes=int(axisPossible(b,view.pos,0))+int(axisPossible(b,view.pos,1))+int(axisPossible(b,view.pos,2));
         // Diagonal views need finer patches so alpha interpolation doesn't
@@ -324,19 +348,24 @@ inline void buildMesh(Mesh& m,const Settings& s,const View& view,const Range& r,
     const int y0=int(std::floor((view.pos.y-levels.end)/brickSize)),y1=int(std::floor((view.pos.y+levels.end)/brickSize));
     for(int y=y0;y<=y1;++y)for(int x=x0;x<=x1;++x)for(int z=0;z<nz;z+=BrickSteps/2) {
         const auto b=bounds({x*BrickSteps,y*BrickSteps,z},{(x+1)*BrickSteps,(y+1)*BrickSteps,std::min(z+BrickSteps/2,nz)},step,origin,view.pos);
-        if(b.nearest<levels.end*levels.end&&visible(b,view,wx,wy))parents.push_back(b);
+        if(b.nearest<levels.end*levels.end&&inView(b))parents.push_back(b);
     }
     // Sibling grid boxes along a shared ray have a monotonic nearest bound.
     // Sorting siblings recursively keeps whole spatial cells in order.
     // Only intersecting planes inside the diagonal crossfade are approximate.
     std::sort(parents.begin(),parents.end(),closer);
     for(const auto& b:parents)collect(collect,b);
-    struct Patch {std::array<Vertex,4> vertices;float depth;int order;};
-    std::vector<Patch> patches;patches.reserve(96);
+    using OutputVertex=typename decltype(m.vertices)::value_type;
+    constexpr bool gpu=std::is_same_v<OutputVertex,GpuVertex>;
+    // Sort small patch keys instead of moving 4 vertices repeatedly.
+    struct Patch {std::array<OutputVertex,4> vertices;float depth;int order;};
+    static thread_local std::vector<Patch> patches;
+    static thread_local std::vector<std::size_t> order;
+    if(patches.capacity()<96)patches.reserve(96);
+    if(order.capacity()<96)order.reserve(96);
     for(const auto& b:bricks) {
-        patches.clear();
-        const float minDist=std::sqrt(b.nearest);
-        const int stride=minDist>=1300.f?4:minDist>=440.f?2:1;
+        patches.clear();order.clear();
+        const int stride=b.nearest>=1300.f*1300.f?4:b.nearest>=440.f*440.f?2:1;
         for(int a=0;a<3;++a) {
             if(!axisPossible(b,view.pos,a))continue;
             const int j=(a+1)%3,k=(a+2)%3;
@@ -355,19 +384,44 @@ inline void buildMesh(Mesh& m,const Settings& s,const View& view,const Range& r,
                     if(q&1)setComponent(p,j,component(hi,j));
                     if(q&2)setComponent(p,k,component(hi,k));
                     const Vec delta=p-view.pos;
-                    const float d=length(delta),w=component(axisWeights(delta),a);
-                    const float cosine=std::abs(component(delta,a))/std::max(d,.001f);
-                    const float path=planeWeight(i,component(step,a),d)/std::max(cosine,.4f);
-                    const float nearWeight=smooth((d-8.f)/24.f)*mix(smooth((d-view.nearClip)/std::max(80.f,s.nearFadeDistance)),1.f,s.interiorHaze*.22f);
-                    const float alpha=sat(path*w/ReferenceStep)*rangeWeight(r,d)*levels.volume(d)*nearWeight;
-                    patch.vertices[q]={p,p.x/tile-uOffset,p.y/tile-vOffset,(p.z-origin.z)/band,alpha,cloudFogFactor(s,d)};
-                    any|=alpha>0.f;
+                    if constexpr(gpu) {
+                        // Reject exactly-zero contributions without computing
+                        // square roots, cubic fades, path lengths or UVs.
+                        const float axisDistance=std::abs(component(delta,a));
+                        const float maxDistance=std::max({std::abs(delta.x),std::abs(delta.y),std::abs(delta.z),.001f});
+                        const float d2=dot(delta,delta);
+                        const float limit=i%4==0?levels.end:i%2==0?std::min(levels.end,1300.f):std::min(levels.end,440.f);
+                        if(axisDistance>.80f*maxDistance&&d2<limit*limit&&d2>64.f) {
+                            // Smoothstep rounds to exactly one just before the
+                            // mathematical endpoint. Preserve the CPU path's
+                            // exact zero classification at those boundaries.
+                            if(d2>=limit*limit*.998f||axisDistance<.80001f*maxDistance||
+                               (s.interiorHaze==0.f&&d2<=view.nearClip*view.nearClip)) {
+                                const float d=length(delta);
+                                any|=component(axisWeights(delta),a)>0.f&&planeWeight(i,component(step,a),d)>0.f&&
+                                    rangeWeight(r,d)>0.f&&levels.volume(d)>0.f&&
+                                    smooth((d-8.f)/24.f)*mix(smooth((d-view.nearClip)/std::max(80.f,s.nearFadeDistance)),1.f,s.interiorHaze*.22f)>0.f;
+                            } else any=true;
+                        }
+                        patch.vertices[q]={p,float(a),component(step,a),i%2==0?1.f:0.f,i%4==0?1.f:0.f};
+                    } else {
+                        const float d=length(delta),w=component(axisWeights(delta),a);
+                        const float cosine=std::abs(component(delta,a))/std::max(d,.001f);
+                        const float path=planeWeight(i,component(step,a),d)/std::max(cosine,.4f);
+                        const float nearWeight=smooth((d-8.f)/24.f)*mix(smooth((d-view.nearClip)/std::max(80.f,s.nearFadeDistance)),1.f,s.interiorHaze*.22f);
+                        const float alpha=sat(path*w/ReferenceStep)*rangeWeight(r,d)*levels.volume(d)*nearWeight;
+                        patch.vertices[q]={p,p.x/tile-uOffset,p.y/tile-vOffset,(p.z-origin.z)/band,alpha,cloudFogFactor(s,d)};
+                        any|=alpha>0.f;
+                    }
                 }
-                if(any)patches.push_back(patch);
+                if(any){order.push_back(patches.size());patches.push_back(patch);}
             }
         }
-        std::sort(patches.begin(),patches.end(),[](const Patch& a,const Patch& b){return a.depth!=b.depth?a.depth<b.depth:a.order<b.order;});
-        for(const auto& p:patches) {
+        std::sort(order.begin(),order.end(),[&](std::size_t i,std::size_t j){
+            const auto& a=patches[i];const auto& b=patches[j];return a.depth!=b.depth?a.depth<b.depth:a.order<b.order;
+        });
+        for(const auto index:order) {
+            const auto& p=patches[index];
             if(m.vertices.size()+4>MaxVertices)break;
             const auto i=std::uint16_t(m.vertices.size());
             m.vertices.insert(m.vertices.end(),p.vertices.begin(),p.vertices.end());

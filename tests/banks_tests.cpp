@@ -176,6 +176,16 @@ int main() {
         previousWeights=w;
     }
     std::cout<<"PASS: fixed world intersections during translation, continuous diagonal axis and distance LOD weights\n";
+    banks::GpuMesh hardware;
+    for(float h:{370.f,450.f,575.f,800.f})for(float w:{0.f,.5f,1.f}) {
+        auto test=flight;test.pos.z=h;
+        banks::buildMesh(raw,s,test,r,wind,.94f,.53f,&b,w);
+        banks::buildMesh(hardware,s,test,r,wind,.94f,.53f,&b,w);
+        CHECK(hardware.indices==raw.indices&&hardware.vertices.size()==raw.vertices.size());
+        for(std::size_t i=0;i<raw.vertices.size();++i)CHECK(length(hardware.vertices[i].pos-raw.vertices[i].pos)<.0001f);
+    }
+    std::cout<<"PASS: CPU and hardware source lattice and order are identical in 12 altitude/weather combinations\n";
+
     // Range must actually control volumetric geometry, not just the canopy.
     const auto farthest=[&](const banks::Mesh& mesh) {
         float d=0;for(const auto& p:mesh.vertices)if(p.alpha>0.f)d=std::max(d,length(p.pos-flight.pos));return d;

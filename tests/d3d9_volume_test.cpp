@@ -199,6 +199,12 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
     const float wx=.94f,wy=.53f;
     const Vec forward=unit(Vec{.96f,-.27f,-.17f});
     const Vec right=unit(cross(forward,{0,0,1})),up=cross(right,forward);
+    d3d9::GpuStream hw;
+#ifdef VC_GPU_VERTEX
+    const bool expectHardware=caps.VertexShaderVersion>=D3DVS_VERSION(2,0)&&
+        (creation.BehaviorFlags&D3DCREATE_HARDWARE_VERTEXPROCESSING);
+    if(expectHardware&&!hw.create(device,caps,creation.BehaviorFlags))return fail("VS2 hardware stream creation");
+#endif
     for(const Vec pos:{Vec{2164,-1265,673},Vec{2255,-1341,672.7f},Vec{2266,-1271,490}}) {
         View camera{pos,right,up,forward,450,1};
         auto view=d3d9::identity();
@@ -209,15 +215,18 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
         projection._11=1.f/wx;projection._22=1.f/wy;
         projection._33=camera.farClip/(camera.farClip-camera.nearClip);
         projection._34=1;projection._43=-camera.nearClip*projection._33;
+        const float coverage=opts.dual?(pos.z<500?1.f:pos.x>2200?.5f:0.f):0.f;
         banks::Mesh mesh;banks::buildMesh(mesh,settings,camera,cloudRange(settings),{},wx,wy,
-            uploadWidth==volume.width&&uploadDepth==volume.depth?&volume:nullptr,0);
+            uploadWidth==volume.width&&uploadDepth==volume.depth?&volume:nullptr,coverage);
         if(mesh.indices.empty())return fail("No occupied 3D geometry in flight view");
         d3d9::ProjectedMesh batch;const auto matrix=d3d9::multiply(view,projection);
-        for(const auto& v:mesh.vertices)batch.clip.push_back(d3d9::clipVertex(v.pos,v.u,v.v,v.w,v.alpha,v.fog,matrix));
+        for(const auto& v:mesh.vertices)batch.clip.push_back(d3d9::clipVertex(v.pos,v.u,v.v,v.w,v.alpha*(opts.vertexFog?1.f:v.fog),v.fog,matrix));
         d3d9::projectMesh(batch,viewport,{208,208,208},1.f,mesh.indices.data(),mesh.indices.size());
         if(FAILED(hr=device->Clear(0,nullptr,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER,0xFF000000,1.f,0)))return fail("Scene Clear",hr);
+        const D3DRECT sentinel{0,0,LONG(desc.Width/4),LONG(desc.Height/4)};
+        if(FAILED(hr=device->Clear(1,&sentinel,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER,0xFF008000,.5f,0)))return fail("Scene occlusion sentinel",hr);
         if(FAILED(hr=device->BeginScene()))return fail("Scene BeginScene",hr);
-        const auto result=d3d9::drawProjected(device,{textures[0],textures[1]},opts,batch,0,true,{90,120,160});
+        const auto result=d3d9::drawProjected(device,{textures[0],textures[1]},opts,batch,coverage,true,{90,120,160});
         const auto end=device->EndScene();
         if(!result)return fail(result.operation,result.hr);
         if(FAILED(end))return fail("Scene EndScene",end);
@@ -225,9 +234,11 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
         D3DLOCKED_RECT lock{};
         if(FAILED(hr=readback->LockRect(&lock,nullptr,D3DLOCK_READONLY)))return fail("Scene LockRect",hr);
         unsigned visible=0,empty=0,peak=0;
+        std::vector<DWORD> reference(std::size_t(desc.Width)*desc.Height);
         for(UINT y=0;y<desc.Height;++y)for(UINT x=0;x<desc.Width;++x) {
             DWORD colour=0;
             std::memcpy(&colour,static_cast<const char*>(lock.pBits)+std::size_t(y)*lock.Pitch+x*sizeof(DWORD),sizeof(DWORD));
+            reference[std::size_t(y)*desc.Width+x]=colour;
             const unsigned value=colour&255;
             visible+=value>8;empty+=value<=2;peak=std::max(peak,value);
         }
@@ -236,6 +247,42 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
             pos.x,pos.y,pos.z,mesh.slices,visible,empty,peak);
         if(visible<desc.Width*desc.Height/64 || (pos.z>settings.maxSpawnZ&&empty<desc.Width*desc.Height/64) || peak<25 || peak>209)
             return fail("Flight scene readback has no cloud/sky contrast");
+        if(hw.available()) {
+            banks::GpuMesh gm;banks::buildMesh(gm,settings,camera,cloudRange(settings),{},wx,wy,
+                uploadWidth==volume.width&&uploadDepth==volume.depth?&volume:nullptr,coverage);
+            if(gm.indices!=mesh.indices||gm.vertices.size()!=mesh.vertices.size())return fail("Hardware and CPU source geometry differ");
+            for(std::size_t i=0;i<mesh.vertices.size();++i)
+                if(length(gm.vertices[i].pos-mesh.vertices[i].pos)>.001f)return fail("Hardware and CPU world lattice differs");
+            d3d9::GpuPasses passes;passes.stream=&hw;
+            if(!passes.prepare(settings,camera,cloudRange(settings),{},true,opts.vertexFog,1,{208,208,208},matrix,projection,viewport))
+                return fail("Hardware projection setup");
+            const auto upload=hw.upload(gm);if(!upload)return fail(upload.operation,upload.hr);
+            if(FAILED(hr=device->Clear(0,nullptr,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER,0xFF000000,1.f,0)))return fail("HW scene clear",hr);
+            if(FAILED(hr=device->Clear(1,&sentinel,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER,0xFF008000,.5f,0)))return fail("HW occlusion sentinel",hr);
+            if(FAILED(hr=device->BeginScene()))return fail("HW scene begin",hr);
+            const auto draw=d3d9::drawRaw(device,{textures[0],textures[1]},opts,gm.vertices.data(),UINT(gm.vertices.size()),
+                sizeof(banks::GpuVertex),0,gm.indices.data(),UINT(gm.indices.size()/3),coverage,opts.vertexFog,true,false,
+                D3DCOLOR_XRGB(90,120,160),nullptr,nullptr,true,&passes);
+            if(FAILED(hr=device->EndScene()))return fail("HW scene end",hr);
+            if(!draw)return fail(draw.operation,draw.hr);
+            if(FAILED(hr=device->GetRenderTargetData(back.p,readback.p)))return fail("HW readback",hr);
+            if(FAILED(hr=readback->LockRect(&lock,nullptr,D3DLOCK_READONLY)))return fail("HW lock",hr);
+            std::uint64_t error=0;unsigned large=0;
+            for(UINT y=0;y<desc.Height;++y)for(UINT x=0;x<desc.Width;++x) {
+                DWORD colour=0;std::memcpy(&colour,static_cast<const char*>(lock.pBits)+std::size_t(y)*lock.Pitch+x*4,4);
+                const auto old=reference[std::size_t(y)*desc.Width+x];
+                if(x<desc.Width/4&&y<desc.Height/4&&(colour&0xFFFFFF)!=(old&0xFFFFFF)){
+                    readback->UnlockRect();return fail("Hardware path leaked past foreground sentinel");
+                }
+                int maxError=0;
+                for(int shift:{0,8,16}){const int diff=std::abs(int((colour>>shift)&255)-int((old>>shift)&255));error+=diff;maxError=std::max(maxError,diff);}
+                large+=maxError>24;
+            }
+            readback->UnlockRect();
+            const float mean=float(error)/(3*desc.Width*desc.Height);
+            std::printf("Hardware vertex readback: mean RGB error %.3f /255, %u pixels with >24 error\n",mean,large);
+            if(mean>6.f||large>desc.Width*desc.Height/12)return fail("Hardware vertex visual parity");
+        }
     }
     // Test the actual distant atlas + projected card pipeline on the pure
     // device, with far fog and weather blending. Only geometry beyond the

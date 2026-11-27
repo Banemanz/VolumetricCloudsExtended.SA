@@ -6,3 +6,4 @@
 *.zip
 *.log
 VolumetricCloudsExtended.ini
+VolumetricCloudsExtended.cache*

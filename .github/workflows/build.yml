@@ -60,6 +60,8 @@ jobs:
           Copy-Item build/Release/VolumetricCloudsExtended.pdb dist/
           Copy-Item README.md dist/
           Copy-Item VolumetricCloudsExtended.defaults.ini dist/
+          & build/Release/cloud_bake_cache.exe dist/VolumetricCloudsExtended.cache
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Copy-Item 'new chat' dist/ -Recurse
           Copy-Item docs dist/ -Recurse
           Compress-Archive -Path dist/* -DestinationPath VolumetricCloudsExtended.SA-Win32.zip

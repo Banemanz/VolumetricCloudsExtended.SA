@@ -86,8 +86,8 @@ int main() {
     for(float offset:{100.f,500.f,2000.f}) {
         auto elevated=s;elevated.minSpawnZ+=offset;elevated.maxSpawnZ+=offset;
         const float canopyZ=altitude(elevated);
-        CHECK(handover(elevated,canopyZ*.90f-.01f)==0.f);
-        CHECK(std::abs(handover(elevated,canopyZ*.95f)-.5f)<.0001f);
+        CHECK(handover(elevated,canopyZ*HandoverRatio-.01f)==0.f);
+        CHECK(std::abs(handover(elevated,canopyZ*(1.f+HandoverRatio)*.5f)-.5f)<.0001f);
         CHECK(handover(elevated,canopyZ)==1.f);
     }
     auto hybridSettings=s;hybridSettings.hybridClouds=true;

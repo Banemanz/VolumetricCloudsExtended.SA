@@ -14,6 +14,7 @@
 #include "common.h"
 #include "CloudD3D9.hpp"
 #include "CloudBillboards.hpp"
+#include "CloudCache.hpp"
 #include <cstdio>
 #include <new>
 
@@ -49,6 +50,8 @@ bool canopyAttempted=false,canopyUploadFailed=false;
 unsigned int lastFrame = 0;
 vc::banks::Volume bankVolume;
 vc::banks::Mesh bankMesh;
+vc::banks::GpuMesh bankGpuMesh;
+vc::d3d9::GpuStream bankGpu;
 std::array<IDirect3DVolumeTexture9*,2> bankTextures{};
 IDirect3DDevice9* bankDevice=nullptr; // borrowed
 bool bankFailed=false,bankPrepared=false,bankDrawLogged=false,bankEmptyLogged=false;
@@ -62,6 +65,7 @@ IDirect3DDevice9* CurrentD3DDevice() {
     return *reinterpret_cast<IDirect3DDevice9**>(0xC97C28);
 }
 void ReleaseBankTextures() {
+    bankGpu.release();
     if(bankPixelQuery){bankPixelQuery->Release();bankPixelQuery=nullptr;}
     bankPixelQueryAttempted=false;bankQueryFrames=0;bankDownsampled=false;
     for(auto& texture:bankTextures) {
@@ -74,7 +78,7 @@ void ReleaseBankTextures() {
 }
 void ReleaseBanks() {
     ReleaseBankTextures();
-    bankVolume={};bankMesh={};bankProjected={};bankPrepared=false;
+    bankVolume={};bankMesh={};bankGpuMesh={};bankProjected={};bankPrepared=false;
     billboardAtlas={};billboardMesh={};billboardProjected={};billboardPrepared=false;
 }
 
@@ -129,8 +133,19 @@ bool EnsureCanopy() {
     if(canopyTextures[0]&&canopyTextures[1])return true;
     if(!canopyAttempted) {
         canopyAttempted=true;
+        const auto cachePath=ModulePath()/L"VolumetricCloudsExtended.cache";
         const auto build=[&](int size) {
             try {
+                bool cached=false;
+                {
+                    std::ifstream in(cachePath,std::ios::binary);
+                    if(in)cached=vc::cache::load(in,settings,size,canopyPixels,bankVolume,billboardAtlas);
+                }
+                if(cached) {
+                    bankPrepared=settings.hybridClouds;
+                    billboardPrepared=bankPrepared&&vc::billboards::eligible(settings,vc::cloudRange(settings));
+                    Log("Cloud schematic cache hit (static masks, volume, occupancy and far atlas).");
+                } else {
                 vc::canopy::Map map;map.build(size,std::uint32_t(settings.seed));
                 map.shadeWeatherLayers(settings);
                 if(settings.hybridClouds) {
@@ -143,6 +158,21 @@ bool EnsureCanopy() {
                     catch(const std::bad_alloc&) {ReleaseBanks();bankFailed=true;Log("3D density allocation failed; using canopy.");}
                 }
                 canopyPixels[0]=std::move(map.pixels);canopyPixels[1]=std::move(map.extraPixels);
+                // Never publish partially generated data or replace an existing
+                // valid cache unless the complete replacement was written.
+                if(!settings.hybridClouds||(bankPrepared&&(!vc::billboards::eligible(settings,vc::cloudRange(settings))||billboardPrepared))) {
+                    auto tmp=cachePath;tmp+=L".tmp."+std::to_wstring(GetCurrentProcessId());
+                    bool written=false;
+                    {
+                        std::ofstream out(tmp,std::ios::binary|std::ios::trunc);
+                        if(out)written=vc::cache::save(out,settings,size,canopyPixels,bankVolume,billboardAtlas);
+                        out.close();written=written&&bool(out);
+                    }
+                    if(written&&MoveFileExW(tmp.c_str(),cachePath.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH))
+                        Log("Cloud schematic baked once and cached on disk.");
+                    else {std::error_code ec;std::filesystem::remove(tmp,ec);}
+                }
+                }
                 canopySize=size;
                 for(int i=0;i<2;++i)canopyHasPixels[i]=std::any_of(canopyPixels[i].begin(),canopyPixels[i].end(),[](const auto& p){return p.a!=0;});
                 return true;
@@ -151,7 +181,7 @@ bool EnsureCanopy() {
         const int requested=vc::canopy::textureSize(settings);
         canopyReady=build(requested);
         if(!canopyReady&&requested!=vc::canopy::EconomySize)canopyReady=build(vc::canopy::EconomySize);
-        if(canopyReady)Log("Canopy: static weather masks generated (live coverage).");
+        if(canopyReady)Log("Canopy: static weather masks ready (live coverage).");
     }
     if(!canopyReady)return false;
     D3DCAPS9 caps{};
@@ -238,8 +268,10 @@ bool EnsureBanks() {
         }
         if(ready) {
             bankDownsampled=w!=UINT(bankVolume.width)||d!=UINT(bankVolume.depth);
-            std::snprintf(info,sizeof(info),"3D cloud bank ready: %lux%lux%lu RGBA volumes, shader-free, %s weather, %s filtering.",
+            const bool gpu=bankGpu.create(device,caps,creation.BehaviorFlags);
+            std::snprintf(info,sizeof(info),"3D cloud bank ready: %lux%lux%lu RGBA volumes, %s, %s weather, %s filtering.",
                 static_cast<unsigned long>(w),static_cast<unsigned long>(w),static_cast<unsigned long>(d),
+                gpu?"hardware vertex / fixed-function pixels":"CPU vertex / fixed-function pixels",
                 bankOptions.dual?"interpolated":"endpoint",bankOptions.filter==D3DTEXF_LINEAR?"linear":"point");
             Log(info);return true;
         }
@@ -440,7 +472,7 @@ bool DrawBillboards(const vc::View& view,const vc::Range& range,const vc::weathe
 }
 bool DrawBanks(RwCamera* camera,const vc::View& view,const vc::Range& range,
                const vc::weather::State& climate,const vc::canopy::Light& light,
-               const D3DMATRIX& transform,const D3DVIEWPORT9& viewport,vc::RGB fog,float handover,float playerZ) {
+               const D3DMATRIX& transform,const D3DMATRIX& projection,const D3DVIEWPORT9& viewport,vc::RGB fog,float handover,float playerZ) {
     if(!bankDevice||!bankTextures[0]||!bankTextures[1])return false;
     auto* window=RwCameraGetViewWindow(camera);
     if(!window)return false;
@@ -454,25 +486,36 @@ bool DrawBanks(RwCamera* camera,const vc::View& view,const vc::Range& range,
     if(handoverVisibility<=1.f/255.f)return true;
     const float visibility=handoverVisibility*handover;
     bool farReady=EnsureBillboards();
+    const auto bankLight=vc::banks::bankLight(light,climate);
+    vc::d3d9::GpuPasses passes;
+    passes.stream=&bankGpu;
+    bool useGpu=false;
+    const auto weather=bankOptions.dual?climate.coverage:(climate.coverage>=.5f?1.f:0.f);
+    const auto* occupancy=bankDownsampled?nullptr:&bankVolume;
     try {
         if(farReady)farReady=DrawBillboards(view,range,climate,light,transform,viewport,fog,wx,wy,handover);
         if(visibility<=1.f/255.f)return true;
-        vc::banks::buildMesh(bankMesh,settings,view,range,canopyDrift,wx,wy,bankDownsampled?nullptr:&bankVolume,
-            bankOptions.dual?climate.coverage:(climate.coverage>=.5f?1.f:0.f),farReady);
-    }
-    catch(const std::bad_alloc&) {bankFailed=true;Log("3D cloud slice allocation failed.");return false;}
-    if(bankMesh.indices.empty()) {
-        if(!bankEmptyLogged&&!bankDrawLogged){Log("3D cloud bank ready; no occupied slices in current camera frustum yet.");bankEmptyLogged=true;}
-        return true;
-    }
-    const auto bankLight=vc::banks::bankLight(light,climate);
-    try {
-        bankProjected.clip.clear();bankProjected.clip.reserve(bankMesh.vertices.size());
-        for(const auto& v:bankMesh.vertices)bankProjected.clip.push_back(vc::d3d9::clipVertex(
-            v.pos,v.u,v.v,v.w,v.alpha*(bankOptions.vertexFog?1.f:v.fog),v.fog,transform));
-        vc::d3d9::projectMesh(bankProjected,viewport,bankLight,visibility,bankMesh.indices.data(),bankMesh.indices.size());
-    } catch(const std::bad_alloc&) {Log("3D cloud projected vertex allocation failed.");return false;}
-    if(bankProjected.indices.empty())return true;
+        useGpu=bankGpu.available()&&passes.prepare(settings,view,range,canopyDrift,farReady,
+            bankOptions.vertexFog,visibility,bankLight,transform,projection,viewport);
+        if(useGpu) {
+            vc::banks::buildMesh(bankGpuMesh,settings,view,range,canopyDrift,wx,wy,occupancy,weather,farReady);
+            if(bankGpuMesh.indices.empty())return true;
+            const auto uploaded=bankGpu.upload(bankGpuMesh);
+            if(!uploaded) {
+                LogD3DFailure("hardware cloud upload; using CPU",uploaded);
+                bankGpu.release();useGpu=false;
+            }
+        }
+        if(!useGpu) {
+            vc::banks::buildMesh(bankMesh,settings,view,range,canopyDrift,wx,wy,occupancy,weather,farReady);
+            if(bankMesh.indices.empty())return true;
+            bankProjected.clip.clear();bankProjected.clip.reserve(bankMesh.vertices.size());
+            for(const auto& v:bankMesh.vertices)bankProjected.clip.push_back(vc::d3d9::clipVertex(
+                v.pos,v.u,v.v,v.w,v.alpha*(bankOptions.vertexFog?1.f:v.fog),v.fog,transform));
+            vc::d3d9::projectMesh(bankProjected,viewport,bankLight,visibility,bankMesh.indices.data(),bankMesh.indices.size());
+            if(bankProjected.indices.empty())return true;
+        }
+    } catch(const std::bad_alloc&) {Log("3D cloud mesh allocation failed.");return false;}
     if(!bankPixelQueryAttempted) {
         bankPixelQueryAttempted=true;
         if(SUCCEEDED(bankDevice->CreateQuery(D3DQUERYTYPE_OCCLUSION,&bankPixelQuery))) {
@@ -482,16 +525,29 @@ bool DrawBanks(RwCamera* camera,const vc::View& view,const vc::Range& range,
         }
     }
     const bool queryThisDraw=bankPixelQuery&&bankQueryFrames==0&&!bankDrawLogged;
-    const auto result=vc::d3d9::drawProjected(bankDevice,{bankTextures[0],bankTextures[1]},bankOptions,
+    const auto result=useGpu?vc::d3d9::drawRaw(bankDevice,{bankTextures[0],bankTextures[1]},bankOptions,
+        bankGpuMesh.vertices.data(),UINT(bankGpuMesh.vertices.size()),sizeof(vc::banks::GpuVertex),0,
+        bankGpuMesh.indices.data(),UINT(bankGpuMesh.indices.size()/3),climate.coverage,bankOptions.vertexFog,
+        true,false,D3DCOLOR_XRGB(vc::d3d9::byte(fog.r),vc::d3d9::byte(fog.g),vc::d3d9::byte(fog.b)),
+        nullptr,nullptr,false,&passes):
+        vc::d3d9::drawProjected(bankDevice,{bankTextures[0],bankTextures[1]},bankOptions,
         bankProjected,climate.coverage,true,fog,true,false);
     if(queryThisDraw && FAILED(bankPixelQuery->Issue(D3DISSUE_END))) {
         bankPixelQuery->Release();bankPixelQuery=nullptr;
     }
-    if(!result){LogD3DFailure("draw",result);return false;}
+    if(!result) {
+        LogD3DFailure("draw",result);
+        if(useGpu) {
+            // A partial draw cannot be safely repeated in the same frame.
+            // Retain the volume on the proven CPU path from the next frame.
+            bankGpu.release();Log("Hardware cloud draw rejected; using CPU vertex path.");return true;
+        }
+        return false;
+    }
     if(!bankDrawLogged) {
         char info[256];
         std::snprintf(info,sizeof(info),"3D cloud draw submitted: %d world-fixed slice patches, %lu triangles, player Z=%.1f, canopy Z=%.1f, camera Z=%.1f, handover=%.2f, coverage=%.2f.",
-            bankMesh.slices,static_cast<unsigned long>(bankProjected.indices.size()/3),playerZ,vc::canopy::altitude(settings),
+            useGpu?bankGpuMesh.slices:bankMesh.slices,static_cast<unsigned long>((useGpu?bankGpuMesh.indices.size():bankProjected.indices.size())/3),playerZ,vc::canopy::altitude(settings),
             view.pos.z,handover,climate.coverage);
         Log(info);bankDrawLogged=true;
     }
@@ -597,7 +653,7 @@ void __cdecl RenderClouds() {
                     try {
                         const auto fog=vc::canopy::fogColour(palette);
                         drawn=DrawCanopy(view,independent,volumeBlend,climate,light,transform,viewport,fog);
-                        if(drawn&&volumeBlend>0.f&&!DrawBanks(camera,view,independent,climate,light,transform,viewport,fog,volumeBlend,playerZ)) {
+                        if(drawn&&volumeBlend>0.f&&!DrawBanks(camera,view,independent,climate,light,transform,projection,viewport,fog,volumeBlend,playerZ)) {
                             bankFailed=true;Log("3D cloud draw failed; retaining full canopy from next frame.");
                         }
                     } catch(const std::bad_alloc&) {Log("Cloud projection allocation failed.");}

@@ -911,3 +911,39 @@ remained a credible source of the swimming seen in flight.
   artifacts. Check 4200/8000/12000 ranges and frame times in flight.
   No assertion that every real-game distortion is fixed; test the
   actual ASI before making new changes to the density art.
+
+## Potato CPU optimization iteration
+
+- User approved the stabilized world-fixed volume look; **do not replace the
+  art or reduce sampling resolution**. Target Celeron 847 / HD Graphics class,
+  not a measured FPS promise. Altitude handover now starts 85% of canopy
+  height (368.9m for default 434m); full volume unchanged at 434m.
+- CloudCache.hpp stores bit-exact baked masks, volumetric endpoints,
+  conservative occupancy arrays and billboard atlas. Version + relevant
+  bake settings + exact expected lengths + FNV-1a checksum. On a cache miss
+  write through a temporary sibling and atomically replace. File lives beside
+  ASI, no per-frame reads/writes. Wind changes UV; live weather blends
+  fixed endpoints. CI builds/packs the default cache with tools/bake_cache.cpp.
+- Hardware vertex processing: VS 2.0 compiled with FXC at build time (optional
+  fallback if unavailable), fixed-function texture stage/pixels unchanged.
+  Per-corner UV, distance, nested-plane opacity, axis weighting and fog on
+  hardware. Dynamic streamed VB + static reversed quad IB. Two GPU
+  projections preserve exact XY/W with near/far clipping, distant pass depth
+  clamped to the cleared viewport depth; restore viewport and full D3D state.
+  No pixel shader, screen copy, extra sample per pixel, or new RT.
+  Hardware creation/draw failure uses proven CPU projection path.
+- Local measurements (not target device): 480 moving poses, previous mesh
+  1.23ms, optimized CPU 1.18ms, GPU input 0.45ms; same average 7275 triangles.
+  Default cache 8,432,196 bytes, 919ms bake / 29ms warm reopen on Linux.
+  Regression tests verify exact cache data and invalidation and same CPU/GPU
+  world-lattice geometry at 12 altitude/weather combinations. Windows test
+  compiles VS2 and compares actual D3D9 pixel readback against CPU backend
+  where hardware vertex processing is available. Device logs identify path.
+- Next real-game test: compare same flight/location, time, weather on Celeron
+  with frame time overlay. Ground, altitude transition 369–434m, flight close
+  inside clouds and short/long scene fog. Check log for cache hit and hardware
+  vertex path; test GPU and CPU fallback if there are driver artifacts.
+- Historical research: GPU Gems 1 ch39 (texture slicing, baked lighting);
+  Mark Harris GDC 2002 (amortize cloud rendering via impostors);
+  OGRE SkyX geometry-block reference; D3D9 SDK buffer, fog and viewport docs.
+  See README for sources. No copied game assets/code.
