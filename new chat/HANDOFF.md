@@ -298,3 +298,68 @@ lighting equation. This section supersedes the previous mode-2 representation.
 - Windows build follow-up: `near` is a legacy Win32 macro. Rename the LOD
   variable to sliceWeight and compile portable cumulus tests with empty
   near/far definitions so this SDK-specific macro collision is caught early.
+
+## Follow-up: replace mode 2 with single-pass procedural cloud canopy (default)
+
+Supersedes all previous mode-2 cumulus implementations. User found prior
+world-fixed slice stacks visually poor, wants GTA V-inspired clouds made
+with old-console techniques and very low cost. Same PR #1, same SDK pin
+2025-10-25, same hook guard. Explicit existing RenderMode=0/1 respected.
+Fresh INIs (and INIs without RenderMode) default to 2. No external assets.
+
+- References reviewed directly: Quake III Arena code/renderer/tr_sky.c
+  (R_BuildCloudData / cloud-layer intersection), OpenMW
+  apps/openmw/mwrender/sky.cpp (UV scroll and blending weather cloud meshes),
+  FlightGear SimGear simgear/scene/sky/cloud.cxx (altitude, coverage, transition),
+  and Adrian Courreges GTA V frame analysis, section Sky (dome + cloud ring;
+  normal/density textures). URLs in README. These are design references;
+  no engine code, game textures or copyrighted assets copied.
+- Canopy.hpp replaces Cumulus.hpp. Seamless original domain-warped periodic
+  value and cellular noise, multiple scales for broad cloud banks and
+  billowed edges. Coverage threshold follows target(s, weather); actual
+  seed 17321 preview coverage ~41% clear and ~86% rainy for alpha >96
+  (texel fraction, not screen coverage). CPU shading uses near/far
+  directional density taps, fine relief, edge softness, native sun vector,
+  mostly neutral daytime light and subdued night from actual sky palette.
+  No additive white rim, no low-cloud oversaturation. Legacy Cumulus*
+  settings mapped to related canopy parameters.
+- One ordinary managed RW tileable RGBA texture, 512² default / 1024² opt-in,
+  1/4 MiB raw plus mipmaps when supported. Format selected after pixels
+  filled. Mip flags tried first, then plain texture, detail failure retries
+  economy. Keep the CPU scalar map, pixels and one RW image for updates.
+  Static noise generated once per RW lifetime; refresh samples a fixed light
+  snapshot and shades 16 rows/frame after at least 50 native timestep units
+  (~1 second) and meaningful light/coverage change. Upload the complete
+  texture only. Paused simulation freezes wind and does not start new jobs;
+  an already started CPU bake may finish. Upload failure releases resources
+  and falls back to mode 0 for the RW lifetime. No custom GPU shader/targets.
+- 257 vertices / 480 triangles in one indexed submission (1440 indices).
+  Fixed, shallow curved disk, world XY texture coordinates and absolute
+  altitude; circular extent follows camera XY but UVs are world anchored,
+  so horizontal travel can see slight height deformation at distant edge,
+  never yaw/roll/altitude-induced texture rotation. Local near fade plus
+  distance/outer-ring fade. Draw two-sided with depth test, no depth write;
+  all touched RW states restored. Weather and clip distance stay native.
+- CanopyFlightClouds=0 default, opt-in 1..24 native crossed groups near
+  center altitude only, <=900 camera range and .65 opacity multiplier.
+  This is not a connected volumetric representation, and is deliberately
+  off by default for reduced overdraw. Normal mode-2 path never updates
+  or sorts the legacy field. Existing modes 0/1 remain as before.
+- Removed obsolete cumulus header/test/preview source; old JPGs intentionally
+  kept as history. New canopy_tests and canopy_preview sources. Portable
+  tests built with legacy Win32 near/far macros, Werror. Tests exercise
+  seamless wrap, deterministic generation, weather coverage, brightness,
+  opposite sun direction, rate-limited completion, camera orientation/height
+  invariance, UV anchoring, fade, wind and previous core regression tests.
+  Preview software rasterizer clips triangles against near plane, performs
+  perspective-correct bilinear wrapping on actual C++ texture, renders
+  day/zenith/dawn/night/rain/above/inside. Synthetic sky; no GTA game or
+  GPU render pipeline, no native wisps or mipmaps simulated. Above-layer
+  angles can still reveal the flat sheet. This is period-style sky-layer
+  rendering, not actual modern volumetric cumulus. No real FPS claims.
+- Next in-game setup: set RenderMode=2 in existing INI and detail 0, compare
+  LA clear dawn/noon/midnight and storm, yaw/roll, vertical ascent through
+  layer, aircraft, clip changes, low draw distance, alt-tab, SkyGfx.
+  Check log for successful texture initialization, compare visual and
+  performance with modes 0/1 and optional detail 1. Profile on actual weak
+  GPU before claiming measured minimum hardware.

@@ -13,7 +13,7 @@ if(BUILD_ASI)
     if(NOT EXISTS "${PLUGIN_SDK_LIB}")
         message(FATAL_ERROR "Build Plugin-SDK Release first: ${PLUGIN_SDK_LIB}")
     endif()
-    add_library(VolumetricCloudsExtended SHARED main.cpp CloudCore.hpp Cumulus.hpp)
+    add_library(VolumetricCloudsExtended SHARED main.cpp CloudCore.hpp Canopy.hpp)
     target_compile_features(VolumetricCloudsExtended PRIVATE cxx_std_23)
     target_compile_definitions(VolumetricCloudsExtended PRIVATE
         GTASA RW PLUGIN_SGV_10US NOMINMAX
@@ -37,10 +37,10 @@ if(BUILD_TESTING)
     add_executable(cloud_tests tests/cloud_tests.cpp)
     target_compile_features(cloud_tests PRIVATE cxx_std_17)
     add_test(NAME cloud_core COMMAND cloud_tests)
-    add_executable(cumulus_tests tests/cumulus_tests.cpp)
-    target_compile_features(cumulus_tests PRIVATE cxx_std_17)
+    add_executable(canopy_tests tests/canopy_tests.cpp)
+    target_compile_features(canopy_tests PRIVATE cxx_std_17)
     # RenderWare/Windows headers expose legacy near/far macros. Emulate
     # those names in portable tests to catch collisions before the ASI build.
-    target_compile_definitions(cumulus_tests PRIVATE near= far=)
-    add_test(NAME cloud_cumulus COMMAND cumulus_tests)
+    target_compile_definitions(canopy_tests PRIVATE near= far=)
+    add_test(NAME cloud_canopy COMMAND canopy_tests)
 endif()

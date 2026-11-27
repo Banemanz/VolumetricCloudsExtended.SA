@@ -1,7 +1,7 @@
 # VolumetricCloudsExtended.SA
 
 A procedural replacement for GTA San Andreas' stock intersecting-card volumetric clouds.
-This is a textured 3D impostor renderer, not a raymarched atmospheric volume. It only
+This is a fixed-function procedural sky/cloud renderer, not a raymarched atmospheric volume. It only
 replaces the volumetric cloud call in the original 3D effects pass. The sky background,
 low clouds, moving fog, rain and other effects remain native.
 
@@ -25,22 +25,21 @@ pipeline may still need compatibility testing.
   after a cloud leaves view. Teleports rebuild the field around the new position.
 - Smooth weather interpolation in both directions, including bad-to-bad transitions.
   Excess clouds fade out instead of remaining permanently allocated.
-- Clustered native-texture clouds (default, mode 1): fixed crossed core
+- Clustered native-texture clouds (mode 1): fixed crossed core
   with independently placed, deterministically tilted satellite cards,
   depth-sorted and angle-weighted. No camera-facing billboards. Increasing
   the puff count does not simply multiply opacity.
 - Crossed cards (mode 0) preserve the native world-axis geometry.
-- Experimental shader-free cumulus (mode 2): a pre-baked three-dimensional
-  density field with self-shadowing, fixed axis-aligned texture slices for
-  depth/parallax, and inexpensive whole projections farther away.
-  All modes select their own fixed geometry automatically; yaw, pitch,
-  roll and altitude no longer rotate the cards or their texture coordinates.
+- **Procedural canopy (default, mode 2):** one curved, world-XY cloud layer
+  with a seamless CPU-generated density/lighting map. Clouds are coherent
+  weather formations instead of intersecting billboards. No camera yaw,
+  pitch, roll or altitude controls texture orientation.
+  Optional sparse native cards at flight altitude are disabled by default.
 - Frustum rejection, actual camera far-plane limit, smooth range and near fades,
   back-to-front view-depth ordering and bounded RenderWare batches.
 - Additional textures are borrowed directly from the loaded particle TXD. Missing
   names are ignored; the native cloudhigh texture is the fallback. No global game
-  RNG consumption or native cloud-table reset. Only optional cumulus mode owns
-  a small ordinary RW texture raster.
+  RNG consumption or native cloud-table reset. Only mode 2 owns a small ordinary RW texture raster.
 
 ## INI controls
 
@@ -50,9 +49,9 @@ text retains the default. Inline comments are supported.
 
 | Setting | Default | Meaning |
 |---|---:|---|
-| TargetProcClouds | 160 | Clear-weather cloud groups (0–512) |
+| TargetProcClouds | 160 | Group count in modes 0/1; coverage control in mode 2 (0 disables) |
 | BadWeatherDensityMultiplier | 1.4 | Cloudy/rainy density relative to clear (0–3) |
-| MinSpawnZ | 200 | Lower absolute altitude |
+| MinSpawnZ | 200 | Lower absolute altitude (canopy uses the band midpoint and curvature) |
 | MaxSpawnZ | 650 | Upper absolute altitude |
 | SpawnRadiusMin | 300 | Inner radius relative to camera; scaled if far clip is shorter |
 | SpawnRadiusMax | 2200 | Outer radius; scaled to effective render distance |
@@ -73,16 +72,17 @@ text retains the default. Inline comments are supported.
 | UseAdditionalTextures | 1 | Look for listed textures in particle.txd |
 | IncludeOriginalTextureInRandom | 1 | Include native cloudhigh among variants |
 | CloudTextureNames | cloud2,cloud3,cloud4 | Comma-separated names; up to 15 |
-| RenderMode | 1 | 0 = crossed cards; 1 = clustered fixed world-space cards; 2 = experimental shader-free cumulus |
-| CumulusDensity | 0.95 | Mode 2: optical density multiplier (0–1) |
+| RenderMode | 2 | 0 = crossed cards; 1 = clustered fixed world-space cards; 2 = procedural canopy (default) |
+| CumulusDensity | 0.95 | Mode 2: opacity of the cloud texture (0–1) |
 | CumulusImpostors | 1 | Legacy key, accepted but ignored; mode 2 always uses fixed geometry |
 | CumulusNightLight | 1 | Mode 2: night illumination multiplier (0–2); smooth transition to daylight |
-| CumulusContrast | 0.65 | Mode 2: directional and underside lighting contrast (0–1) |
-| CumulusRimStrength | 0.85 | Mode 2: subtle sunward edge softening (0–1), never above native daytime luminance |
-| CumulusDetail | 0 | Mode 2: 0 = economy 64px tiles / 2×2 grid; 1 = 128px tiles / 3×3 grid, depth LOD farther out |
+| CumulusContrast | 0.65 | Mode 2: directional relief and occlusion contrast (0–1) |
+| CumulusRimStrength | 0.85 | Mode 2: subtle thin-edge illumination (0–1), no additive halo |
+| CumulusDetail | 0 | Mode 2: 0 = 512² texture; 1 = 1024² texture, same geometry |
+| CanopyFlightClouds | 0 | Optional native crossed wisps near the canopy height (0–24); off for lowest cost |
 | PuffsPerCloud | 5 | Mode 1: number of puffs (1–8); core uses three fixed planes, each satellite one |
-| SizeScale | 1 | Group dimensions multiplier |
-| Opacity | 1 | Group opacity multiplier (0–2) |
+| SizeScale | 1 | Group dimensions multiplier, or mode 2 world texture scale |
+| Opacity | 1 | Overall cloud opacity multiplier (0–2) |
 | NearFadeDistance | 25 | Fade near the camera; 0 disables |
 | BottomShade | 1 | Custom mode only: bottom/vertical shading (1 disables) |
 | HazeStrength | 0 | Custom mode only: blend distant cards toward sky-bottom RGB |
@@ -93,7 +93,7 @@ text retains the default. Inline comments are supported.
 colour from SA 1.0 US: average the six sky colour channels (integer division),
 add `ColorBrightnessBoost` (native 64) and clamp to 255. All vertices use that
 neutral brightness, with no extra puff/bottom shading or manual colour haze.
-An older INI without `LightingMode` automatically uses this corrected mode;
+In modes 0/1 an older INI without `LightingMode` automatically uses this corrected lighting;
 no need to delete or regenerate it. The custom lighting settings are retained,
 but take effect only with `LightingMode=1`. `UseGameFog` is independently
 configurable and defaults off, like the native pass.
@@ -104,110 +104,93 @@ For the stock appearance with the procedural field, use `RenderMode=0`,
 configuration try `PuffsPerCloud=3`. The new renderer deliberately does not
 extend the world/camera clip plane or change the game's native height-switch global.
 
-## Experimental cumulus mode (no shaders)
+## Procedural canopy (mode 2, default; no custom shaders)
 
-Add or change these values in your existing INI, then restart:
+Existing INIs are never overwritten. Explicit RenderMode=0 or 1 remains
+unchanged. To switch an existing installation, edit and restart:
 
 ```ini
 RenderMode=2
 CumulusDetail=0
 CumulusDensity=0.95
-CumulusNightLight=1
 CumulusContrast=0.65
 CumulusRimStrength=0.85
+CumulusNightLight=1
+CanopyFlightClouds=0
 Opacity=1
-ColorBrightnessBoost=64
 ```
 
-The default renderer remains mode 1, so existing installations do not switch.
-Mode 2 deliberately favors a period-appropriate, semi-transparent cloud over
-a near-opaque modern impostor. Mode 2 uses its own texture and lighting;
-native/additional texture choice and the custom tint/shade/haze keys do not
-affect it. Native sky luminance, global opacity, wind, altitude, weather,
-visibility and clipping still apply. `PuffsPerCloud` applies to mode 1 only.
-The obsolete `CumulusImpostors` key is accepted but ignored, so an older INI
-cannot accidentally restore rotating billboards.
+### The cheap trick
 
-**World-fixed geometry and level of detail:** a classic object-aligned
-texture-slicing technique, described in [SIGGRAPH 2004 Course 28, section 3.2](https://faculty.cc.gatech.edu/~jarek/lectures/V00Intro/handouts/Course28.pdf).
-Flight simulation has also used cheap cloud textures and impostors since
-at least [Flight Simulator 2004](https://niniane.org/clouds/). The implementation
-here is original and adapted to SA's own fixed-function RenderWare pipeline.
+A curved, textured sky layer has been practical since the fixed-function
+console era. References: [Quake III tr_sky.c](https://github.com/id-Software/Quake-III-Arena/blob/master/code/renderer/tr_sky.c)
+(curved cloud texture coordinates), [OpenMW sky.cpp](https://github.com/OpenMW/openmw/blob/master/apps/openmw/mwrender/sky.cpp)
+(scrolling UVs and weather transitions), [SimGear cloud.cxx](https://github.com/FlightGear/simgear/blob/next/simgear/scene/sky/cloud.cxx)
+(layer altitude, thickness and coverage), and
+[Adrian Courrèges' GTA V frame capture](https://www.adriancourreges.com/blog/2015/11/02/gta-v-graphics-study/)
+(the game uses a sky dome and a distant cloud ring with seamless density and normal textures).
+Here directional lighting and shape are baked into original procedural pixels,
+not a copy of any game's assets, code or shaders.
 
-Each archetype is a coherent 3D density field. Three perpendicular stacks
-(XZ, YZ, XY in a stable cloud-local yaw frame) each contain three integrated
-density slabs at fixed spatial offsets; there is also a single whole-cloud
-projection per axis. Close clouds use the slabs to approximate parallax and
-depth; distant clouds fade into the corresponding whole projections.
-Selection uses angular cloud size, not a hard world-distance switch, with
-detail 1 retaining the more detailed representation farther away.
-Stack opacity weights follow the projected area of each plane, suppress
-nearly edge-on stacks and blend the comparable axes. The alpha calibration
-preserves transmittance of a representative dense ray across stack/LOD
-transitions; it is approximate for other sample masks. **No camera-facing
-basis is used** in any mode; even when alpha or LOD changes, the card centers,
-orientation, UVs and vertex lighting remain fixed in world space.
+- **Shape:** periodic, domain-warped multi-scale value noise and cellular
+  billows form connected banks with gaps and finer detail. Coverage changes
+  with the interpolated weather and configured group count/multiplier.
+  The same cloud map drifts with native wind; the weather threshold exposes
+  more or less of the same field rather than regenerating random clouds.
+- **Light:** CPU directional density-gradient relief, two-scale occlusion,
+  fine detail and thin-edge illumination, based on the current SA sun vector.
+  Neutral daylight scattering with restrained warmth at sunrise/sunset;
+  nighttime uses the timecycle sky, not the stock +64 night brightness floor.
+  Modes 0/1 retain their exact native/custom lighting options.
+- **Geometry:** 257 vertices and 480 indexed triangles in one 32-segment,
+  8-ring shallow disk. Absolute layer altitude and world-XY UVs stay stable
+  under yaw, pitch, roll and camera altitude. The finite disk is recentered
+  horizontally to cover the active camera clip region; only its gentle
+  outer curvature and distance fade are camera-relative. There is no
+  facing sprite, texture rotation, or per-cloud sort in the default path.
+  Near the surface the alpha fades locally to avoid a hard sheet crossing
+  the camera. The two-sided mesh is depth-tested against world geometry.
+- **Cost:** one fixed-function texture+alpha blend submission in default
+  mode, no per-frame cloud raymarch, custom vertex/pixel shader, screen copy,
+  3D GPU texture or render target. Economy uses a 512² RGBA texture (1 MiB
+  base, ~1.33 MiB with mipmaps); detail 1 uses 1024² (4 MiB base, ~5.33 MiB
+  with mipmaps). One static CPU scalar map and RGBA buffer, plus RW image
+  staging. Lighting updates at most once per simulated second plus bake
+  time; 16 rows/frame, only when the sun/weather changes sufficiently.
+  The previous complete texture stays visible until the next upload.
+  Automatic RW mipmaps are requested, with non-mipmapped fallback if
+  unavailable; detail allocation failure retries economy. Texture creation
+  or upload failure falls back to mode 0 and logs it. All owned resources
+  are destroyed at RW shutdown.
+- **Flight:** the canopy is a thin fake cloud surface, not a true 3D volume.
+  For additional local parallax use CanopyFlightClouds=12 (max 24); these
+  native crossed wisps appear only near the center altitude, with
+  altitude/range fading. They are optional because they add alpha overdraw
+  and can reveal card geometry. The default purposely omits them.
 
-**Textures:** four deterministic 3D density fields of overlapping lobes,
-turbulent erosion and irregular vertical development are baked once on CPU.
-Optical thickness is integrated over each slab and over the entire field
-(48 tiles total). Soft density taper, fractal interior structure, density
-gradient relief and a precomputed sky-light integral give the clouds more
-body than the earlier flat projections without harsh particle outlines.
-Economy detail uses a 512×512 RGBA atlas (48 64×64 tiles, 1 MiB raw).
-Optional detail 1 uses a 1024×1024 atlas (128×128 tiles, 4 MiB raw) and a
-higher-resolution bake. If it cannot be allocated, the economy atlas is
-tried; UVs work with either size. Atlas creation can take longer at detail 1,
-especially on older CPUs. No external textures are shipped.
+Mode 2 uses CumulusDetail, CumulusDensity, CumulusContrast, CumulusRimStrength,
+CumulusNightLight, TargetProcClouds, BadWeatherDensityMultiplier, SizeScale,
+Opacity, Seed, WindMoveScale, the altitude and range/fade controls, and
+UseGameFog. ColorBrightnessBoost sets the native luminance reference for
+daylight; LightingMode and tint settings affect only native cards.
+CumulusImpostors is accepted as a legacy no-op. PuffsPerCloud affects only
+mode 1. Texture names, spacing, and group spawn radius controls apply to
+native cards (including optional flight wisps), not the procedural sheet.
 
-**Lighting:** pre-baked neutral self-shadowing approximates diffuse sky
-occlusion; the current game sun vector and native neutral daytime luminance
-drive world-aligned vertex gradients. Sunward edge softening never exceeds
-native daytime luminance. No excessive low-cloud tint or additive white
-halo. Night blends toward subdued sky illumination and weak approximate
-lunar lighting. `CumulusNightLight` scales night illumination. Modes 0 and
-1 retain the original neutral/custom lighting paths.
+### Linux software previews
 
-**Cost:** one fixed-function texture/blend pass, one shared atlas, bounded
-RenderWare batches, no shaders, 3D GPU textures, render targets, scene copies
-or per-frame raymarching. Economy detail draws two triangles per active card
-and most far clouds use only one; near clouds commonly use three. Up to
-12 candidates per group exist during simultaneous axis and distance LOD
-crossfades (24 triangles at detail 0, 96 at detail 1); zero/negligible alpha
-cards are discarded before visibility tests or submission. For a synthetic
-512-cloud diagnostic field, 912 active cards at economy detail and 1443 at
-detail 1 before frustum or distance-opacity culling (about 1.8/2.8 per group,
-not a measured game benchmark). Fresh configurations default to economy
-detail. An existing INI with detail 1 stays at detail 1. Use `CumulusDetail=0`
-for old GPUs; lower `TargetProcClouds` if transparent fill rate is limiting.
-Allocation failure of both atlas sizes falls back to mode 0 and is logged.
-The raster is released before RenderWare shutdown.
-
-This is a coarse volume approximation, not a physically accurate cloud
-renderer. Oblique and extremely close views may still reveal flat slices,
-crossfades or texture softness; transparent overdraw can vary by angle.
-The goal is a plausible period look on low-end hardware, not modern
-raymarched clouds.
-
-| Looking toward the sun | Looking away |
+| Day | Overhead |
 |---|---|
-| ![Backlit clouds](docs/previews/cumulus_back.jpg) | ![Frontlit clouds](docs/previews/cumulus_front.jpg) |
-| ![Above clouds](docs/previews/cumulus_flight.jpg) | ![From the ground](docs/previews/cumulus_ground.jpg) |
-| ![Economy geometry](docs/previews/cumulus_low.jpg) | ![Night](docs/previews/cumulus_night.jpg) |
-| ![Looking upward](docs/previews/cumulus_zenith.jpg) | ![Within the cloud layer](docs/previews/cumulus_inside.jpg) |
-| ![Illustrative sunrise](docs/previews/cumulus_sunrise.jpg) | ![Isolated close cloud](docs/previews/cumulus_close.jpg) |
+| ![Canopy daytime](docs/previews/canopy_day.jpg) | ![Canopy zenith](docs/previews/canopy_zenith.jpg) |
+| ![Canopy dawn](docs/previews/canopy_sunrise.jpg) | ![Canopy night](docs/previews/canopy_night.jpg) |
+| ![Canopy rain](docs/previews/canopy_rain.jpg) | ![Canopy above](docs/previews/canopy_flight.jpg) |
 
-| Identical world field, camera Z=30 | Camera Z=210 | Camera Z=390 |
-|---|---|---|
-| ![Low altitude](docs/previews/cumulus_height_low.jpg) | ![Middle altitude](docs/previews/cumulus_height_mid.jpg) | ![High altitude](docs/previews/cumulus_height_high.jpg) |
-
-These are offline renders of the actual C++ atlas, mesh, UVs and vertex
-colours. The sky and sun glare are illustrative backgrounds, not GTA assets,
-and the preview omits near-plane-crossing cards rather than clipping them.
-The altitude sequence retains the same field and view axes; changes represent
-perspective and opacity weights, not rotation of the cloud geometry. The
-historical previews with a `_previous` or `_layers` suffix remain as
-references for the old implementation, not current output.
+These render the actual C++ procedural texture and geometry against a
+synthetic sky, clipping triangles at the near plane and perspective-correctly
+sampling UVs. Not screenshots of GTA, no optional native wisps or RW mipmaps
+simulated in this diagnostic. The above-layer view still exposes the sheet
+at grazing angles. Real-game appearance, device behavior and GPU fill rate
+remain to be validated. Historical cumulus images are previous versions.
 
 ## Build
 
@@ -231,8 +214,8 @@ Portable regression tests on Linux (no game required):
 ```sh
 g++ -std=c++17 -O2 -Wall -Wextra -Werror tests/cloud_tests.cpp -o cloud_tests
 ./cloud_tests
-g++ -std=c++17 -O2 -Wall -Wextra -Werror tests/cumulus_tests.cpp -o cumulus_tests
-./cumulus_tests
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -Dnear= -Dfar= tests/canopy_tests.cpp -o canopy_tests
+./canopy_tests
 ```
 
 ## Engine reference
@@ -270,9 +253,9 @@ g++ -std=c++17 -O2 tests/dump_preview.cpp -o dump_preview
 python tests/preview.py ./dump_preview docs/previews
 ```
 
-To regenerate the cumulus previews:
+To regenerate the canopy previews:
 
 ```sh
-g++ -std=c++17 -O2 tests/cumulus_preview.cpp -o cumulus_preview
-python tests/cumulus_preview.py ./cumulus_preview docs/previews
+g++ -std=c++17 -O2 tests/canopy_preview.cpp -o canopy_preview
+python tests/canopy_preview.py ./canopy_preview docs/previews
 ```

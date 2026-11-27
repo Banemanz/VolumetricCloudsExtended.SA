@@ -11,7 +11,7 @@
 #include "CTimer.h"
 #include "CTxdStore.h"
 #include "CScene.h"
-#include "Cumulus.hpp"
+#include "Canopy.hpp"
 #include <new>
 
 #include <array>
@@ -27,8 +27,12 @@ constexpr int BatchVertices = 480; // multiple of 6; comfortably below the RW Im
 vc::Settings settings;
 vc::Field field;
 bool haveFrame = false;
-RwRaster* cumulusRaster=nullptr; // owned by the plugin, only while RW is initialized
-bool atlasAttempted=false;
+RwRaster* canopyRaster=nullptr; // owned only during the RW lifetime
+RwImage* canopyImage=nullptr;
+vc::canopy::Map canopyMap;
+vc::canopy::Refresh canopyRefresh;
+vc::canopy::Drift canopyDrift;
+bool canopyAttempted=false,canopyMipmaps=false,flightFieldActive=false;
 unsigned int lastFrame = 0;
 
 std::filesystem::path ModulePath() {
@@ -64,56 +68,79 @@ void LoadIni() {
     }
 }
 
-void ReleaseCumulus() {
-    if (cumulusRaster) RwRasterDestroy(cumulusRaster);
-    cumulusRaster=nullptr;
-    atlasAttempted=false;
+void FreeCanopyResources() {
+    if (canopyRaster) RwRasterDestroy(canopyRaster);
+    if (canopyImage) RwImageDestroy(canopyImage);
+    canopyRaster=nullptr;
+    canopyImage=nullptr;
+    canopyMipmaps=false;
+    canopyMap={};
 }
-
-// Generate once, only when the optional mode is selected. Managed RW texture,
-// not a render target or dynamic/default-pool buffer. Never require external assets.
-bool EnsureCumulusAtlas() {
-    if (atlasAttempted) return cumulusRaster!=nullptr;
-    atlasAttempted=true;
-    using namespace vc::cumulus;
-    const int requested=atlasTile(settings);
-    const auto create=[&](int tileSize) {
-        const int size=tileSize*AtlasColumns;
-        RwImage* img=RwImageCreate(size,size,32);
-        if (!img) return;
-        if (RwImageAllocatePixels(img) && RwImageGetPixels(img) && RwImageGetStride(img)>=size*4) {
-            try {
-                const auto pixels=bakeAtlas(tileSize);
-                for (int y=0;y<size;++y)
-                    std::memcpy(RwImageGetPixels(img)+y*RwImageGetStride(img),
-                                pixels.data()+y*size,size*sizeof(Pixel));
-                RwInt32 w=0,h=0,depth=0,format=0;
-                if (RwImageFindRasterFormat(img,rwRASTERTYPETEXTURE,&w,&h,&depth,&format)
-                    && w==size && h==size) {
-                    cumulusRaster=RwRasterCreate(w,h,depth,format|rwRASTERTYPETEXTURE);
-                    if (cumulusRaster && !RwRasterSetFromImage(cumulusRaster,img)) {
-                        RwRasterDestroy(cumulusRaster);
-                        cumulusRaster=nullptr;
-                    }
-                }
-            } catch (const std::bad_alloc&) {
-                Log("Cumulus: procedural atlas CPU allocation failed.");
-            }
+void ReleaseCanopy() {
+    FreeCanopyResources();
+    canopyAttempted=false;
+}
+void FillCanopyImage() {
+    const int size=canopyMap.size();
+    for (int y=0;y<size;++y)
+        std::memcpy(RwImageGetPixels(canopyImage)+y*RwImageGetStride(canopyImage),
+                    canopyMap.pixels.data()+std::size_t(y)*size,size*sizeof(vc::canopy::Pixel));
+}
+bool UploadCanopy() {
+    if (!canopyImage || !canopyRaster) return false;
+    FillCanopyImage();
+    return RwRasterSetFromImage(canopyRaster,canopyImage)!=nullptr;
+}
+bool EnsureCanopy(const vc::canopy::Light& light) {
+    if (canopyAttempted) return canopyRaster!=nullptr;
+    canopyAttempted=true;
+    const auto create=[&](int size) {
+        canopyImage=RwImageCreate(size,size,32);
+        if (!canopyImage || !RwImageAllocatePixels(canopyImage) ||
+            !RwImageGetPixels(canopyImage) || RwImageGetStride(canopyImage)<size*4) {
+            FreeCanopyResources();return;
         }
-        RwImageDestroy(img);
+        try {
+            canopyMap.build(size,std::uint32_t(settings.seed));
+            canopyMap.shade(light,0,size);
+            canopyRefresh.reset(light);
+            FillCanopyImage(); // format selection inspects the actual alpha channel
+            RwInt32 w=0,h=0,depth=0,format=0;
+            if (RwImageFindRasterFormat(canopyImage,rwRASTERTYPETEXTURE,&w,&h,&depth,&format)
+                && w==size && h==size) {
+                // Prefer native RW automatic mipmaps for the grazing-angle
+                // horizon. Driver/format limitation: retry without mipmaps.
+                const int mipFlags=rwRASTERFORMATMIPMAP|rwRASTERFORMATAUTOMIPMAP;
+                for (int flags:{mipFlags,0}) {
+                    canopyRaster=RwRasterCreate(w,h,depth,(format&~mipFlags)|rwRASTERTYPETEXTURE|flags);
+                    if (canopyRaster && RwRasterSetFromImage(canopyRaster,canopyImage)) {
+                        canopyMipmaps=RwRasterGetNumLevels(canopyRaster)>1;
+                        return;
+                    }
+                    if (canopyRaster) RwRasterDestroy(canopyRaster);
+                    canopyRaster=nullptr;
+                }
+            }
+        } catch (const std::bad_alloc&) {
+            Log("Canopy: CPU allocation failed.");
+        }
+        FreeCanopyResources();
     };
+    const int requested=vc::canopy::textureSize(settings);
     create(requested);
-    if (!cumulusRaster && requested!=Tile) {
-        Log("Cumulus: detail atlas unavailable; trying economy atlas.");
-        create(Tile);
+    if (!canopyRaster && requested!=vc::canopy::EconomySize) {
+        Log("Canopy: detail texture unavailable; trying economy.");
+        create(vc::canopy::EconomySize);
     }
-    Log(cumulusRaster?"Cumulus: shader-free procedural atlas generated."
-                      :"Cumulus: atlas creation failed; using crossed native textures.");
-    return cumulusRaster!=nullptr;
+    Log(canopyRaster?"Canopy: procedural cloud sheet generated."
+                    :"Canopy: texture creation failed; using crossed native textures.");
+    return canopyRaster!=nullptr;
 }
 
 void ResetField() {
     field.reset(settings);
+    canopyDrift={};
+    flightFieldActive=false;
     haveFrame=false;
 }
 
@@ -226,37 +253,35 @@ std::array<RwIm3DVertex,BatchVertices> vertices;
 constexpr int BatchIndices=BatchVertices*4;
 std::array<RwImVertexIndex,BatchIndices> modernIndices;
 static_assert(sizeof(RwImVertexIndex)==sizeof(std::uint16_t));
-void FlushCumulus(int& count,int& indexCount) {
-    if (!count) return;
-    RwRenderStateSet(rwRENDERSTATETEXTURERASTER,cumulusRaster);
-    if (RwIm3DTransform(vertices.data(),count,nullptr,rwIM3D_VERTEXXYZ|rwIM3D_VERTEXUV|rwIM3D_VERTEXRGBA)) {
-        RwIm3DRenderIndexedPrimitive(rwPRIMTYPETRILIST,modernIndices.data(),indexCount);
+void DrawCanopy(const vc::View& view,const vc::Range& range) {
+    if (settings.opacity<=0.f || settings.cumulusDensity<=0.f || !settings.targetProcClouds) return;
+    RenderStates states;
+    if (!states.begin()) return;
+    const auto mesh=vc::canopy::mesh(settings,view,range,canopyDrift);
+    static_assert(vc::canopy::VertexCount<=BatchVertices && vc::canopy::IndexCount<=BatchIndices);
+    bool visible=false;
+    for(int i=0;i<vc::canopy::VertexCount;++i) {
+        auto& v=vertices[i];
+        const auto& p=mesh.vertices[i];
+        visible|=p.alpha>1.f/255.f;
+        RwIm3DVertexSetPos(&v,p.pos.x,p.pos.y,p.pos.z);
+        RwIm3DVertexSetNormal(&v,0.f,0.f,1.f);
+        RwIm3DVertexSetU(&v,p.u);
+        RwIm3DVertexSetV(&v,p.v);
+        RwIm3DVertexSetRGBA(&v,255,255,255,Byte(p.alpha*255.f));
+    }
+    if (!visible) return;
+    std::copy(mesh.indices.begin(),mesh.indices.end(),modernIndices.begin());
+    RwRenderStateSet(rwRENDERSTATETEXTURERASTER,canopyRaster);
+    if (canopyMipmaps) RwRenderStateSet(rwRENDERSTATETEXTUREFILTER,reinterpret_cast<void*>(rwFILTERLINEARMIPLINEAR));
+    RwRenderStateSet(rwRENDERSTATETEXTUREADDRESSU,reinterpret_cast<void*>(rwTEXTUREADDRESSWRAP));
+    RwRenderStateSet(rwRENDERSTATETEXTUREADDRESSV,reinterpret_cast<void*>(rwTEXTUREADDRESSWRAP));
+    if (RwIm3DTransform(vertices.data(),vc::canopy::VertexCount,nullptr,
+                         rwIM3D_VERTEXXYZ|rwIM3D_VERTEXUV|rwIM3D_VERTEXRGBA)) {
+        RwIm3DRenderIndexedPrimitive(rwPRIMTYPETRILIST,modernIndices.data(),vc::canopy::IndexCount);
         RwIm3DEnd();
     }
-    count=indexCount=0;
 }
-void AppendCumulus(const vc::Card& card,const vc::View& view,const vc::cumulus::Lighting& lighting,
-                   int n,int& count,int& indexCount) {
-    vc::cumulus::LitVertex mesh[vc::cumulus::MaxVertices];
-    const int size=vc::cumulus::mesh(card,view,lighting,n,mesh);
-    std::uint16_t local[vc::cumulus::MaxIndices];
-    const int ni=vc::cumulus::indices(n,count,local);
-    for(int i=0;i<ni;++i) modernIndices[indexCount++]=local[i];
-    const auto normal=vc::unit(vc::Vec{
-        card.right.y*card.up.z-card.right.z*card.up.y,
-        card.right.z*card.up.x-card.right.x*card.up.z,
-        card.right.x*card.up.y-card.right.y*card.up.x});
-    for(int i=0;i<size;++i) {
-        auto& v=vertices[count++];
-        const auto& p=mesh[i];
-        RwIm3DVertexSetPos(&v,p.pos.x,p.pos.y,p.pos.z);
-        RwIm3DVertexSetNormal(&v,normal.x,normal.y,normal.z);
-        RwIm3DVertexSetU(&v,p.uv.u);
-        RwIm3DVertexSetV(&v,p.uv.v);
-        RwIm3DVertexSetRGBA(&v,Byte(p.colour.r),Byte(p.colour.g),Byte(p.colour.b),Byte(card.alpha*255.f));
-    }
-}
-
 void Flush(int& count,RwRaster* raster) {
     if (!count) return;
     RwRenderStateSet(rwRENDERSTATETEXTURERASTER,raster);
@@ -303,34 +328,74 @@ void __cdecl RenderClouds() {
     const auto& cc=CTimeCycle::m_CurrentColours;
     const auto range=vc::range(settings,view.farClip,cc.m_fFarClip);
     if (range.end<=1.f) return;
-    const bool modern=settings.renderMode==2 && EnsureCumulusAtlas();
-    // Allocation/format failure falls back without rewriting the user's INI.
+    const vc::Palette palette{
+        {float(cc.m_nSkyTopRed),float(cc.m_nSkyTopGreen),float(cc.m_nSkyTopBlue)},
+        {float(cc.m_nSkyBottomRed),float(cc.m_nSkyBottomGreen),float(cc.m_nSkyBottomBlue)},
+        {float(cc.m_nLowCloudsRed),float(cc.m_nLowCloudsGreen),float(cc.m_nLowCloudsBlue)},
+        {float(cc.m_nFluffyCloudsBottomRed),float(cc.m_nFluffyCloudsBottomGreen),float(cc.m_nFluffyCloudsBottomBlue)}
+    };
     const int requestedMode=settings.renderMode;
     struct RestoreMode { int mode; ~RestoreMode(){settings.renderMode=mode;} } restore{requestedMode};
-    if (!modern && requestedMode==2) settings.renderMode=0;
-    const Textures textures=modern?Textures{}:GetTextures();
-    if (!modern && !textures.count) return;
-
-    // Simulate at most once per game frame, using the actual render camera.
     const auto frameId=CTimer::m_FrameCounter;
-    if (!haveFrame || frameId!=lastFrame) {
-        const float dt=CTimer::m_UserPause || CTimer::m_CodePause ? 0.f : CTimer::ms_fTimeStep;
-        const float weather=vc::weatherFactor(BadWeather(CWeather::OldWeatherType),BadWeather(CWeather::NewWeatherType),
-            CWeather::InterpolationValue,CWeather::Rain);
-        const auto& wind=CWeather::WindDir;
-        field.update(settings,view,range,vc::target(settings,weather),
-            vc::Vec{wind.x,wind.y,0.f}*CWeather::Wind,dt);
-        haveFrame=true;
-        lastFrame=frameId;
+    const bool newFrame=!haveFrame || frameId!=lastFrame;
+    const float dt=CTimer::m_UserPause || CTimer::m_CodePause ? 0.f : CTimer::ms_fTimeStep;
+    const float weather=vc::weatherFactor(BadWeather(CWeather::OldWeatherType),BadWeather(CWeather::NewWeatherType),
+        CWeather::InterpolationValue,CWeather::Rain);
+    const auto& wind=CWeather::WindDir;
+    const vc::Vec windVector=vc::Vec{wind.x,wind.y,0.f}*CWeather::Wind;
+    bool modern=false;
+    float flightAlpha=1.f;
+    int desired=vc::target(settings,weather);
+    auto cardRange=range;
+    if (requestedMode==2) {
+        if (!settings.targetProcClouds || settings.opacity<=0.f || settings.cumulusDensity<=0.f) return;
+        const int index=std::clamp(CTimeCycle::m_CurrentStoredValue,0,15);
+        const auto& sun=CTimeCycle::m_VectorToSun[index];
+        const auto light=vc::canopy::lighting(settings,palette,{sun.x,sun.y,sun.z},weather,CWeather::Rain,CWeather::Foggyness);
+        modern=EnsureCanopy(light);
+        if (modern && newFrame) {
+            canopyDrift.update(settings,windVector,dt);
+            if (canopyRefresh.advance(canopyMap,light,dt) && !UploadCanopy()) {
+                Log("Canopy: texture update failed; using crossed native textures.");
+                FreeCanopyResources();modern=false;
+            }
+        }
+        if (modern) {
+            DrawCanopy(view,range);
+            // Default mode is single-pass. Optional sparse fixed cards are
+            // localized to flight altitude; never fill the horizon with sprites.
+            flightAlpha=vc::canopy::flightWeight(settings,view)*.65f;
+            desired=std::min(settings.canopyFlightClouds,desired);
+            if (!desired || flightAlpha<=1.f/255.f) {
+                if(newFrame) {
+                    if (flightFieldActive) field.reset(settings);
+                    flightFieldActive=false;haveFrame=true;lastFrame=frameId;
+                }
+                return;
+            }
+            flightFieldActive=true;
+            cardRange=vc::range(settings,std::min(view.farClip,900.f),cc.m_fFarClip);
+        }
+        // Optional flight wisps and resource-failure fallback use native geometry.
+        settings.renderMode=0;
+    }
+    Textures textures;
+    if (modern) textures.add(CClouds::ms_vc.m_pTex);
+    else textures=GetTextures();
+    if (!textures.count) return;
+
+    if (newFrame) {
+        field.update(settings,view,cardRange,desired,windVector,dt);
+        haveFrame=true;lastFrame=frameId;
     }
 
     int drawCount=0;
     for (const auto& c:field.clouds) {
         if (!c.used) continue;
-        const float a=vc::cloudAlpha(settings,c,view,range);
+        const float a=vc::cloudAlpha(settings,c,view,cardRange)*flightAlpha;
         if (a<1.f/255.f || !Visible(camera,c.position,vc::bound(c))) continue;
         vc::Card cards[vc::MaxCards];
-        const int count=modern?vc::cumulus::cards(settings,c,view,a,cards):vc::cards(settings,c,view,a,cards);
+        const int count=vc::cards(settings,c,view,a,cards);
         for (int i=0;i<count;++i) {
             auto& card=cards[i];
             if (card.alpha<1.f/255.f) continue;
@@ -338,7 +403,7 @@ void __cdecl RenderClouds() {
             const float radius=vc::cardBound(card);
             if (depth+radius<view.nearClip ||
                 depth-radius>view.farClip || !Visible(camera,card.center,radius)) continue;
-            drawList[drawCount]={card,depth,drawCount,modern?cumulusRaster:textures.get(card.textureKey)};
+            drawList[drawCount]={card,depth,drawCount,textures.get(card.textureKey)};
             ++drawCount;
         }
     }
@@ -353,29 +418,6 @@ void __cdecl RenderClouds() {
 
     RenderStates states;
     if (!states.begin()) return;
-    const vc::Palette palette{
-        {float(cc.m_nSkyTopRed),float(cc.m_nSkyTopGreen),float(cc.m_nSkyTopBlue)},
-        {float(cc.m_nSkyBottomRed),float(cc.m_nSkyBottomGreen),float(cc.m_nSkyBottomBlue)},
-        {float(cc.m_nLowCloudsRed),float(cc.m_nLowCloudsGreen),float(cc.m_nLowCloudsBlue)},
-        {float(cc.m_nFluffyCloudsBottomRed),float(cc.m_nFluffyCloudsBottomGreen),float(cc.m_nFluffyCloudsBottomBlue)}
-    };
-    if (modern) {
-        const int index=std::clamp(CTimeCycle::m_CurrentStoredValue,0,15);
-        const auto& sun=CTimeCycle::m_VectorToSun[index];
-        const float moon=vc::cumulus::moonVisibility(CClock::ms_nGameClockHours,
-            CClock::ms_nGameClockMinutes,CWeather::Rain,CWeather::Foggyness);
-        const vc::cumulus::Lighting lighting(settings,palette,{sun.x,sun.y,sun.z},moon);
-        const int n=vc::cumulus::grid(settings);
-        const int vertexCount=n*n,ic=(n-1)*(n-1)*6;
-        int count=0,indexCount=0;
-        for(int i=0;i<drawCount;++i) {
-            if (count+vertexCount>BatchVertices || indexCount+ic>BatchIndices)
-                FlushCumulus(count,indexCount);
-            AppendCumulus(drawList[i].card,view,lighting,n,count,indexCount);
-        }
-        FlushCumulus(count,indexCount);
-        return;
-    }
     const vc::CloudLighting lighting(settings,palette);
     int count=0;
     RwRaster* raster=nullptr;
@@ -384,7 +426,7 @@ void __cdecl RenderClouds() {
         // Batch only consecutive matching rasters: no texture regrouping that breaks alpha order.
         if (count+6>BatchVertices || raster!=d.raster) Flush(count,raster);
         raster=d.raster;
-        const float distanceNorm=settings.lightingMode==1?vc::length(d.card.center-view.pos)/range.end:0.f;
+        const float distanceNorm=settings.lightingMode==1?vc::length(d.card.center-view.pos)/cardRange.end:0.f;
         Append(d.card,lighting.colours(d.card.shade,distanceNorm),count);
     }
     Flush(count,raster);
@@ -411,8 +453,8 @@ public:
         plugin::Events::initGameEvent += ResetField;
         plugin::Events::reInitGameEvent += ResetField;
         plugin::Events::shutdownRwEvent += ResetField;
-        plugin::Events::shutdownRwEvent += ReleaseCumulus;
-        Log(settings.renderMode==2 ? "Procedural volumetric cloud renderer installed (SA 1.0 US, shader-free cumulus)." : settings.lightingMode==0
+        plugin::Events::shutdownRwEvent += ReleaseCanopy;
+        Log(settings.renderMode==2 ? "Procedural volumetric cloud renderer installed (SA 1.0 US, shader-free canopy)." : settings.lightingMode==0
             ? "Procedural volumetric cloud renderer installed (SA 1.0 US, native lighting)."
             : "Procedural volumetric cloud renderer installed (SA 1.0 US, custom lighting).");
     }

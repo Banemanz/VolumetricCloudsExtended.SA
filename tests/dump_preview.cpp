@@ -8,7 +8,7 @@ using namespace vc;
 
 int main(int argc,char** argv) {
     const std::string scene=argc>1?argv[1]:"clear";
-    Settings cfg;
+    Settings cfg; cfg.renderMode=1;
     float pitch=0.14f;
     float height=20.f;
     if(scene=="crossed") cfg.renderMode=0;

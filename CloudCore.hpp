@@ -49,11 +49,12 @@ struct Settings {
     int colorBrightnessBoost = 64;
     bool useAdditionalTextures = true, includeOriginalTextureInRandom = true;
     std::vector<std::string> textureNames{"cloud2", "cloud3", "cloud4"};
-    int renderMode = 1, puffsPerCloud = 5; // 0: crossed, 1: clustered, 2: cumulus
+    int renderMode = 2, puffsPerCloud = 5; // 0: crossed, 1: clustered, 2: canopy
     float cumulusDensity = .95f, cumulusContrast = .65f, cumulusRimStrength = .85f;
     bool cumulusImpostors = true; // legacy INI compatibility; mode 2 is always world-fixed
     float cumulusNightLight = 1.f;
-    int cumulusDetail = 0; // 0: economy atlas/2x2; 1: higher-res atlas/3x3
+    int cumulusDetail = 0; // 0: 512x512, 1: 1024x1024
+    int canopyFlightClouds = 0; // optional native crossed groups in the layer
     float sizeScale = 1.f, opacity = 1.f, nearFadeDistance = 25.f;
     float bottomShade = 1.f, hazeStrength = 0.f;
     bool useGameFog = false;
@@ -96,7 +97,7 @@ inline bool boolean(const std::string& s, bool& v) {
     X(CumulusRimStrength,cumulusRimStrength,0.f,1.f) X(CumulusNightLight,cumulusNightLight,0.f,2.f)
 #define VC_INTS(X) X(TargetProcClouds,targetProcClouds,0,MaxClouds) \
     X(ColorBrightnessBoost,colorBrightnessBoost,0,255) X(LightingMode,lightingMode,0,1) X(RenderMode,renderMode,0,2) X(CumulusDetail,cumulusDetail,0,1) \
-    X(PuffsPerCloud,puffsPerCloud,1,MaxPuffs) X(Seed,seed,1,16777215)
+    X(PuffsPerCloud,puffsPerCloud,1,MaxPuffs) X(CanopyFlightClouds,canopyFlightClouds,0,24) X(Seed,seed,1,16777215)
 #define VC_BOOLS(X) X(UseTimecycTint,useTimecycTint) X(UseAdditionalTextures,useAdditionalTextures) \
     X(IncludeOriginalTextureInRandom,includeOriginalTextureInRandom) X(UseGameFog,useGameFog) \
     X(CumulusImpostors,cumulusImpostors)
@@ -319,10 +320,7 @@ inline float cloudAlpha(const Settings& s,const Cloud& c,const View& v,const Ran
     // Fade before the cloud's far edge reaches the range. Near fade reduces cockpit/aircraft intersections.
     const float edge=dist+bound(c)*.45f;
     const float nearFade=s.nearFadeDistance>0.f ? smooth(dist/(s.nearFadeDistance+bound(c)*.30f)) : 1.f;
-    const float randomDensity=sat((c.alpha*255.f-36.f)/92.f);
-    const float density=s.renderMode==2
-        ? s.cumulusDensity*mix(.68f,.94f,randomDensity)
-        : c.alpha;
+    const float density=c.alpha;
     return sat(density*s.opacity*smooth(c.fade)*distanceAlpha(r,edge)*nearFade);
 }
 inline int cards(const Settings& s,const Cloud& c,const View& v,float alpha,Card* out) {
