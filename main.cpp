@@ -125,12 +125,7 @@ void ReleaseCanopy() {
     canopyReady=false;canopyAttempted=false;
     ReleaseBanks();
 }
-bool EnsureCanopy() {
-    auto* device=CurrentD3DDevice();
-    if(!device)return false;
-    if(device!=canopyDevice)ReleaseCanopyTextures();
-    if(canopyUploadFailed)return false;
-    if(canopyTextures[0]&&canopyTextures[1])return true;
+bool PrepareSchematic() {
     if(!canopyAttempted) {
         canopyAttempted=true;
         const auto cachePath=ModulePath()/L"VolumetricCloudsExtended.cache";
@@ -176,14 +171,22 @@ bool EnsureCanopy() {
                 canopySize=size;
                 for(int i=0;i<2;++i)canopyHasPixels[i]=std::any_of(canopyPixels[i].begin(),canopyPixels[i].end(),[](const auto& p){return p.a!=0;});
                 return true;
-            } catch(const std::bad_alloc&) {canopyPixels={};return false;}
+            } catch(const std::bad_alloc&) {canopyPixels={};ReleaseBanks();return false;}
         };
         const int requested=vc::canopy::textureSize(settings);
         canopyReady=build(requested);
         if(!canopyReady&&requested!=vc::canopy::EconomySize)canopyReady=build(vc::canopy::EconomySize);
         if(canopyReady)Log("Canopy: static weather masks ready (live coverage).");
     }
-    if(!canopyReady)return false;
+    return canopyReady;
+}
+bool EnsureCanopy() {
+    auto* device=CurrentD3DDevice();
+    if(!device)return false;
+    if(device!=canopyDevice)ReleaseCanopyTextures();
+    if(canopyUploadFailed)return false;
+    if(canopyTextures[0]&&canopyTextures[1])return true;
+    if(!PrepareSchematic())return false;
     D3DCAPS9 caps{};
     if(FAILED(device->GetDeviceCaps(&caps)))return false;
     canopyOptions=vc::d3d9::options(caps);canopyOptions.dual=false;
@@ -192,13 +195,14 @@ bool EnsureCanopy() {
     canopyOptions.mip=(caps.TextureFilterCaps&D3DPTFILTERCAPS_MIPFLINEAR)!=0;
     canopyDevice=device;
     try {
-        bool success=true;
-        for(int i=0;i<2;++i) {
-            auto result=vc::d3d9::uploadCanopy(device,canopyPixels[i],UINT(canopySize),&canopyTextures[i]);
-            if(!result)result=vc::d3d9::uploadCanopy(device,canopyPixels[i],UINT(canopySize),&canopyTextures[i],true);
-            if(!result){success=false;break;}
-        }
-        if(success)return true;
+        D3DFORMAT format=D3DFMT_UNKNOWN;
+        const bool compact=vc::d3d9::compactFormat(device,D3DRTYPE_TEXTURE,
+            canopyOptions.filter==D3DTEXF_LINEAR||canopyOptions.mip);
+        const auto result=vc::d3d9::uploadPair(canopyTextures,compact,format,
+            [&](int i,IDirect3DTexture9** out,bool managed,D3DFORMAT f){
+                return vc::d3d9::uploadCanopy(device,canopyPixels[i],UINT(canopySize),out,managed,true,f);
+            });
+        if(result){Log(format==D3DFMT_A8L8?"Canopy: lossless A8L8 textures.":"Canopy: RGBA texture fallback.");return true;}
     } catch(const std::bad_alloc&) {}
     ReleaseCanopyTextures();canopyDevice=device;canopyUploadFailed=true;
     Log("Canopy: native 2D texture upload failed; using classic clouds.");return false;
@@ -254,28 +258,26 @@ bool EnsureBanks() {
     // attempted if the driver rejects staging/upload.
     if(!bankOptions.dual)Log("3D cloud device lacks dual-volume blending; using nearest weather endpoint.");
     if(bankOptions.filter==D3DTEXF_POINT)Log("3D cloud device lacks linear volume filtering; using point filtering.");
+    const bool compact=vc::d3d9::compactFormat(device,D3DRTYPE_VOLUMETEXTURE,bankOptions.filter==D3DTEXF_LINEAR);
     for(UINT w=UINT(bankVolume.width);w>=16;w/=2) {
         if(w>caps.MaxVolumeExtent)continue;
         const UINT d=std::min(UINT(bankVolume.depth),w);
-        bool ready=true;
-        for(int layer=0;layer<2;++layer) {
-            auto result=vc::d3d9::upload(device,bankVolume,layer,w,d,&bankTextures[layer]);
-            if(!result) {
-                LogD3DFailure("staged upload",result);
-                result=vc::d3d9::upload(device,bankVolume,layer,w,d,&bankTextures[layer],true);
-                if(!result){LogD3DFailure("managed upload",result);ready=false;break;}
-            }
-        }
-        if(ready) {
+        D3DFORMAT format=D3DFMT_UNKNOWN;
+        const auto result=vc::d3d9::uploadPair(bankTextures,compact,format,
+            [&](int layer,IDirect3DVolumeTexture9** out,bool managed,D3DFORMAT f){
+                return vc::d3d9::upload(device,bankVolume,layer,w,d,out,managed,f);
+            });
+        if(result) {
             bankDownsampled=w!=UINT(bankVolume.width)||d!=UINT(bankVolume.depth);
             const bool gpu=bankGpu.create(device,caps,creation.BehaviorFlags);
-            std::snprintf(info,sizeof(info),"3D cloud bank ready: %lux%lux%lu RGBA volumes, %s, %s weather, %s filtering.",
+            std::snprintf(info,sizeof(info),"3D cloud bank ready: %lux%lux%lu %s volumes, %s, %s weather, %s filtering.",
                 static_cast<unsigned long>(w),static_cast<unsigned long>(w),static_cast<unsigned long>(d),
+                format==D3DFMT_A8L8?"lossless A8L8":"RGBA",
                 gpu?"hardware vertex / fixed-function pixels":"CPU vertex / fixed-function pixels",
                 bankOptions.dual?"interpolated":"endpoint",bankOptions.filter==D3DTEXF_LINEAR?"linear":"point");
             Log(info);return true;
         }
-        for(auto& texture:bankTextures){if(texture)texture->Release();texture=nullptr;}
+        LogD3DFailure("volume pair upload",result);
     }
     return fail();
 }
@@ -290,11 +292,14 @@ bool EnsureBillboards() {
     // atlas mips which could blend unrelated neighboring cells.
     billboardOptions.mip=false;
     try {
-        for(int i=0;i<2;++i) {
-            auto result=vc::d3d9::uploadCanopy(bankDevice,billboardAtlas.pixels[i],vc::billboards::AtlasSize,&billboardTextures[i],false,false);
-            if(!result)result=vc::d3d9::uploadCanopy(bankDevice,billboardAtlas.pixels[i],vc::billboards::AtlasSize,&billboardTextures[i],true,false);
-            if(!result) {LogD3DFailure("far billboard upload",result);throw std::bad_alloc();}
-        }
+        D3DFORMAT format=D3DFMT_UNKNOWN;
+        const bool compact=vc::d3d9::compactFormat(bankDevice,D3DRTYPE_TEXTURE,billboardOptions.filter==D3DTEXF_LINEAR);
+        const auto result=vc::d3d9::uploadPair(billboardTextures,compact,format,
+            [&](int i,IDirect3DTexture9** out,bool managed,D3DFORMAT f){
+                return vc::d3d9::uploadCanopy(bankDevice,billboardAtlas.pixels[i],vc::billboards::AtlasSize,out,managed,false,f);
+            });
+        if(!result){LogD3DFailure("far billboard upload",result);throw std::bad_alloc();}
+        Log(format==D3DFMT_A8L8?"Far cloud LOD: lossless A8L8 textures.":"Far cloud LOD: RGBA texture fallback.");
         const auto lod=vc::banks::lod(settings,vc::cloudRange(settings));
         char msg[160];std::snprintf(msg,sizeof(msg),"Far cloud LOD ready: volume-projected billboards, transition %.0f-%.0f.",lod.start,lod.end);Log(msg);
         return true;
@@ -304,6 +309,17 @@ bool EnsureBillboards() {
     }
 }
 
+// Preload at the end of RenderWare initialization, outside a frame.
+// The immutable CPU schematic remains resident through new games and
+// D3D loss/reset; only the GPU resources are released on device resets.
+// Old/late ASI loaders still have the lazy Ensure* path.
+void PreloadClouds() {
+    if(settings.renderMode!=2||!settings.targetProcClouds||settings.opacity<=0.f||settings.cumulusDensity<=0.f)return;
+    const bool first=!canopyAttempted;
+    if(!PrepareSchematic())return;
+    if(EnsureCanopy()&&EnsureBanks())EnsureBillboards();
+    if(first)Log("Cloud schematic resident in RAM; initial texture preload attempted.");
+}
 void ResetField() {
     field.reset(settings);
     canopyDrift={};
@@ -499,7 +515,7 @@ bool DrawBanks(RwCamera* camera,const vc::View& view,const vc::Range& range,
             bankOptions.vertexFog,visibility,bankLight,transform,projection,viewport);
         if(useGpu) {
             vc::banks::buildMesh(bankGpuMesh,settings,view,range,canopyDrift,wx,wy,occupancy,weather,farReady);
-            if(bankGpuMesh.indices.empty())return true;
+            if(bankGpuMesh.vertices.empty())return true;
             const auto uploaded=bankGpu.upload(bankGpuMesh);
             if(!uploaded) {
                 LogD3DFailure("hardware cloud upload; using CPU",uploaded);
@@ -527,7 +543,7 @@ bool DrawBanks(RwCamera* camera,const vc::View& view,const vc::Range& range,
     const bool queryThisDraw=bankPixelQuery&&bankQueryFrames==0&&!bankDrawLogged;
     const auto result=useGpu?vc::d3d9::drawRaw(bankDevice,{bankTextures[0],bankTextures[1]},bankOptions,
         bankGpuMesh.vertices.data(),UINT(bankGpuMesh.vertices.size()),sizeof(vc::banks::GpuVertex),0,
-        bankGpuMesh.indices.data(),UINT(bankGpuMesh.indices.size()/3),climate.coverage,bankOptions.vertexFog,
+        nullptr,UINT(bankGpuMesh.triangleCount()),climate.coverage,bankOptions.vertexFog,
         true,false,D3DCOLOR_XRGB(vc::d3d9::byte(fog.r),vc::d3d9::byte(fog.g),vc::d3d9::byte(fog.b)),
         nullptr,nullptr,false,&passes):
         vc::d3d9::drawProjected(bankDevice,{bankTextures[0],bankTextures[1]},bankOptions,
@@ -547,7 +563,7 @@ bool DrawBanks(RwCamera* camera,const vc::View& view,const vc::Range& range,
     if(!bankDrawLogged) {
         char info[256];
         std::snprintf(info,sizeof(info),"3D cloud draw submitted: %d world-fixed slice patches, %lu triangles, player Z=%.1f, canopy Z=%.1f, camera Z=%.1f, handover=%.2f, coverage=%.2f.",
-            useGpu?bankGpuMesh.slices:bankMesh.slices,static_cast<unsigned long>((useGpu?bankGpuMesh.indices.size():bankProjected.indices.size())/3),playerZ,vc::canopy::altitude(settings),
+            useGpu?bankGpuMesh.slices:bankMesh.slices,static_cast<unsigned long>(useGpu?bankGpuMesh.triangleCount():bankProjected.indices.size()/3),playerZ,vc::canopy::altitude(settings),
             view.pos.z,handover,climate.coverage);
         Log(info);bankDrawLogged=true;
     }
@@ -737,7 +753,9 @@ public:
         }
         ResetField();
         plugin::patch::RedirectCall(CloudCall,RenderClouds);
+        plugin::Events::initRwEvent += PreloadClouds;
         plugin::Events::initGameEvent += ResetField;
+        plugin::Events::initGameEvent += PreloadClouds;
         plugin::Events::reInitGameEvent += ResetField;
         plugin::Events::shutdownRwEvent += ResetField;
         plugin::Events::shutdownRwEvent += ReleaseCanopy;

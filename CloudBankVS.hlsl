@@ -11,6 +11,7 @@ float4 nearData : register(c6); // near clip, reciprocal near fade, interior haz
 float4 distances : register(c7); // max range, reciprocal range taper, LOD start, reciprocal LOD transition
 float4 fogData : register(c8); // start, reciprocal fog range, hardware fog flag, unused
 float4 rgb : register(c9);
+float4 latticeStep : register(c10);
 float ease(float x) { x=saturate(x);return x*x*(3-2*x); }
 struct Output {
     float4 pos : POSITION;
@@ -28,12 +29,14 @@ Output main(float3 position : POSITION, float4 lattice : TEXCOORD0) {
     float3 ad=abs(delta);
     float3 weights=saturate((ad/max(max(max(ad.x,ad.y),ad.z),.001)-.8)*5);
     weights=weights*weights*(3-2*weights);
-    float3 axis=saturate(1-abs(lattice.x-float3(0,1,2)));
+    float3 axis=lattice.rgb; // exact one-hot D3DCOLOR channels
+    float parity=floor(lattice.a*2+.5);
+    float even=min(parity,1),fourth=max(parity-1,0);
     float w=dot(weights,axis)/max(dot(weights,float3(1,1,1)),.0001);
     float cosine=dot(ad,axis)/max(d,.001);
     float fine=1-ease((d-140)/300);
     float coarse=ease((d-620)/680);
-    float path=lattice.y*(fine+lattice.z*2*(1-fine)*(1-coarse)+lattice.w*4*(1-fine)*coarse)/max(cosine,.4);
+    float path=dot(axis,latticeStep.xyz)*(fine+even*2*(1-fine)*(1-coarse)+fourth*4*(1-fine)*coarse)/max(cosine,.4);
     float nearWeight=ease((d-8)/24)*lerp(ease((d-nearData.x)*nearData.y),1,nearData.z);
     float fade=ease((distances.x-d)*distances.y);
     float lod=1-ease((d-distances.z)*distances.w);

@@ -7,7 +7,8 @@
 // The periodic world schematic is immutable. Weather changes blend its two
 // baked endpoints and wind shifts coordinates; neither requires disk writes.
 namespace vc::cache {
-constexpr std::uint32_t Version=1; // bump whenever any bake equation/layout changes
+constexpr std::uint32_t Version=2; // v2 stores exact luminance + opacity; v1 is RGBA
+constexpr std::uint32_t LegacyVersion=1;
 static_assert(sizeof(canopy::Pixel)==4);
 struct Hash {
     std::uint64_t value=14695981039346656037ull;
@@ -17,9 +18,9 @@ struct Hash {
     }
     template<class T> void add(T v){add(&v,sizeof(v));}
 };
-inline std::uint64_t key(const Settings& s,int size) {
+inline std::uint64_t key(const Settings& s,int size,std::uint32_t version=Version) {
     Hash h;
-    h.add(Version);h.add(size);h.add(s.seed);h.add(s.targetProcClouds);
+    h.add(version);h.add(size);h.add(s.seed);h.add(s.targetProcClouds);
     h.add(s.badWeatherDensityMultiplier);h.add(s.minSpawnZ);h.add(s.maxSpawnZ);
     h.add(s.sizeScale);h.add(s.opacity);h.add(s.cumulusDensity);
     h.add(s.cumulusContrast);h.add(s.cumulusRimStrength);h.add(int(s.cumulusDetail));
@@ -40,13 +41,26 @@ inline bool transfer(std::ostream& out,const void* p,std::size_t n,Hash& h) {
 }
 inline bool load(std::istream& in,const Settings& s,int size,Masks& masks,banks::Volume& volume,billboards::Atlas& atlas) {
     Header header{};Hash h;
-    if(!transfer(in,&header,sizeof(header),h)||header.magic!=Magic||header.version!=Version||
-       header.signature!=key(s,size)||header.size!=std::uint32_t(size))return false;
+    if(!transfer(in,&header,sizeof(header),h)||header.magic!=Magic||(header.version!=Version&&header.version!=LegacyVersion)||
+       header.signature!=key(s,size,header.version)||header.size!=std::uint32_t(size))return false;
     // File lengths are never used as allocation sizes. Even malformed input
     // only allocates the exact dimensions already validated in the INI.
     Masks m; banks::Volume v;billboards::Atlas a;
     const auto readPixels=[&](auto& p,std::size_t n){
-        p.resize(n);return transfer(in,p.data(),p.size()*sizeof(canopy::Pixel),h);
+        p.resize(n);
+        if(header.version==LegacyVersion)return transfer(in,p.data(),n*sizeof(canopy::Pixel),h);
+        // A bounded sequential read on HDD, then expand losslessly for CPU
+        // sampling and devices that lack native luminance texture support.
+        std::array<std::uint8_t,32768> packed{};
+        for(std::size_t start=0;start<n;) {
+            const auto count=std::min(n-start,packed.size()/2);
+            if(!transfer(in,packed.data(),count*2,h))return false;
+            for(std::size_t i=0;i<count;++i) {
+                const auto l=packed[2*i];p[start+i]={l,l,l,packed[2*i+1]};
+            }
+            start+=count;
+        }
+        return true;
     };
     for(auto& p:m)if(!readPixels(p,std::size_t(size)*size))return false;
     if(s.hybridClouds) {
@@ -68,11 +82,25 @@ inline bool load(std::istream& in,const Settings& s,int size,Masks& masks,banks:
     masks=std::move(m);volume=std::move(v);atlas=std::move(a);
     return true;
 }
-inline bool save(std::ostream& out,const Settings& s,int size,const Masks& masks,const banks::Volume& volume,const billboards::Atlas& atlas) {
-    const Header header{Magic,key(s,size),Version,std::uint32_t(size)};
+inline bool save(std::ostream& out,const Settings& s,int size,const Masks& masks,const banks::Volume& volume,const billboards::Atlas& atlas,std::uint32_t version=Version) {
+    if(version!=Version&&version!=LegacyVersion)return false;
+    const Header header{Magic,key(s,size,version),version,std::uint32_t(size)};
     Hash h;if(!transfer(out,&header,sizeof(header),h))return false;
     const auto writePixels=[&](const auto& p,std::size_t n){
-        return p.size()==n&&transfer(out,p.data(),n*sizeof(canopy::Pixel),h);
+        if(p.size()!=n)return false;
+        if(version==LegacyVersion)return transfer(out,p.data(),n*sizeof(canopy::Pixel),h);
+        std::array<std::uint8_t,32768> packed{};
+        for(std::size_t start=0;start<n;) {
+            const auto count=std::min(n-start,packed.size()/2);
+            for(std::size_t i=0;i<count;++i) {
+                const auto pixel=p[start+i];
+                if(pixel.r!=pixel.g||pixel.r!=pixel.b)return false; // never discard a colour channel
+                packed[2*i]=pixel.r;packed[2*i+1]=pixel.a;
+            }
+            if(!transfer(out,packed.data(),count*2,h))return false;
+            start+=count;
+        }
+        return true;
     };
     for(const auto& p:masks)if(!writePixels(p,std::size_t(size)*size))return false;
     if(s.hybridClouds) {

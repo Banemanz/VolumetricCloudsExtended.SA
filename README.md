@@ -232,9 +232,18 @@ and [pure-device GetViewport documentation](https://learn.microsoft.com/en-us/wi
   480-pose Linux mesh-only benchmark: previous mesh 1.18ms, optimized
   CPU mesh 1.14ms, GPU-input mesh 0.43ms, all ~7276 triangles average
   (excludes legacy CPU projection and hardware draw). These are not GTA
-  FPS or Intel HD measurements. The GPU still bears the fill-rate cost
-  of translucent clouds. The fixed-index/stream buffer uses <1.4 MiB.
-  Economy GPU textures are ~8.67 MiB in flight; detail ~28.67 MiB.
+  FPS or Intel HD measurements. A subsequent compact vertex/patch pass
+  on the same 480-pose benchmark reduced GPU-input mesh time from 0.422
+  to 0.321ms and CPU fallback mesh time from 1.200 to 0.944ms, preserving
+  all 7276 average triangles and 14552 vertices. Each hardware vertex is
+  16 bytes instead of 28 (43% less streamed data); the static index buffer
+  eliminates CPU index generation entirely on the hardware path.
+  The GPU still bears the fill-rate cost of translucent clouds.
+  All generated textures are greyscale with independent 8-bit opacity:
+  use lossless A8L8 when the device advertises the format and required
+  filtering, otherwise use full-resolution RGBA. Economy texture storage
+  is ~4.33 MiB if all resources support A8L8 (~8.67 MiB RGBA); detail
+  ~14.33 MiB (~28.67 MiB RGBA). Actual driver allocations may differ.
   No per-frame density/texture generation, weather uploads or screen copy.
 - **Compatibility:** the direct D3D9 draw carries actual three-component
   texture coordinates, not a RenderWare 2D atlas. SA's normal pure-device
@@ -253,26 +262,36 @@ and [pure-device GetViewport documentation](https://learn.microsoft.com/en-us/wi
   GPU occlusion query records depth-passing samples without waiting.
   Device loss/reset and RW shutdown release owned resources.
 - **Initialization / disk schematic:** `VolumetricCloudsExtended.cache`
-  stores the two exact canopy masks, complete two-endpoint RGBA volume,
-  conservative occupancy tables and the optional far atlas. The default
-  economy file is 8,432,196 bytes (~8.04 MiB). The release ZIP includes a
-  pre-baked default cache. Keep it beside the ASI. At startup the ASI checks
-  the format version, relevant bake settings, fixed expected lengths and
-  checksum; missing, stale or corrupted files rebuild automatically.
-  Replacement is atomic; an unwritable folder simply uses generated data.
-  No per-frame disk traffic, no cache writes on weather transitions, and
-  no need for world-sized files: the immutable periodic schematic repeats
-  seamlessly, with live wind UV offsets and live weather blending.
-  A local run baked the default data in 919ms and reopened it in 29ms
-  (warm filesystem cache, not a physical HDD benchmark).
-  Deleting the cache is safe; the exact same procedural field is rebuilt.
-  GPU texture transfers remain deferred until first flight.
+  stores the two exact canopy masks, complete two-endpoint volume,
+  conservative occupancy tables and optional far atlas. Version 2 stores
+  luminance + opacity rather than duplicate RGB channels: the default
+  economy file shrinks from 8,432,196 to 4,237,892 bytes (~4.04 MiB)
+  without altering a texel. Existing v1 cache files remain readable.
+  The release ZIP includes a pre-baked default cache. Keep it beside the
+  ASI. During RenderWare initialization a single sequential read validates
+  the version, relevant bake settings, expected lengths and checksum.
+  Missing, stale or corrupted files rebuild automatically. Replacement is
+  atomic; an unwritable folder simply uses generated data. CPU data stays
+  resident (~8.04 MiB expanded default schematic), including across game
+  restarts within the same process and D3D9 device loss/reset. GPU textures
+  are preloaded during startup; late ASI loaders retain the lazy fallback.
+  Reset recovery reuploads from RAM without reopening the cache.
+  No per-frame cache disk traffic and no writes on weather transitions:
+  the immutable periodic schematic repeats seamlessly, with live wind UV
+  offsets and live weather blending. A specific startup bake is only
+  required if the cache is missing or its bake-related settings changed.
+  Local 20-load warm filesystem benchmark: v1 16.8ms, v2 10.4ms; this
+  excludes physical HDD seek/read latency and GPU uploads. Deleting the
+  cache is safe; the exact same procedural field is rebuilt. The RAM is
+  ordinary pageable memory; the mod does not pin it against OS paging.
 
 The target is convincing 2013-era cloud volumes at 2004-game budgets,
 not a recreation of Rockstar assets or renderer. References:
 [Rockstar's RDR2 atmospheric rendering presentation](https://advances.realtimerendering.com/s2019/),
 [GPU Gems 1, chapter 39: Volume Rendering Techniques](https://developer.nvidia.com/gpugems/gpugems/part-vi-beyond-triangles/chapter-39-volume-rendering-techniques),
 [Direct3D 9 volume textures](https://learn.microsoft.com/en-us/windows/win32/direct3d9/volume-texture-resources),
+[Direct3D 9 texture formats (A8L8)](https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dformat),
+[Direct3D 9 resource management](https://learn.microsoft.com/en-us/windows/win32/direct3d9/managing-resources),
 [Unity community cloud renderer](https://github.com/jaagupku/volumetric-clouds)
 (weather mask, vertical profile, erosion), and
 [Project V Atmosphere](https://github.com/rsrodev/ProjectVAtmosphere)

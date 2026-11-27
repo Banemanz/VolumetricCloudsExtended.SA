@@ -69,6 +69,28 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
         return fail("Unsupported readback format");
     if(FAILED(hr=device->CreateOffscreenPlainSurface(desc.Width,desc.Height,desc.Format,D3DPOOL_SYSTEMMEM,&readback.p,nullptr)))
         return fail("CreateOffscreenPlainSurface",hr);
+    // Read actual rendered RGB rather than merely comparing source bytes.
+    const auto capture=[&](std::vector<DWORD>& image)->bool {
+        if(FAILED(device->GetRenderTargetData(back.p,readback.p)))return false;
+        D3DLOCKED_RECT lock{};
+        if(FAILED(readback->LockRect(&lock,nullptr,D3DLOCK_READONLY)))return false;
+        image.resize(std::size_t(desc.Width)*desc.Height);
+        for(UINT y=0;y<desc.Height;++y)
+            std::memcpy(image.data()+std::size_t(y)*desc.Width,
+                static_cast<const char*>(lock.pBits)+std::size_t(y)*lock.Pitch,desc.Width*sizeof(DWORD));
+        return SUCCEEDED(readback->UnlockRect());
+    };
+    const auto compare=[&](const char* name,const std::vector<DWORD>& expected)->bool {
+        std::vector<DWORD> actual;if(!capture(actual)||actual.size()!=expected.size())return false;
+        unsigned maxError=0;std::uint64_t sum=0;
+        for(std::size_t i=0;i<actual.size();++i)for(int shift:{0,8,16}) {
+            const unsigned diff=unsigned(std::abs(int((actual[i]>>shift)&255)-int((expected[i]>>shift)&255)));
+            maxError=std::max(maxError,diff);sum+=diff;
+        }
+        std::printf("%s: compact vs RGBA max RGB error %u/255, mean %.4f/255\n",
+            name,maxError,double(sum)/(3*actual.size()));
+        return maxError<=2;
+    };
     for(float coverage:{0.f,.5f,1.f}) {
         if(coverage==.5f&&!opts.dual){std::puts("No dual-volume blend support; endpoints only.");continue;}
         if(FAILED(hr=device->Clear(0,nullptr,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER,0xFF000000,1.f,0)))
@@ -174,6 +196,9 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
     if(FAILED(hr=device->Clear(0,nullptr,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER,0xFF000000,1.f,0)))return fail("2D clear",hr);
     if(FAILED(hr=device->BeginScene()))return fail("2D begin",hr);
     auto canopyOpts=opts;canopyOpts.dual=false;
+    const DWORD linear=D3DPTFILTERCAPS_MINFLINEAR|D3DPTFILTERCAPS_MAGFLINEAR;
+    canopyOpts.filter=(caps.TextureFilterCaps&linear)==linear?D3DTEXF_LINEAR:D3DTEXF_POINT;
+    canopyOpts.mip=(caps.TextureFilterCaps&D3DPTFILTERCAPS_MIPFLINEAR)!=0;
     canopyResult=d3d9::drawProjected(device,{canopyTex.p,canopyTex.p},canopyOpts,projected,0,false,{0,0,240});
     if(!canopyResult)return fail(canopyResult.operation,canopyResult.hr);
     if(FAILED(hr=device->EndScene()))return fail("2D end",hr);
@@ -182,6 +207,32 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
     const DWORD sheet=pixel(desc.Width/4,desc.Height/2);
     readback->UnlockRect();
     if(std::abs(int(sheet&255)-100)>6)return fail("Projected canopy texture");
+    // Exact grayscale + alpha textures, including alpha-weighted mipmaps.
+    // Use varying luminance/alpha and enough repeats to exercise minification.
+    if(d3d9::compactFormat(device,D3DRTYPE_TEXTURE,canopyOpts.filter==D3DTEXF_LINEAR||canopyOpts.mip)) {
+        std::vector<canopy::Pixel> pattern(64*64);
+        for(unsigned y=0;y<64;++y)for(unsigned x=0;x<64;++x) {
+            const auto l=std::uint8_t((x*13+y*19)&255);
+            pattern[y*64+x]={l,l,l,std::uint8_t((x*7+y*11)&255)};
+        }
+        std::array<Com<IDirect3DTexture9>,2> pair;
+        for(int i=0;i<2;++i) {
+            const auto result=d3d9::uploadCanopy(device,pattern,64,&pair[i].p,false,true,
+                i?D3DFMT_A8L8:D3DFMT_A8R8G8B8);
+            if(!result)return fail(result.operation,result.hr);
+        }
+        auto mipBatch=projected;
+        for(auto& v:mipBatch.vertices){v.u=v.x*.15f;v.v=v.y*.15f;}
+        std::vector<DWORD> reference;
+        for(int i=0;i<2;++i) {
+            if(FAILED(hr=device->Clear(0,nullptr,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER,0xFF000000,1.f,0)))return fail("Compact canopy clear",hr);
+            if(FAILED(hr=device->BeginScene()))return fail("Compact canopy begin",hr);
+            const auto result=d3d9::drawProjected(device,{pair[i].p,pair[i].p},canopyOpts,mipBatch,0,false,{0,0,240});
+            if(FAILED(hr=device->EndScene()))return fail("Compact canopy end",hr);
+            if(!result)return fail(result.operation,result.hr);
+            if(i?!compare("Mipmapped canopy",reference):!capture(reference))return fail("Compact canopy visual parity");
+        }
+    } else std::puts("A8L8 2D format/filter unavailable: RGBA fallback.");
     // Render the generated density and actual mesh through the same backend,
     // with a perspective camera near the altitude/position in the flight
     // recording. The test above isolates the sampler; this checks that the
@@ -196,6 +247,17 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
         if(!result)return fail(result.operation,result.hr);
         textures[layer]=owner[layer].p;
     }
+    std::array<Com<IDirect3DVolumeTexture9>,2> compactOwner;
+    std::array<IDirect3DVolumeTexture9*,2> compactVolume{};
+    D3DFORMAT volumeFormat=D3DFMT_UNKNOWN;
+    const auto compactResult=d3d9::uploadPair(compactVolume,
+        d3d9::compactFormat(device,D3DRTYPE_VOLUMETEXTURE,opts.filter==D3DTEXF_LINEAR),volumeFormat,
+        [&](int layer,IDirect3DVolumeTexture9** out,bool managed,D3DFORMAT format) {
+            return d3d9::upload(device,volume,layer,uploadWidth,uploadDepth,out,managed,format);
+        });
+    for(int i=0;i<2;++i)compactOwner[i].p=compactVolume[i];
+    if(!compactResult)return fail(compactResult.operation,compactResult.hr);
+    std::puts(volumeFormat==D3DFMT_A8L8?"Testing lossless A8L8 volume.":"A8L8 volume unavailable: testing RGBA fallback.");
     const float wx=.94f,wy=.53f;
     const Vec forward=unit(Vec{.96f,-.27f,-.17f});
     const Vec right=unit(cross(forward,{0,0,1})),up=cross(right,forward);
@@ -247,10 +309,17 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
             pos.x,pos.y,pos.z,mesh.slices,visible,empty,peak);
         if(visible<desc.Width*desc.Height/64 || (pos.z>settings.maxSpawnZ&&empty<desc.Width*desc.Height/64) || peak<25 || peak>209)
             return fail("Flight scene readback has no cloud/sky contrast");
+        if(FAILED(hr=device->Clear(0,nullptr,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER,0xFF000000,1.f,0)))return fail("Compact scene clear",hr);
+        if(FAILED(hr=device->Clear(1,&sentinel,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER,0xFF008000,.5f,0)))return fail("Compact scene sentinel",hr);
+        if(FAILED(hr=device->BeginScene()))return fail("Compact scene begin",hr);
+        const auto compactDraw=d3d9::drawProjected(device,{compactVolume[0],compactVolume[1]},opts,batch,coverage,true,{90,120,160});
+        if(FAILED(hr=device->EndScene()))return fail("Compact scene end",hr);
+        if(!compactDraw)return fail(compactDraw.operation,compactDraw.hr);
+        if(!compare("Volume flight scene",reference))return fail("Compact volume visual parity");
         if(hw.available()) {
             banks::GpuMesh gm;banks::buildMesh(gm,settings,camera,cloudRange(settings),{},wx,wy,
                 uploadWidth==volume.width&&uploadDepth==volume.depth?&volume:nullptr,coverage);
-            if(gm.indices!=mesh.indices||gm.vertices.size()!=mesh.vertices.size())return fail("Hardware and CPU source geometry differ");
+            if(gm.triangleCount()!=mesh.indices.size()/3||gm.vertices.size()!=mesh.vertices.size())return fail("Hardware and CPU source geometry differ");
             for(std::size_t i=0;i<mesh.vertices.size();++i)
                 if(length(gm.vertices[i].pos-mesh.vertices[i].pos)>.001f)return fail("Hardware and CPU world lattice differs");
             d3d9::GpuPasses passes;passes.stream=&hw;
@@ -261,7 +330,7 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
             if(FAILED(hr=device->Clear(1,&sentinel,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER,0xFF008000,.5f,0)))return fail("HW occlusion sentinel",hr);
             if(FAILED(hr=device->BeginScene()))return fail("HW scene begin",hr);
             const auto draw=d3d9::drawRaw(device,{textures[0],textures[1]},opts,gm.vertices.data(),UINT(gm.vertices.size()),
-                sizeof(banks::GpuVertex),0,gm.indices.data(),UINT(gm.indices.size()/3),coverage,opts.vertexFog,true,false,
+                sizeof(banks::GpuVertex),0,nullptr,UINT(gm.triangleCount()),coverage,opts.vertexFog,true,false,
                 D3DCOLOR_XRGB(90,120,160),nullptr,nullptr,true,&passes);
             if(FAILED(hr=device->EndScene()))return fail("HW scene end",hr);
             if(!draw)return fail(draw.operation,draw.hr);
@@ -294,6 +363,17 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
         if(!result)return fail(result.operation,result.hr);
         if(farTextures[layer]->GetLevelCount()!=1)return fail("Atlas must not allocate bleeding mip levels");
     }
+    std::array<Com<IDirect3DTexture9>,2> compactFarOwner;
+    std::array<IDirect3DTexture9*,2> compactFar{};
+    D3DFORMAT atlasFormat=D3DFMT_UNKNOWN;
+    const auto atlasUpload=d3d9::uploadPair(compactFar,
+        d3d9::compactFormat(device,D3DRTYPE_TEXTURE,canopyOpts.filter==D3DTEXF_LINEAR),atlasFormat,
+        [&](int layer,IDirect3DTexture9** out,bool managed,D3DFORMAT format) {
+            return d3d9::uploadCanopy(device,atlas.pixels[layer],billboards::AtlasSize,out,managed,false,format);
+        });
+    for(int i=0;i<2;++i)compactFarOwner[i].p=compactFar[i];
+    if(!atlasUpload)return fail(atlasUpload.operation,atlasUpload.hr);
+    std::puts(atlasFormat==D3DFMT_A8L8?"Testing lossless A8L8 atlas.":"A8L8 atlas unavailable; testing RGBA fallback.");
     View distant{{2164,-1265,490},{1,0,0},{0,0,1},{0,1,0},450,1};
     banks::Mesh cards;billboards::buildMesh(cards,settings,distant,cloudRange(settings),{},atlas,wx,wy,.5f);
     if(cards.indices.empty())return fail("No far LOD geometry");
@@ -305,7 +385,7 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
     for(const auto& p:cards.vertices)farBatch.clip.push_back(d3d9::clipVertex(p.pos,p.u,p.v,p.w,p.alpha,p.fog,transformFar));
     d3d9::projectMesh(farBatch,viewport,{240,240,240},1.f,cards.indices.data(),cards.indices.size());
     if(farBatch.indices.empty())return fail("Far LOD clipped at scene far plane");
-    auto atlasOpts=opts;atlasOpts.mip=false;
+    auto atlasOpts=canopyOpts;atlasOpts.dual=opts.dual;atlasOpts.mip=false;
     for(float coverage:{0.f,.5f,1.f}) {
         if(FAILED(hr=device->Clear(0,nullptr,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER,0xFF000000,1.f,0)))return fail("Atlas clear",hr);
         if(FAILED(hr=device->BeginScene()))return fail("Atlas begin",hr);
@@ -323,6 +403,14 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
         readback->UnlockRect();
         std::printf("Far billboard coverage %.2f: %zu cards, %u visible pixels beyond scene far plane\n",coverage,cards.vertices.size()/4,visible);
         if(visible<16)return fail("Far LOD not visible on real D3D9 device");
+        std::vector<DWORD> reference;
+        if(!capture(reference))return fail("Atlas capture");
+        if(FAILED(hr=device->Clear(0,nullptr,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER,0xFF000000,1.f,0)))return fail("Compact atlas clear",hr);
+        if(FAILED(hr=device->BeginScene()))return fail("Compact atlas begin",hr);
+        result=d3d9::drawProjected(device,{compactFar[0],compactFar[1]},atlasOpts,farBatch,coverage,false,{90,120,160});
+        if(FAILED(hr=device->EndScene()))return fail("Compact atlas end",hr);
+        if(!result)return fail(result.operation,result.hr);
+        if(!compare("Distant cloud atlas",reference))return fail("Compact atlas visual parity");
     }
     return 0;
 }

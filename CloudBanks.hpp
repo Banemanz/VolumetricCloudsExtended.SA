@@ -21,9 +21,27 @@ struct Vertex {Vec pos;float u{},v{},w{},alpha{},fog{1.f};};
 struct Mesh {std::vector<Vertex> vertices;std::vector<std::uint16_t> indices;int slices{};};
 // Four corner positions and lattice attributes, no per-frame CPU lighting,
 // UV, fog, opacity or projection. A VS2 program computes the same equations.
-struct GpuVertex {Vec pos;float axis,step,even,fourth;};
-static_assert(sizeof(GpuVertex)==28);
-struct GpuMesh {std::vector<GpuVertex> vertices;std::vector<std::uint16_t> indices;int slices{};};
+// A universally supported D3DCOLOR input carries one-hot RGB axis flags
+// and a 3-level alpha parity code. Only 16 bytes per streamed vertex.
+struct GpuVertex {Vec pos;std::uint32_t lattice;};
+static_assert(sizeof(GpuVertex)==16);
+inline std::uint32_t latticeCode(int axis,int i) {
+    const std::uint32_t parity=i%4==0?255u:i%2==0?128u:0u;
+    return (parity<<24)|(255u<<((2-axis)*8));
+}
+struct GpuMesh {
+    std::vector<GpuVertex> vertices;
+    int slices{};
+    std::size_t triangleCount() const{return std::size_t(slices)*2;}
+};
+inline int verticalSteps(const Settings& s) {
+    const float base=s.cumulusDetail?16.f:20.f;
+    return std::max(4,int(std::ceil((s.maxSpawnZ-s.minSpawnZ)/(base*4.f)))*4);
+}
+inline Vec latticeSpacing(const Settings& s) {
+    const float base=s.cumulusDetail?16.f:20.f;
+    return {base,base,(s.maxSpawnZ-s.minSpawnZ)/verticalSteps(s)};
+}
 struct TextureOrigin {float u,v,tile,band;};
 inline TextureOrigin textureOrigin(const Settings& s,const View& v,const canopy::Drift& drift) {
     const float tile=canopy::tileWorldSize(s);
@@ -283,15 +301,17 @@ template<class MeshType>
 inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range& r,
                       const canopy::Drift& drift,float wx,float wy,const Volume* volume=nullptr,
                       float weather=0.f,bool billboardAvailable=true) {
-    m.vertices.clear();m.indices.clear();m.slices=0;
+    using OutputVertex=typename decltype(m.vertices)::value_type;
+    constexpr bool gpu=std::is_same_v<OutputVertex,GpuVertex>;
+    m.vertices.clear();if constexpr(!gpu)m.indices.clear();m.slices=0;
     const float band=s.maxSpawnZ-s.minSpawnZ;
     if(!s.hybridClouds||!s.targetProcClouds||r.end<5.f||band<1.f||
        !std::isfinite(wx)||!std::isfinite(wy)||wx<=0||wy<=0||wx>10.f||wy>10.f)return;
     const auto levels=lod(s,r,billboardAvailable,view.pos.z-(s.minSpawnZ+s.maxSpawnZ)*.5f);
     if(view.pos.z<s.minSpawnZ-levels.end||view.pos.z>s.maxSpawnZ+levels.end)return;
     const float base=s.cumulusDetail?16.f:20.f;
-    const int nz=std::max(4,int(std::ceil(band/(base*4.f)))*4);
-    const Vec step{base,base,band/nz},origin{0,0,s.minSpawnZ};
+    const int nz=verticalSteps(s);
+    const Vec step=latticeSpacing(s),origin{0,0,s.minSpawnZ};
     const float brickSize=BrickSteps*base;
     const auto tex=textureOrigin(s,view,drift);
     const float tile=tex.tile,uOffset=tex.u,vOffset=tex.v;
@@ -355,10 +375,9 @@ inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range
     // Only intersecting planes inside the diagonal crossfade are approximate.
     std::sort(parents.begin(),parents.end(),closer);
     for(const auto& b:parents)collect(collect,b);
-    using OutputVertex=typename decltype(m.vertices)::value_type;
-    constexpr bool gpu=std::is_same_v<OutputVertex,GpuVertex>;
-    // Sort small patch keys instead of moving 4 vertices repeatedly.
-    struct Patch {std::array<OutputVertex,4> vertices;float depth;int order;};
+    // Record only bounds and lattice metadata. Do not construct/copy
+    // four output vertices for rejected patches or during sorting.
+    struct Patch {Vec lo,hi;float depth;int axis,plane,order;};
     static thread_local std::vector<Patch> patches;
     static thread_local std::vector<std::size_t> order;
     if(patches.capacity()<96)patches.reserve(96);
@@ -377,51 +396,62 @@ inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range
                 const float plane=component(origin,a)+(i+.5f)*component(step,a);
                 setComponent(lo,a,plane);setComponent(hi,a,plane);
                 if(!occupied(lo,hi))continue;
-                Patch patch{};patch.order=int(patches.size());bool any=false;
-                patch.depth=dot((lo+hi)*.5f-view.pos,(lo+hi)*.5f-view.pos);
-                for(int q=0;q<4;++q) {
+                bool any=false;
+                const float limit=(i%4==0?levels.end:i%2==0?std::min(levels.end,1300.f):std::min(levels.end,440.f))+.01f;
+                const float limitSq=limit*limit;
+                const float axisDistance=std::abs(plane-component(view.pos,a));
+                // Axis distance is identical for all four corners. Stop at
+                // the first potentially contributing one. The exact same
+                // conservative endpoint classifier serves both backends.
+                for(int q=0;q<4&&!any;++q) {
                     Vec p=lo;
                     if(q&1)setComponent(p,j,component(hi,j));
                     if(q&2)setComponent(p,k,component(hi,k));
                     const Vec delta=p-view.pos;
-                    // Shared conservative culling: retain a patch if any
-                    // corner could contribute. A tiny guard around the
-                    // mathematical fade endpoints avoids CPU/compiler/GPU
-                    // rounding disagreements; zero-alpha corners cost no
-                    // blend and the visible source lattice stays identical.
-                    const float axisDistance=std::abs(component(delta,a));
                     const float maxDistance=std::max({std::abs(delta.x),std::abs(delta.y),std::abs(delta.z),.001f});
                     const float d2=dot(delta,delta);
-                    const float limit=(i%4==0?levels.end:i%2==0?std::min(levels.end,1300.f):std::min(levels.end,440.f))+.01f;
-                    any|=axisDistance>=.799999f*maxDistance&&d2<=limit*limit&&d2>63.98f;
-                    if constexpr(gpu) {
-                        patch.vertices[q]={p,float(a),component(step,a),i%2==0?1.f:0.f,i%4==0?1.f:0.f};
-                    } else {
-                        const float d=length(delta),w=component(axisWeights(delta),a);
-                        const float cosine=std::abs(component(delta,a))/std::max(d,.001f);
-                        const float path=planeWeight(i,component(step,a),d)/std::max(cosine,.4f);
-                        const float nearWeight=smooth((d-8.f)/24.f)*mix(smooth((d-view.nearClip)/std::max(80.f,s.nearFadeDistance)),1.f,s.interiorHaze*.22f);
-                        const float alpha=sat(path*w/ReferenceStep)*rangeWeight(r,d)*levels.volume(d)*nearWeight;
-                        patch.vertices[q]={p,p.x/tile-uOffset,p.y/tile-vOffset,(p.z-origin.z)/band,alpha,cloudFogFactor(s,d)};
-                    }
+                    any=axisDistance>=.799999f*maxDistance&&d2<=limitSq&&d2>63.98f;
                 }
-                if(any){order.push_back(patches.size());patches.push_back(patch);}
+                if(any) {
+                    const auto center=(lo+hi)*.5f-view.pos;
+                    order.push_back(patches.size());
+                    patches.push_back({lo,hi,dot(center,center),a,i,int(patches.size())});
+                }
             }
         }
         std::sort(order.begin(),order.end(),[&](std::size_t i,std::size_t j){
             const auto& a=patches[i];const auto& b=patches[j];return a.depth!=b.depth?a.depth<b.depth:a.order<b.order;
         });
         for(const auto index:order) {
-            const auto& p=patches[index];
+            const auto& patch=patches[index];
             if(m.vertices.size()+4>MaxVertices)break;
-            const auto i=std::uint16_t(m.vertices.size());
-            m.vertices.insert(m.vertices.end(),p.vertices.begin(),p.vertices.end());
-            m.indices.insert(m.indices.end(),{i,std::uint16_t(i+1),std::uint16_t(i+2),
-                std::uint16_t(i+1),std::uint16_t(i+3),std::uint16_t(i+2)});
+            const auto offset=std::uint16_t(m.vertices.size());
+            const int a=patch.axis,j=(a+1)%3,k=(a+2)%3,i=patch.plane;
+            const auto code=latticeCode(a,i);
+            for(int q=0;q<4;++q) {
+                Vec p=patch.lo;
+                if(q&1)setComponent(p,j,component(patch.hi,j));
+                if(q&2)setComponent(p,k,component(patch.hi,k));
+                if constexpr(gpu) {
+                    m.vertices.push_back({p,code});
+                } else {
+                    const Vec delta=p-view.pos;
+                    const float d=length(delta),w=component(axisWeights(delta),a);
+                    const float cosine=std::abs(component(delta,a))/std::max(d,.001f);
+                    const float path=planeWeight(i,component(step,a),d)/std::max(cosine,.4f);
+                    const float nearWeight=smooth((d-8.f)/24.f)*mix(smooth((d-view.nearClip)/std::max(80.f,s.nearFadeDistance)),1.f,s.interiorHaze*.22f);
+                    const float alpha=sat(path*w/ReferenceStep)*rangeWeight(r,d)*levels.volume(d)*nearWeight;
+                    m.vertices.push_back({p,p.x/tile-uOffset,p.y/tile-vOffset,(p.z-origin.z)/band,alpha,cloudFogFactor(s,d)});
+                }
+            }
+            // The hardware path already owns a static reversed index
+            // buffer, so there is no per-frame index allocation or fill.
+            if constexpr(!gpu)m.indices.insert(m.indices.end(),{offset,std::uint16_t(offset+1),std::uint16_t(offset+2),
+                std::uint16_t(offset+1),std::uint16_t(offset+3),std::uint16_t(offset+2)});
             ++m.slices;
         }
         if(m.vertices.size()+4>MaxVertices)break;
     }
-    std::reverse(m.indices.begin(),m.indices.end()); // far first, culling disabled
+    if constexpr(!gpu)std::reverse(m.indices.begin(),m.indices.end()); // far first, culling disabled
 }
 } // namespace vc::banks

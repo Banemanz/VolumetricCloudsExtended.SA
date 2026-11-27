@@ -24,40 +24,71 @@ inline std::uint8_t byte(float x) {return canopy::byte(x);}
 inline D3DMATRIX identity() {
     D3DMATRIX m{};m._11=m._22=m._33=m._44=1.f;return m;
 }
-inline Result fill(IDirect3DVolumeTexture9* texture,const banks::Volume& volume,int layer,UINT w,UINT d) {
+// Density/shading textures in mode 2 are greyscale + 8-bit opacity.
+// A8L8 expands luminance to RGB at sampling time. Unlike DXT compression,
+// this retains all 256 possible values in both channels.
+inline bool compactFormat(IDirect3DDevice9* device,D3DRESOURCETYPE type,bool filter) {
+    D3DDEVICE_CREATION_PARAMETERS creation{};
+    if(FAILED(device->GetCreationParameters(&creation)))return false;
+    IDirect3D9* api=nullptr;
+    if(FAILED(device->GetDirect3D(&api))||!api){if(api)api->Release();return false;}
+    D3DDISPLAYMODE mode{};
+    const bool result=SUCCEEDED(api->GetAdapterDisplayMode(creation.AdapterOrdinal,&mode))&&
+        SUCCEEDED(api->CheckDeviceFormat(creation.AdapterOrdinal,creation.DeviceType,mode.Format,0,type,D3DFMT_A8L8))&&
+        (!filter||SUCCEEDED(api->CheckDeviceFormat(creation.AdapterOrdinal,creation.DeviceType,mode.Format,
+            D3DUSAGE_QUERY_FILTER,type,D3DFMT_A8L8)));
+    api->Release();return result;
+}
+inline UINT texelBytes(D3DFORMAT format) {return format==D3DFMT_A8L8?2u:4u;}
+inline bool putTexel(char* dst,canopy::Pixel p,D3DFORMAT format) {
+    if(format==D3DFMT_A8L8) {
+        // Never silently convert a future non-greyscale bake.
+        if(p.r!=p.g||p.r!=p.b)return false;
+        const std::uint16_t al=std::uint16_t((unsigned(p.a)<<8)|p.r);
+        std::memcpy(dst,&al,sizeof(al));
+    } else {
+        const DWORD argb=D3DCOLOR_ARGB(p.a,p.r,p.g,p.b);
+        std::memcpy(dst,&argb,sizeof(argb));
+    }
+    return true;
+}
+inline Result fill(IDirect3DVolumeTexture9* texture,const banks::Volume& volume,int layer,UINT w,UINT d,
+                   D3DFORMAT format=D3DFMT_A8R8G8B8) {
     D3DLOCKED_BOX lock{};
     const auto hr=texture->LockBox(0,&lock,nullptr,0);
     if(FAILED(hr))return failed(hr,"LockBox");
-    if(!lock.pBits || lock.RowPitch<int(w*sizeof(DWORD)) ||
+    const UINT bytes=texelBytes(format);
+    if(!lock.pBits || lock.RowPitch<int(w*bytes) ||
        lock.SlicePitch<std::int64_t(lock.RowPitch)*w) {
         texture->UnlockBox(0);
         return failed(E_FAIL,"invalid volume lock pitches");
     }
+    const bool exact=w==UINT(volume.width)&&d==UINT(volume.depth);
     for(UINT z=0;z<d;++z)for(UINT y=0;y<w;++y) {
         auto* dst=static_cast<char*>(lock.pBits)+std::size_t(z)*lock.SlicePitch+std::size_t(y)*lock.RowPitch;
         for(UINT x=0;x<w;++x) {
-            const auto p=w==UINT(volume.width)&&d==UINT(volume.depth)
-                ?volume.pixels[layer][volume.index(x,y,z)]
+            const auto p=exact
+                ?volume.pixels[layer][(std::size_t(z)*w+y)*w+x]
                 :volume.sample(layer,(x+.5f)/w,(y+.5f)/w,(z+.5f)/d);
-            const DWORD argb=D3DCOLOR_ARGB(p.a,p.r,p.g,p.b);
-            // No alignment assumption on the driver's row offsets.
-            std::memcpy(dst+x*sizeof(DWORD),&argb,sizeof(argb));
+            if(!putTexel(dst+x*bytes,p,format)){
+                texture->UnlockBox(0);return failed(E_FAIL,"non-greyscale A8L8 volume");
+            }
         }
     }
     const auto unlock=texture->UnlockBox(0);
     return failed(unlock,"UnlockBox");
 }
 inline Result upload(IDirect3DDevice9* device,const banks::Volume& volume,int layer,
-                     UINT w,UINT d,IDirect3DVolumeTexture9** out,bool managed=false) {
+                     UINT w,UINT d,IDirect3DVolumeTexture9** out,bool managed=false,D3DFORMAT format=D3DFMT_A8R8G8B8) {
     *out=nullptr;
     IDirect3DVolumeTexture9* staging=nullptr;
     const auto pool=managed?D3DPOOL_MANAGED:D3DPOOL_SYSTEMMEM;
-    HRESULT hr=device->CreateVolumeTexture(w,w,d,1,0,D3DFMT_A8R8G8B8,pool,&staging,nullptr);
+    HRESULT hr=device->CreateVolumeTexture(w,w,d,1,0,format,pool,&staging,nullptr);
     if(FAILED(hr))return failed(hr,managed?"CreateVolumeTexture(MANAGED)":"CreateVolumeTexture(SYSTEMMEM)");
-    auto result=fill(staging,volume,layer,w,d);
+    auto result=fill(staging,volume,layer,w,d,format);
     if(!result){staging->Release();return result;}
     if(managed){*out=staging;return {};}
-    hr=device->CreateVolumeTexture(w,w,d,1,0,D3DFMT_A8R8G8B8,D3DPOOL_DEFAULT,out,nullptr);
+    hr=device->CreateVolumeTexture(w,w,d,1,0,format,D3DPOOL_DEFAULT,out,nullptr);
     if(FAILED(hr)){staging->Release();return failed(hr,"CreateVolumeTexture(DEFAULT)");}
     hr=device->UpdateTexture(staging,*out);
     staging->Release();
@@ -67,24 +98,29 @@ inline Result upload(IDirect3DDevice9* device,const banks::Volume& volume,int la
 // Build the distant 2D layer with ordinary RGBA mipmaps, without relying on
 // private RenderWare raster structures. Alpha-weighted colour avoids halos.
 inline Result uploadCanopy(IDirect3DDevice9* device,const std::vector<canopy::Pixel>& pixels,
-                          UINT size,IDirect3DTexture9** out,bool managed=false,bool mipmaps=true) {
+                          UINT size,IDirect3DTexture9** out,bool managed=false,bool mipmaps=true,D3DFORMAT format=D3DFMT_A8R8G8B8) {
     *out=nullptr;
-    std::vector<canopy::Pixel> mip=pixels;
+    // No scratch copy for atlas/no-mip uploads. Preserve the exact source
+    // channels, including the alpha-weighted mip reduction for canopy.
+    std::vector<canopy::Pixel> mip;
+    if(mipmaps)mip=pixels;
+    const UINT bytes=texelBytes(format);
     IDirect3DTexture9* stage=nullptr;
-    HRESULT hr=device->CreateTexture(size,size,mipmaps?0:1,0,D3DFMT_A8R8G8B8,
+    HRESULT hr=device->CreateTexture(size,size,mipmaps?0:1,0,format,
         managed?D3DPOOL_MANAGED:D3DPOOL_SYSTEMMEM,&stage,nullptr);
     if(FAILED(hr))return failed(hr,"CreateTexture(canopy)");
     UINT n=size;
     for(UINT level=0;level<stage->GetLevelCount();++level) {
         D3DLOCKED_RECT lock{};
         if(FAILED(hr=stage->LockRect(level,&lock,nullptr,0))){stage->Release();return failed(hr,"LockRect(canopy)");}
-        if(!lock.pBits||lock.Pitch<int(n*sizeof(DWORD))) {
+        if(!lock.pBits||lock.Pitch<int(n*bytes)) {
             stage->UnlockRect(level);stage->Release();return failed(E_FAIL,"canopy pitch");
         }
         for(UINT y=0;y<n;++y)for(UINT x=0;x<n;++x) {
-            const auto p=mip[std::size_t(y)*n+x];
-            const DWORD argb=D3DCOLOR_ARGB(p.a,p.r,p.g,p.b);
-            std::memcpy(static_cast<char*>(lock.pBits)+std::size_t(y)*lock.Pitch+x*sizeof(DWORD),&argb,sizeof(argb));
+            const auto p=(mipmaps?mip:pixels)[std::size_t(y)*n+x];
+            if(!putTexel(static_cast<char*>(lock.pBits)+std::size_t(y)*lock.Pitch+x*bytes,p,format)){
+                stage->UnlockRect(level);stage->Release();return failed(E_FAIL,"non-greyscale A8L8 texture");
+            }
         }
         if(FAILED(hr=stage->UnlockRect(level))){stage->Release();return failed(hr,"UnlockRect(canopy)");}
         if(n==1||level+1==stage->GetLevelCount())break;
@@ -103,11 +139,30 @@ inline Result uploadCanopy(IDirect3DDevice9* device,const std::vector<canopy::Pi
         n=next;
     }
     if(managed){*out=stage;return {};}
-    hr=device->CreateTexture(size,size,mipmaps?0:1,0,D3DFMT_A8R8G8B8,D3DPOOL_DEFAULT,out,nullptr);
+    hr=device->CreateTexture(size,size,mipmaps?0:1,0,format,D3DPOOL_DEFAULT,out,nullptr);
     if(FAILED(hr)){stage->Release();return failed(hr,"CreateTexture(DEFAULT canopy)");}
     hr=device->UpdateTexture(stage,*out);stage->Release();
     if(FAILED(hr)){(*out)->Release();*out=nullptr;return failed(hr,"UpdateTexture(canopy)");}
     return {};
+}
+// Only select a compact format when advertised for the actual resource and
+// filter type. If either endpoint fails upload, retry the entire pair at
+// identical resolution in RGBA; no half-installed mixed weather textures.
+template<class Texture,class Upload>
+inline Result uploadPair(std::array<Texture*,2>& pair,bool preferCompact,D3DFORMAT& selected,Upload&& uploader) {
+    Result last=failed(E_FAIL,"texture pair");
+    for(auto format:{D3DFMT_A8L8,D3DFMT_A8R8G8B8}) {
+        if(format==D3DFMT_A8L8&&!preferCompact)continue;
+        bool success=true;
+        for(int i=0;i<2;++i) {
+            last=uploader(i,&pair[i],false,format);
+            if(!last)last=uploader(i,&pair[i],true,format);
+            if(!last){success=false;break;}
+        }
+        if(success){selected=format;return {};}
+        for(auto& t:pair){if(t)t->Release();t=nullptr;}
+    }
+    return last;
 }
 struct ScreenVertex {float x,y,z,rhw;DWORD rgba,fog;float u,v,w;};
 static_assert(sizeof(ScreenVertex)==36);
@@ -265,7 +320,7 @@ struct GpuStream {
         if(caps.VertexShaderVersion<D3DVS_VERSION(2,0)||!(behavior&D3DCREATE_HARDWARE_VERTEXPROCESSING))return false;
         const D3DVERTEXELEMENT9 elements[]={
             {0,0,D3DDECLTYPE_FLOAT3,D3DDECLMETHOD_DEFAULT,D3DDECLUSAGE_POSITION,0},
-            {0,12,D3DDECLTYPE_FLOAT4,D3DDECLMETHOD_DEFAULT,D3DDECLUSAGE_TEXCOORD,0},
+            {0,12,D3DDECLTYPE_D3DCOLOR,D3DDECLMETHOD_DEFAULT,D3DDECLUSAGE_TEXCOORD,0},
             D3DDECL_END()
         };
         // The FXC header is a BYTE array: copy to aligned DWORD storage.
@@ -307,7 +362,7 @@ struct GpuStream {
 };
 struct GpuPasses {
     GpuStream* stream{};
-    std::array<std::array<float,4>,10> constants{};
+    std::array<std::array<float,4>,11> constants{};
     D3DMATRIX scene{},distant{};
     D3DVIEWPORT9 viewport{};
     // Hardware clips both sides of the old far plane with complementary
@@ -332,6 +387,7 @@ struct GpuPasses {
         constants[7]={r.end,1.f/(r.end-r.begin),lod.start,lod.end>lod.start?1.f/(lod.end-lod.start):0.f};
         constants[8]={s.cloudFogStart,s.cloudFogEnd-s.cloudFogStart>1.f?1.f/(s.cloudFogEnd-s.cloudFogStart):0.f,vertexFog?1.f:0.f,0.f};
         constants[9]={byte(color.r)/255.f,byte(color.g)/255.f,byte(color.b)/255.f,1.f};
+        const auto step=banks::latticeSpacing(s);constants[10]={step.x,step.y,step.z,0.f};
         return true;
     }
     Result draw(IDirect3DDevice9* d,UINT count,UINT triangles) {

@@ -20,7 +20,12 @@ int main(){
         const auto t=std::chrono::steady_clock::now();
         banks::buildMesh(m,s,view,r,drift,.94f,.53f,&v,float(i%100)/100);
         sum+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t).count();
-        triangles+=m.indices.size()/3;verts+=m.vertices.size();
+        #ifdef GPU
+        triangles+=m.triangleCount();
+#else
+        triangles+=m.indices.size()/3;
+#endif
+        verts+=m.vertices.size();
     }
     std::cout<<sum/480<<" ms, "<<triangles/480<<" triangles, "<<verts/480<<" vertices\n";
 }

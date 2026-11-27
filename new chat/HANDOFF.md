@@ -955,3 +955,45 @@ remained a credible source of the swimming seen in flight.
   interpolated and overcast masks, with foreground depth preserved. FXC
   compiled the shader successfully. Follow-up uses one conservative
   candidate classifier for both backends to satisfy GCC 15 as well.
+
+## Source mesh, memory bandwidth and HDD preload optimization
+
+- Kept mode 2 defaults, density/opacity art, world lattice, altitude handover
+  and LOD unchanged. GPU corner representation now 16 bytes (XYZ float3 +
+  D3DCOLOR axis/parity) instead of 28; VS2 decodes exact one-hot axis flags,
+  parity and uniform lattice step. Static reversed index buffer means
+  no per-frame index creation on hardware. Shared culling stops testing
+  corners once a patch is known potentially visible; sort only bounds and
+  generate surviving CPU vertices after culling. 480 poses, same local
+  host: previous/new GPU-input 0.422/0.321ms, CPU 1.200/0.944ms; both
+  7276 mean triangles, 14552 vertices (excludes projection/draw).
+- D3D9 A8L8 (two 8-bit channels) is chosen only with advertised actual
+  resource type + filter support and successful upload. Whole weather
+  pair falls back at the same resolution to RGBA on failure. All existing
+  pixels are greyscale + alpha; reject unexpected colour data. Canopy
+  mips remain alpha-weighted and atlas has no mips. Default logical GPU
+  texture footprint ~4.33 MiB if all compact formats work, ~8.67 MiB
+  otherwise. No measured bandwidth or frame-time claim for this GPU.
+- CloudCache.hpp v2 saves exact original luminance/alpha, decodes into
+  the original RGBA CPU vectors via bounded sequential reads, preserves
+  occupancy and atlas data. V1 remains loadable; no forced rebuild.
+  Default v2: 4,237,892 bytes vs 8,432,196 v1. Local warm filesystem
+  average of 20 full loads: 10.4ms vs 16.8ms. Actual physical HDD and
+  Windows driver upload times unmeasured. Cache tests check exact
+  byte-for-byte decoded data, legacy compatibility, stale key, truncation,
+  corruption and rejection of non-greyscale writes.
+- HDD mode is always on, no INI knob: PrepareSchematic loads at initRwEvent;
+  PreloadClouds also uploads all available textures before gameplay.
+  initGameEvent offers an idempotent second chance after startup/device
+  initialization; fallback remains lazy if a loader missed both events.
+  The CPU schematic survives reInitGameEvent and D3D lost/reset, and is
+  only freed on RW shutdown. GPU resources reupload from resident data.
+  No cache reads or writes during camera movement or live weather/wind;
+  memory is pageable, not force-pinned. Preloading trades a small startup
+  cost for no first-flight texture creation.
+- Native D3D9 test now compares mipmapped patterned 2D textures, generated
+  end-to-end volume flight views and far atlas weather endpoints against
+  RGBA framebuffer readback. No scene/lattice downgrade. Pure device
+  support, depth sentinel and CPU/GPU parity remain CI gates. Verify
+  cache hit/preload log and actual in-game stutter on the Celeron before
+  claiming FPS or target hardware success.
