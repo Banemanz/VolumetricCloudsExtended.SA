@@ -16,13 +16,14 @@ def render(scene,executable,destination):
     with tempfile.TemporaryDirectory() as work:
         atlas_path=pathlib.Path(work)/"atlas.rgba"
         raw=subprocess.check_output([executable,scene,str(atlas_path)],text=True)
-        atlas=np.fromfile(atlas_path,dtype=np.uint8).reshape(256,256,4).astype(np.float32)/255
+        atlas=np.fromfile(atlas_path,dtype=np.uint8).reshape(int(np.sqrt(atlas_path.stat().st_size/4)),int(np.sqrt(atlas_path.stat().st_size/4)),4).astype(np.float32)/255
+    size=atlas.shape[0]
     rows=csv.reader(io.StringIO(raw))
     p=np.array(list(map(float,next(rows))))
     t=np.linspace(0,1,H)[:,None,None]
     canvas=np.broadcast_to((p[:3]*(1-t)+p[3:6]*t)/255,(H,W,3)).copy()
     # Illustrative sky glare (not part of the plugin; SA retains the game's sun).
-    if scene!="night" and p[7]>0:
+    if not scene.startswith("night") and p[7]>0:
         sx=480+510*p[6]/max(.01,p[7])
         sy=270-510*p[8]/max(.01,p[7])
         yy,xx=np.mgrid[:H,:W]
@@ -60,11 +61,11 @@ def render(scene,executable,destination):
                     weights=np.stack([b0[m],b1[m],b2[m]],axis=1)/v[:,2]
                     weights/=weights.sum(1)[:,None]
                     attr=weights@v[:,3:]
-                    uv=attr[:,:2]*256-.5
-                    u=np.clip(uv[:,0],0,255);w=np.clip(uv[:,1],0,255)
+                    uv=attr[:,:2]*size-.5
+                    u=np.clip(uv[:,0],0,size-1);w=np.clip(uv[:,1],0,size-1)
                     ix=np.floor(u).astype(int);iy=np.floor(w).astype(int)
                     fx=(u-ix)[:,None];fy=(w-iy)[:,None]
-                    jx=np.minimum(ix+1,255);jy=np.minimum(iy+1,255)
+                    jx=np.minimum(ix+1,size-1);jy=np.minimum(iy+1,size-1)
                     tex=(atlas[iy,ix]*(1-fx)+atlas[iy,jx]*fx)*(1-fy)+(atlas[jy,ix]*(1-fx)+atlas[jy,jx]*fx)*fy
                     colour=tex[:,:3]*attr[:,2:]/255
                     a=tex[:,3:]*alpha
@@ -76,5 +77,5 @@ def render(scene,executable,destination):
     return im
 if __name__=="__main__":
     out=pathlib.Path(sys.argv[2]);out.mkdir(parents=True,exist_ok=True)
-    for scene in ("back","front","flight","ground","low","night"):
+    for scene in ("back","front","flight","ground","low","night","zenith","inside","zenith_layers","night_layers"):
         render(scene,sys.argv[1],out/f"cumulus_{scene}.jpg")

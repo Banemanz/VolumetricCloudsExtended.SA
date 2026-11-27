@@ -9,20 +9,23 @@ using namespace vc;
 int main(int argc,char** argv) {
     if(argc<3) return 2;
     const std::string scene=argv[1];
-    const auto atlas=cumulus::bakeAtlas();
+    const bool legacy=scene=="night_layers" || scene=="zenith_layers";
+    const auto atlas=cumulus::bakeAtlas(!legacy);
     std::ofstream rgba(argv[2],std::ios::binary);
     rgba.write(reinterpret_cast<const char*>(atlas.data()),atlas.size()*sizeof(cumulus::Pixel));
     if(!rgba) return 3;
-    Settings cfg; cfg.renderMode=2;
+    Settings cfg; cfg.renderMode=2; cfg.cumulusImpostors=!legacy;
     cfg.targetProcClouds=160;
     float height=400,pitch=.07f;
     Vec sun=unit(Vec{-.32f,.92f,.24f});
     Palette p{{75,148,215},{174,220,250},{50,50,50},{50,50,50}};
     if(scene=="front") sun=unit(Vec{-.55f,-.7f,.45f});
     if(scene=="flight"){height=680;pitch=-.15f;}
+    if(scene=="inside"){height=410;pitch=.12f;cfg.spawnRadiusMin=30;}
     if(scene=="ground"){height=30;pitch=.3f;}
+    if(scene=="zenith" || scene=="night" || legacy){height=30;pitch=1.10f;cfg.spawnRadiusMin=25;cfg.spawnRadiusMax=1250;cfg.targetProcClouds=100;}
     if(scene=="low")cfg.cumulusDetail=0;
-    if(scene=="night"){p={{6,9,25},{16,25,40},{0,0,0},{0,0,0}};sun=unit(Vec{.4f,.5f,-.6f});}
+    if(scene=="night" || scene=="night_layers"){p={{35,48,51},{52,62,63},{0,0,0},{0,0,0}};sun=unit(Vec{.4f,.5f,-.6f});}
     View v{{0,0,height},{1,0,0},{0,-std::sin(pitch),std::cos(pitch)},
         {0,std::cos(pitch),std::sin(pitch)},2500,1};
     const auto r=range(cfg,v.farClip,2000);
@@ -36,7 +39,7 @@ int main(int argc,char** argv) {
         for(int i=0;i<n;++i)items.push_back(out[i]);
     }
     std::stable_sort(items.begin(),items.end(),[&](auto& a,auto& b){return viewDepth(v,a.center)>viewDepth(v,b.center);});
-    const cumulus::Lighting lighting(cfg,p,sun);
+    const cumulus::Lighting lighting(cfg,p,sun,sun.z<0.f?1.f:0.f);
     const int n=cumulus::grid(cfg);
     std::cout<<std::setprecision(8)<<p.skyTop.r<<','<<p.skyTop.g<<','<<p.skyTop.b<<','
              <<p.skyBottom.r<<','<<p.skyBottom.g<<','<<p.skyBottom.b<<','<<dot(sun,v.right)<<','<<dot(sun,v.forward)<<','<<dot(sun,v.up)<<'\n';

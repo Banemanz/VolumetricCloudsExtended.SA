@@ -31,8 +31,8 @@ pipeline may still need compatibility testing.
   simply multiply opacity.
 - Crossed cards remain selectable for the native appearance.
 - Experimental shader-free cumulus mode (opt-in): rounded, opaque cloud
-  groups with an original procedural RGBA atlas, CPU-calculated sunlight,
-  soft self-shading and a backlit silver lining. Uses the same world-space
+  groups with an original integrated-density RGBA atlas, CPU-calculated sunlight,
+  soft self-shading, restrained night light and a backlit silver lining. Uses the same world-space
   field and a single fixed-function texture/blend pass. No external texture
   or shader dependency.
 - Frustum rejection, actual camera far-plane limit, smooth range and near fades,
@@ -75,6 +75,8 @@ text retains the default. Inline comments are supported.
 | CloudTextureNames | cloud2,cloud3,cloud4 | Comma-separated names; up to 15 |
 | RenderMode | 1 | 0 = crossed cards; 1 = clustered camera-facing cards; 2 = experimental shader-free cumulus |
 | CumulusDensity | 0.95 | Mode 2: optical density multiplier (0–1) |
+| CumulusImpostors | 1 | Mode 2: coherent whole-cloud impostors outside; 0 = all layered puffs |
+| CumulusNightLight | 1 | Mode 2: night illumination multiplier (0–2); smooth transition to daylight |
 | CumulusContrast | 0.65 | Mode 2: directional and underside lighting contrast (0–1) |
 | CumulusRimStrength | 0.85 | Mode 2: forward-scattering rim strength (0–1) |
 | CumulusDetail | 1 | Mode 2: 0 = economy 3×3 lattice (8 triangles), 1 = 5×5 lattice (32 triangles) |
@@ -110,6 +112,8 @@ Add or change these values in your existing INI, then restart:
 RenderMode=2
 CumulusDetail=1
 CumulusDensity=0.95
+CumulusImpostors=1
+CumulusNightLight=1
 CumulusContrast=0.65
 CumulusRimStrength=0.85
 PuffsPerCloud=5
@@ -124,18 +128,44 @@ Mode 2 uses its own texture and lighting; native/additional texture selection
 and the legacy custom tint/shade/haze keys do not affect it. Native sky luminance,
 global opacity, wind, altitude, weather, visibility and clipping still apply.
 
-**How it works:** four original 128×128 puff variants are generated into a
-256×256 RGBA atlas the first time it is needed (~256 KiB of raw pixels).
-Each variant combines overlapping rounded sub-lobes with optical thickness,
-soft edge erosion and subtle micro-relief. A handful of stable, world-space
-puffs forms each cloud. CPU vertex lighting uses the current game sun vector,
-native neutral sky luminance, a soft diffuse floor and a view-dependent
-bright rim. A tessellated billboard interpolates those values using RW's
-Gouraud shading and ordinary alpha blending. There is no shader compilation,
-raymarching, scene-copy, extra render target or post-process. The single atlas
-allows consecutive depth-sorted cards to be submitted in indexed batches.
-Allocation failure falls back to mode 1 and is logged; the owned texture is
-destroyed before RenderWare shutdown.
+**How it works (second iteration):** four original 256×256 cloud variants are
+generated into a 512×512 RGBA atlas the first time it is needed (~1 MiB of raw
+pixels). The CPU bake integrates noisy optical thickness across overlapping
+sub-lobes before evaluating alpha (Beer–Lambert) and softly blended surface
+relief. It does not stack translucent sphere images to create the silhouette.
+
+Outside the cloud, the complete body is one depth-sorted impostor (32 triangles
+at detail 1, eight at detail 0). The body dimensions are projected from the
+world ellipsoid into the viewing plane, rather than using its vertical height
+as its apparent height even when looking straight up. As the camera enters a
+cloud, the renderer transitions to depth-separated world-space puffs using
+split optical depth, with individual near-camera fades. `PuffsPerCloud` limits
+this close-range representation. `CumulusImpostors=0` uses layered puffs
+at all distances and the previous lobe texture generation, with the corrected
+orientation and updated lighting.
+
+The cloud facing basis depends on the world eye-to-cloud vector, not screen
+orientation. Thus rotating or rolling the camera at a fixed location does not
+rotate the cloud texture/geometry in world space. Translation around a cloud
+can still reveal that it is a projected impostor; it is not a true 3D volume.
+The transported basis has a singularity at the antipodal horizontal direction;
+there is a world-axis fallback for this exceptional orientation.
+
+CPU vertex lighting uses the current game sun vector, original neutral
+daytime sky luminance, diffuse light and a view-dependent bright rim.
+The underside is softly shaded. At night it transitions to ambient sky
+luminance and a small diffuse floor rather than the stock +64 brightness
+addition. A weak lunar directional term follows the native lunar sprite's
+world offset (0,-100,15), with a smooth approximate midnight visibility window
+and weather attenuation. `CumulusNightLight` scales night illumination.
+There is no change to the native brightness equation in modes 0 or 1.
+
+The tessellated billboard interpolates these colours using ordinary RW
+Gouraud shading and alpha blending. There is no shader compilation,
+runtime raymarching, scene-copy, extra render target or post-process, and
+the single atlas stays bound across all depth-sorted indexed batches.
+Allocation failure falls back to mode 1 and is logged; the owned texture
+is destroyed before RenderWare shutdown.
 
 This approach is inspired by early flight simulation impostors, in particular
 [Harris and Lastra (2001)](https://markmark.net/clouds/) and the older
@@ -152,10 +182,15 @@ interactions with graphics mods need in-game profiling.
 | ![Backlit cumulus](docs/previews/cumulus_back.jpg) | ![Frontlit cumulus](docs/previews/cumulus_front.jpg) |
 | ![Above clouds](docs/previews/cumulus_flight.jpg) | ![From the ground](docs/previews/cumulus_ground.jpg) |
 | ![Economy geometry](docs/previews/cumulus_low.jpg) | ![Night](docs/previews/cumulus_night.jpg) |
+| ![Previous overhead day](docs/previews/cumulus_zenith_previous.jpg) | ![Reworked overhead day](docs/previews/cumulus_zenith.jpg) |
+| ![Previous overhead night](docs/previews/cumulus_night_previous.jpg) | ![Reworked overhead night](docs/previews/cumulus_night.jpg) |
 
 These are offline renders of the actual C++ cumulus atlas, mesh, UVs and vertex
 colours. The sky and sun glare are illustrative backgrounds, not GTA assets,
 and the preview omits near-plane-crossing cards rather than clipping them.
+The previous overhead comparison uses the previous release source at
+`94fbeaa15b9d0adf76ab18a43fc9e9d9592a3f3a` with the same diagnostic field,
+camera and palette.
 
 ## Build
 

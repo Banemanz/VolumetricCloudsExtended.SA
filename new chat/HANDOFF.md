@@ -130,3 +130,58 @@ no GPL source or assets reused.
   and close intersections may expose planes. Do not claim measured game FPS.
   For a potato setup use CumulusDetail=0, PuffsPerCloud=3; tweak density only if
   fill-rate remains a problem. Preserve the vanilla-like default mode.
+
+## Cumulus follow-up: nighttime ghosting and camera rotation
+User's runtime screenshots at 23:42 and 12:36 demonstrated transparent
+overlapping puff silhouettes, flattened-looking overhead clouds and
+camera-rotation-coupled shapes. The initial cumulus implementation was
+using the camera's forward/up basis for every puff and applying native +64
+brightness to dense clouds even after the direct sunlight term had vanished.
+The screenshots are evidence of the visual symptoms, not a controlled test
+with the same camera/weather. Protect modes 0 and 1 and keep PR #1.
+
+- Mode 2 now defaults to CumulusImpostors=1. A 512x512 RGBA atlas has four
+  256x256 whole cloud archetypes. Bake 36 noisy rounded lobes into an
+  integrated optical-density field, alpha=1-exp(-tau). Smooth weighted
+  visible surface gradients and lobe-normal illumination provide neutral
+  relief. No runtime raymarching or shaders, only a one-time CPU projection.
+- Normal outside representation is a single textured 5x5 or 3x3 grid
+  (32 or 8 triangles); project ellipsoid X/Y/Z support radii in the plane
+  so overhead views use horizontal cloud extent. Single alpha value avoids
+  layer-on-layer pseudo-brightening. Density remapping makes exterior bodies
+  nearly opaque but global Opacity, distance, spawn and near fades still apply.
+- Near a volume, split optical depth between the body and at most
+  PuffsPerCloud-1 near layers, preserving the draw-buffer limit. A ray-specific
+  ellipsoid intersection radius prevents wide, shallow clouds overhead from being
+  incorrectly treated as near/inside. The blend is an approximation due to
+  nonidentical silhouettes; world-space puffs have per-puff proximity fade.
+  With PuffsPerCloud=1, use one body card at all distances.
+- CumulusImpostors=0 retains the layered representation and original lobe
+  atlas algorithm; both paths get updated lighting and world-locked facing.
+  The facing basis is determined from the world eye-to-center vector using
+  shortest-arc transport of a fixed reference (+Y) frame. Its antipodal
+  horizon singularity falls back to world up; no camera yaw/pitch/roll
+  or camera forward/right/up axes enter the calculation at any view angle.
+  This is not view-independent 3D geometry: moving around an impostor
+  may still expose texture/view changes. Further progress could use
+  multi-view baked volume projections, with careful blending and LOD.
+- Direct sunlight still uses CTimeCycle::m_VectorToSun. Reversed
+  TimeCycle.cpp 0x560A67 computes sun direction using sin/cos(game minutes).
+  Night blends toward subdued ambient from the sky palette, with small
+  diffuse floor rather than vanilla +64 at night. The reversed Clouds.cpp
+  lunar sprite offset is (0,-100,15); a weak diffuse moon term is gated by
+  an approximate midnight window from CClock and weather rain/fog; not an
+  exact phase/visibility reconstruction. CumulusNightLight=1 adjustable.
+- Atlas size is now 1 MiB of RGBA, not the initial 256 KiB. Outside, fewer
+  meshes and less overlap than five cards; actual GPU overhead is unmeasured.
+- Regression tests verify atlas density and padding, night and lunar response,
+  optical-depth split, and identical world-space card positions and basis after
+  camera orientation changes at the same eye position (including close layers
+  and zenith), plus projected overhead extent, finite axes and existing limits.
+- Comparison scenes 'zenith'/'night' are from identical synthetic field, camera,
+  and palette as 'zenith_previous'/'night_previous' generated from the previous
+  commit 94fbeaa15b9d0adf76ab18a43fc9e9d9592a3f3a. The 'layers' scenes use the
+  newly corrected layered option; all are software renders, not GTA captures.
+- Re-test actual game by rotating camera while stationary, then walking and
+  flying underneath/through clouds, checking sunset, night, moon direction,
+  circling clouds, and performance on weak GPUs. No actual game run in Linux.

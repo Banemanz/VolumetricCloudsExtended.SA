@@ -4,6 +4,7 @@
 #endif
 #include "plugin.h"
 #include "CClouds.h"
+#include "CClock.h"
 #include "CGame.h"
 #include "CWeather.h"
 #include "CTimeCycle.h"
@@ -77,7 +78,7 @@ bool EnsureCumulusAtlas() {
     RwImage* img=RwImageCreate(AtlasSize,AtlasSize,32);
     if (img) {
         if (RwImageAllocatePixels(img) && RwImageGetPixels(img) && RwImageGetStride(img)>=AtlasSize*4) {
-            const auto pixels=bakeAtlas();
+            const auto pixels=bakeAtlas(settings.cumulusImpostors);
             for (int y=0;y<AtlasSize;++y)
                 std::memcpy(RwImageGetPixels(img)+y*RwImageGetStride(img),
                             pixels.data()+y*AtlasSize,AtlasSize*sizeof(Pixel));
@@ -347,7 +348,9 @@ void __cdecl RenderClouds() {
     if (modern) {
         const int index=std::clamp(CTimeCycle::m_CurrentStoredValue,0,15);
         const auto& sun=CTimeCycle::m_VectorToSun[index];
-        const vc::cumulus::Lighting lighting(settings,palette,{sun.x,sun.y,sun.z});
+        const float moon=vc::cumulus::moonVisibility(CClock::ms_nGameClockHours,
+            CClock::ms_nGameClockMinutes,CWeather::Rain,CWeather::Foggyness);
+        const vc::cumulus::Lighting lighting(settings,palette,{sun.x,sun.y,sun.z},moon);
         const int n=vc::cumulus::grid(settings);
         const int vertexCount=n*n,ic=(n-1)*(n-1)*6;
         int count=0,indexCount=0;
