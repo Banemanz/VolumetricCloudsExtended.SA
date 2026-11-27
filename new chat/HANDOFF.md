@@ -671,3 +671,59 @@ No new mode or changes to density generation, settings or shader budget.
   and optional depth-passing sample count. If failure, exact HRESULT
   and operation are now recorded. Do not infer successful in-game
   rendering from Linux preview or build alone.
+
+
+## Flight distortion follow-up (2026-11-27)
+
+User's in-game log establishes that the prior pure-device compatibility fix
+worked, including linear-filtered 128×128×32 native volume textures, 8
+submitted planes / 256 triangles on first frame (camera Z=24.7), and 282194
+depth-passing GPU occlusion samples. This is real game evidence, distinct
+from the software diagnostics.
+
+Examined the user's 22.4 s / 2560×1440 recording frame-by-frame around 7–10 s.
+At approximately Z=673, player coordinates (2164,-1265,673) move toward
+(2255,-1341,673); cloud contours smear and change during traversal.
+At ~490m, bright cloud almost fills the view; above the layer, broad
+white/yellow shapes lack discernible relief. Camera heading is approximate,
+not reconstructed from a game-state capture. Dawn colour filter likely
+contributes to washout, so do not interpret software preview as exact game
+lighting.
+
+Root code issues: sample distances were recalculated from near/far projected
+bounds and capped at 16 (24 detail); step and phase could change while
+moving or pitching, causing undersampling and apparent shape deformation.
+Opacity often accumulated too strongly. A fixed XYZ cell prototype was
+discarded after local diagnostics exposed discontinuities at axis transitions.
+
+- Keep Mode 2 + HybridClouds as default, no new mode, shader or texture
+  memory increase. Use parallel fixed-phase planes (40m economy, 28m
+  detail, max 36/52) anchored to projected world position minus unwrapped
+  wind displacement. At fixed heading, camera movement and clip changes
+  preserve sample locations, even crossing a whole slice boundary. Rotate
+  only the integration plane orientation with the view (finite sampling
+  can still alias as pitch/yaw changes). Actual density remains world fixed.
+- Use a lower reference optical density, nonlinear soft-edge/dense-core
+  opacity curve, larger vertical crown variation, sharper coverage ramp,
+  and four baked oblique extinction taps with overhead extinction. Reserve
+  headroom for the post effect at dawn/noon, leave canopy/night/lightning
+  unchanged. No per-frame lighting bake or texture upload; no game assets.
+  Fade close samples rather than letting one slice overwhelm the view.
+- Keep one native D3D9 draw call and 4 MiB texture memory in economy.
+  Increase theoretical triangle cap to 8640 before occupancy rejection.
+  Portable ordinary flight pose draws 3374/5312 after/before culling.
+  Alpha fill may increase; no potato GPU benchmark or game FPS guarantee.
+- Four local portable regression tests pass with g++ -O2 -Wall -Wextra
+  -Werror; banks test verifies lattice phase at 144 pose/detail combinations
+  plus travel/clip continuity, with 30 shared planes across video poses.
+  Baked volume measured ~177ms on this Linux host. Added real D3D9
+  perspective scene readback test to complement the existing sampler
+  isolation test. CI validates actual rasterization, not SA's post effects.
+- Updated rendered software diagnostics for all scenes in docs/previews;
+  these are not in-game captures. For next verification, use the same
+  Air Break test at dawn and noon, ascent around 400–700m then level
+  travel/yaw at 670m. Look for stationary outlines and relief instead of
+  white slabs; compare frametime against prior ASI. If residual warp under
+  changes in angle persists, measure whether a small bounded PS2.0
+  integration shader (optional, at equal/lower fill budget) would be
+  preferable. Do not add successive experimental modes.

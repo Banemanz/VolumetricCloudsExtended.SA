@@ -6,11 +6,15 @@
 namespace vc::banks {
 constexpr int Width=128, Height=128, Depth=32;
 constexpr int DetailWidth=256,DetailDepth=32;
-constexpr int MaxSlices=16, DetailSlices=24, GridX=12,GridY=10;
+// Constant world-distance sampling. Never stretch the sample interval to
+// fit the current frustum: that causes the field to swim during flight.
+constexpr float EconomyStep=40.f,DetailStep=28.f;
+constexpr int MaxSlices=36,DetailSlices=52,GridX=12,GridY=10;
 constexpr int OccupancyXY=16,OccupancyZ=8;
-constexpr float ReferenceStep=65.f;
+constexpr float ReferenceStep=90.f; // opacity baked for this path length
 struct Vertex {Vec pos;float u{},v{},w{},alpha{};};
 struct Mesh {std::vector<Vertex> vertices;std::vector<std::uint16_t> indices;int slices{};};
+static_assert(DetailSlices*(GridX+1)*(GridY+1)<65536);
 inline float radius(const Settings& s,const Range& r) {
     return std::min({canopy::tileWorldSize(s)*.62f,r.end*.90f,1400.f});
 }
@@ -42,10 +46,10 @@ struct Volume {
         std::vector<float> rho(count),coverage(count);
         const auto seed=std::uint32_t(s.seed);
         const float base=sat((canopy::altitude(s)-s.minSpawnZ)/std::max(1.f,s.maxSpawnZ-s.minSpawnZ));
-        const float clearThreshold=canopy::threshold(s,0),wetThreshold=canopy::threshold(s,1);
+        const float clearThreshold=canopy::threshold(s,0)+.026f,wetThreshold=canopy::threshold(s,1)+.026f;
         const auto macro=[&](float u,float v) {
-            return .28f*map.sample(u,v)+.18f*(map.sample(u+.025f,v)+map.sample(u-.025f,v)
-                +map.sample(u,v+.025f)+map.sample(u,v-.025f));
+            return .52f*map.sample(u,v)+.12f*(map.sample(u+.018f,v)+map.sample(u-.018f,v)
+                +map.sample(u,v+.018f)+map.sample(u,v-.018f));
         };
         // The canopy supplies broad coverage, not vertical extrusion of
         // every fine 2D detail. 3D billow noise distorts both shape and
@@ -59,12 +63,12 @@ struct Volume {
             const float warpV=v+.038f*(noise3(u,v,h,9,4,seed+721)-.5f);
             const float broad=macro(warpU,warpV);
             // Lower, wide bases and rounded crowns instead of pillars.
-            const float tower=smooth((broad-std::min(clearThreshold,wetThreshold)+.025f)/.17f);
-            const float floor=base-.14f+.035f*(n1-.5f);
-            const float ceiling=base+.035f+.29f*tower+.15f*(n1-.5f)+.04f*(n2-.5f);
-            const float vertical=smooth((h-floor)/.09f)*smooth((ceiling-h)/.085f);
-            const float topTaper=.045f*smooth((h-base-.02f)/.24f);
-            const float f=broad+.23f*(n1-.5f)+.13f*(n2-.5f)+.065f*(n3-.5f)-topTaper;
+            const float tower=smooth((broad-std::min(clearThreshold,wetThreshold)+.012f)/.20f);
+            const float floor=base-.24f+.045f*(n1-.5f)+.035f*(1.f-tower);
+            const float ceiling=base+.045f+.39f*tower+.18f*(n1-.5f)+.060f*(n2-.5f);
+            const float vertical=smooth((h-floor)/.075f)*smooth((ceiling-h)/.075f);
+            const float topTaper=.065f*smooth((h-base+.01f)/.27f);
+            const float f=broad+.28f*(n1-.5f)+.15f*(n2-.5f)+.075f*(n3-.5f)-topTaper;
             const auto i=index(x,y,z);
             coverage[i]=f;
             rho[i]=z==0||z==depth-1?0.f:vertical;
@@ -73,26 +77,39 @@ struct Volume {
             pixels[weather].resize(count);
             const float threshold=weather?wetThreshold:clearThreshold;
             const float density=s.cumulusDensity*s.opacity*smooth(float(target(s,float(weather)))/30.f);
+            // Reuse a scalar endpoint field for a short baked light integration.
+            // This is a one-time CPU calculation, not a shader/raymarch at draw.
+            std::vector<float> dField(count);
+            for(std::size_t i=0;i<count;++i)
+                dField[i]=rho[i]*smooth((coverage[i]-threshold+.006f)/.065f);
+            const float xyStep=canopy::tileWorldSize(s)/width;
+            const float zStep=(s.maxSpawnZ-s.minSpawnZ)/depth;
+            const int lateralStep=std::max(1,int(std::round(35.f/std::max(1.f,xyStep))));
+            const int riseStep=std::max(1,int(std::round(22.f/std::max(1.f,zStep))));
             for(int y=0;y<width;++y)for(int x=0;x<width;++x) {
-                // Overhead optical depth, plus two cheap neighbouring taps
-                // for baked directional relief. Brighten thin edges, shade
-                // dense undersides; actual sky RGB applied per frame.
                 float column=0.f;
                 for(int z=depth-1;z>=0;--z) {
                     const auto i=index(x,y,z);
-                    const float cover=smooth((coverage[i]-threshold+.018f)/.080f);
-                    const float d=rho[i]*cover;
-                    const auto neighbor=[&](int dx,int dy,int dz) {
-                        const auto j=index(x+dx,y+dy,z+dz);
-                        return rho[j]*smooth((coverage[j]-threshold+.018f)/.080f);
+                    const float d=dField[i];
+                    if(d<=0.f){pixels[weather][i]={255,255,255,0};continue;}
+                    const auto at=[&](int dx,int dy,int dz) {
+                        return dField[index(x+dx,y+dy,z+dz)];
                     };
-                    const float lateral=.52f*(neighbor(-2,-1,1)+neighbor(-4,-2,2))-.52f*(neighbor(2,1,1)+neighbor(4,2,2));
-                    // A darker underside and soft occlusion are closer to
-                    // observed daylight cumulus than uniformly white cards.
-                    const float transmission=std::exp(-column*.22f);
-                    const float shade=clamp(1.f-s.cumulusContrast*(.42f*(1.f-transmission)+.25f*lateral)
-                        +s.cumulusRimStrength*.08f*(1.f-d),.50f,1.f);
-                    const float alpha=1.f-std::exp(-d*1.15f*density);
+                    // A shallow, broad light path reveals relief from above,
+                    // where overhead extinction alone washed every top white.
+                    float oblique=0.f;
+                    for(int k=1;k<=4;++k)
+                        oblique+=at(-k*lateralStep,-k*lateralStep/2,k*riseStep);
+                    const float topDepth=column*zStep/90.f;
+                    const float sideDepth=oblique*.45f;
+                    const float ambient=std::exp(-.38f*topDepth-.56f*sideDepth);
+                    const float slope=clamp((at(lateralStep,0,0)-at(-lateralStep,0,0)
+                        +at(0,lateralStep,0)-at(0,-lateralStep,0))*.5f,-1.f,1.f);
+                    const float shade=clamp(1.f-s.cumulusContrast*(.59f*(1.f-ambient)+.22f*d+.15f*slope)
+                        +s.cumulusRimStrength*.035f*(1.f-d),.50f,1.f);
+                    // Reference alpha for 90m of cloud; individual slices
+                    // scale this by their actual path length.
+                    const float alpha=1.f-std::exp(-d*(.32f+.95f*d)*density);
                     const auto gray=canopy::byte(shade*255.f);
                     pixels[weather][i]={gray,gray,gray,canopy::byte(alpha*255.f)};
                     column+=d;
@@ -142,9 +159,19 @@ struct Volume {
         return {g,g,g,interp(&canopy::Pixel::a)};
     }
 };
-// Render a finite stack of view-aligned sample planes. The geometry aligns
-// with the view for efficient compositing, but the texture coordinates are
-// absolute world XYZ: no cloud object can swing with camera orientation.
+// The bank lighting is intentionally independent of the existing canopy.
+// SA applies a further colour filter after RenderEffects (particularly strong
+// at dawn); reserve headroom instead of painting every dense top near 255.
+inline RGB bankLight(const canopy::Light& l,const weather::State& w) {
+    if(w.flash)return l.bright;
+    const float lowSun=l.day*(1.f-smooth((l.sun.z-.06f)/.44f));
+    const float gain=1.f-l.day*.10f-lowSun*.18f;
+    return scaleRGB(l.bright,gain);
+}
+// Parallel, view-facing integration planes, anchored to a fixed world phase.
+// Moving the camera or changing its far clip does not stretch or slide the
+// sampling grid. Pitch/yaw can still change quadrature (not world density).
+// Avoid intersecting axis-aligned cells, which expose their edges in flight.
 inline void buildMesh(Mesh& m,const Settings& s,const View& view,const Range& r,
                       const canopy::Drift& drift,float wx,float wy,const Volume* volume=nullptr,float weather=0.f) {
     m.vertices.clear();m.indices.clear();m.slices=0;
@@ -159,9 +186,18 @@ inline void buildMesh(Mesh& m,const Settings& s,const View& view,const Range& r,
     const float last=std::min(r.end,std::max(z0*view.forward.z,z1*view.forward.z)+lateral);
     if(last-first<1.f)return;
     const int cap=s.cumulusDetail?DetailSlices:MaxSlices;
-    const int slices=std::clamp(int(std::ceil((last-first)/ReferenceStep)),1,cap);
-    const float step=(last-first)/slices;
+    const float step=s.cumulusDetail?DetailStep:EconomyStep;
     const float tile=canopy::tileWorldSize(s);
+    // Anchor the phase to the wind-advected density rather than the eye.
+    // Use doubles for the phase so crossing large world coordinates does
+    // not cause the lattice to snap. Only whole planes enter/leave range.
+    const double phase=double(view.forward.x)*(double(view.pos.x)-drift.worldX)
+        +double(view.forward.y)*(double(view.pos.y)-drift.worldY)
+        +double(view.forward.z)*(double(view.pos.z)-s.minSpawnZ);
+    const double phaseOffset=phase-step*std::floor(phase/step);
+    const int firstPlane=int(std::ceil((first+phaseOffset)/step-.5));
+    const int lastPlane=std::min(firstPlane+cap-1,int(std::floor((last+phaseOffset)/step-.5)));
+    if(lastPlane<firstPlane)return;
     // Keep UVs near zero to retain precision in high-speed flight.
     const double uu=double(view.pos.x)/tile-drift.x,vv=double(view.pos.y)/tile-drift.y;
     const float u0=float(uu-std::floor(uu)),v0=float(vv-std::floor(vv));
@@ -169,8 +205,8 @@ inline void buildMesh(Mesh& m,const Settings& s,const View& view,const Range& r,
     const float fade=smooth((rad-5.f)/120.f);
     const int per=(GridX+1)*(GridY+1);
     m.vertices.reserve(std::size_t(cap)*per);m.indices.reserve(std::size_t(cap)*GridX*GridY*6);
-    for(int k=slices-1;k>=0;--k) {
-        const float d=first+(k+.5f)*step;
+    for(int k=lastPlane;k>=firstPlane;--k) {
+        const float d=float((k+.5)*step-phaseOffset);
         const int start=int(m.vertices.size());
         for(int y=0;y<=GridY;++y)for(int x=0;x<=GridX;++x) {
             const Vec ray=view.forward+view.right*((2.f*x/GridX-1.f)*wx)+view.up*((1.f-2.f*y/GridY)*wy);
@@ -178,11 +214,12 @@ inline void buildMesh(Mesh& m,const Settings& s,const View& view,const Range& r,
             const float horizontal=std::sqrt(horizontalSq(delta));
             const float rangeWeight=distanceAlpha(r,length(delta));
             const float edge=smooth((rad-horizontal)/(rad*.34f));
+            const float capFade=smooth((first+cap*step-d)/(step*2.f));
             // The density texture is clamped vertically to empty border
             // slices. Geometry outside the layer therefore contributes zero.
             const float w=(pos.z-s.minSpawnZ)/band;
-            const float nearWeight=mix(smooth((length(delta)-view.nearClip)/std::max(80.f,s.nearFadeDistance)),1.f,s.interiorHaze);
-            const float a=sat(refOpacity*length(ray))*edge*rangeWeight*nearWeight*fade;
+            const float nearWeight=mix(smooth((length(delta)-view.nearClip)/std::max(80.f,s.nearFadeDistance)),1.f,s.interiorHaze*.22f);
+            const float a=sat(refOpacity*length(ray))*edge*rangeWeight*nearWeight*fade*capFade;
             m.vertices.push_back({pos,u0+delta.x/tile,v0+delta.y/tile,w,a});
         }
         const auto before=m.indices.size();

@@ -407,10 +407,11 @@ bool DrawBanks(RwCamera* camera,const vc::View& view,const vc::Range& range,
     catch(const std::bad_alloc&) {Log("3D cloud vertex allocation failed.");return false;}
     const float visibility=vc::weather::visibility(climate)*vc::weather::clearOpacity(climate);
     if(visibility<=1.f/255.f)return true;
+    const auto bankLight=vc::banks::bankLight(light,climate);
     for(std::size_t i=0;i<batch.size();++i) {
         const auto& v=bankMesh.vertices[i];
         batch[i]={v.pos.x,v.pos.y,v.pos.z,D3DCOLOR_ARGB(Byte(v.alpha*visibility*255.f),
-            Byte(light.bright.r),Byte(light.bright.g),Byte(light.bright.b)),v.u,v.v,v.w};
+            Byte(bankLight.r),Byte(bankLight.g),Byte(bankLight.b)),v.u,v.v,v.w};
     }
     // CameraBeginUpdate (7F8F20) writes these matrices before applying
     // them to D3D. Read the active camera matrices, not device GetTransform
@@ -435,7 +436,7 @@ bool DrawBanks(RwCamera* camera,const vc::View& view,const vc::Range& range,
     if(!result){LogD3DFailure("draw",result);return false;}
     if(!bankDrawLogged) {
         char info[256];
-        std::snprintf(info,sizeof(info),"3D cloud draw submitted: %d slices, %lu triangles, camera Z=%.1f, coverage=%.2f.",
+        std::snprintf(info,sizeof(info),"3D cloud draw submitted: %d fixed-phase planes, %lu triangles, camera Z=%.1f, coverage=%.2f.",
             bankMesh.slices,static_cast<unsigned long>(bankMesh.indices.size()/3),view.pos.z,climate.coverage);
         Log(info);bankDrawLogged=true;
     }
@@ -620,7 +621,7 @@ public:
         plugin::Events::shutdownRwEvent += ReleaseCanopy;
         plugin::Events::d3dLostEvent += ReleaseBankTextures;
         plugin::Events::d3dResetEvent += ReleaseBankTextures;
-        Log(settings.renderMode==2 ? "Procedural volumetric cloud renderer installed (SA 1.0 US, shader-free D3D9 volume banks, pure-device compatible)." : settings.lightingMode==0
+        Log(settings.renderMode==2 ? "Procedural volumetric cloud renderer installed (SA 1.0 US, world-locked D3D9 volume banks, pure-device compatible)." : settings.lightingMode==0
             ? "Procedural volumetric cloud renderer installed (SA 1.0 US, native lighting)."
             : "Procedural volumetric cloud renderer installed (SA 1.0 US, custom lighting).");
     }

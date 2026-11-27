@@ -96,6 +96,62 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
         if(std::abs(observed[0]-expected[0])>6||std::abs(observed[1]-expected[1])>6)
             return fail("Incorrect 3D texture or alpha/weather blend result");
     }
+    // Render the generated density and actual mesh through the same backend,
+    // with a perspective camera near the altitude/position in the flight
+    // recording. The test above isolates the sampler; this checks that the
+    // full scene has both visible cloud relief and unobscured sky.
+    const int uploadWidth=volume.width,uploadDepth=volume.depth;
+    Settings settings;
+    canopy::Map map;map.build(canopy::textureSize(settings),settings.seed);
+    volume.build(settings,map);
+    for(int layer=0;layer<2;++layer) {
+        owner[layer].p->Release();owner[layer].p=nullptr;
+        const auto result=d3d9::upload(device,volume,layer,uploadWidth,uploadDepth,&owner[layer].p);
+        if(!result)return fail(result.operation,result.hr);
+        textures[layer]=owner[layer].p;
+    }
+    const float wx=.94f,wy=.53f;
+    const Vec forward=unit(Vec{.96f,-.27f,-.17f});
+    const Vec right=unit(cross(forward,{0,0,1})),up=cross(right,forward);
+    for(const Vec pos:{Vec{2164,-1265,673},Vec{2255,-1341,672.7f},Vec{2266,-1271,490}}) {
+        View camera{pos,right,up,forward,2200,1};
+        auto view=d3d9::identity();
+        view._11=right.x;view._21=right.y;view._31=right.z;view._41=-dot(pos,right);
+        view._12=up.x;view._22=up.y;view._32=up.z;view._42=-dot(pos,up);
+        view._13=forward.x;view._23=forward.y;view._33=forward.z;view._43=-dot(pos,forward);
+        D3DMATRIX projection{};
+        projection._11=1.f/wx;projection._22=1.f/wy;
+        projection._33=camera.farClip/(camera.farClip-camera.nearClip);
+        projection._34=1;projection._43=-camera.nearClip*projection._33;
+        banks::Mesh mesh;banks::buildMesh(mesh,settings,camera,range(settings,camera.farClip,1600),{},wx,wy,
+            uploadWidth==volume.width&&uploadDepth==volume.depth?&volume:nullptr,0);
+        if(mesh.indices.empty())return fail("No occupied 3D geometry in flight view");
+        std::vector<d3d9::Vertex> batch;
+        for(const auto& v:mesh.vertices)batch.push_back({v.pos.x,v.pos.y,v.pos.z,
+            D3DCOLOR_ARGB(d3d9::byte(v.alpha*255),208,208,208),v.u,v.v,v.w});
+        if(FAILED(hr=device->Clear(0,nullptr,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER,0xFF000000,1,0)))return fail("Scene Clear",hr);
+        if(FAILED(hr=device->BeginScene()))return fail("Scene BeginScene",hr);
+        const auto result=d3d9::draw(device,textures,opts,batch.data(),UINT(batch.size()),mesh.indices.data(),
+            UINT(mesh.indices.size()/3),0,false,&view,&projection);
+        const auto end=device->EndScene();
+        if(!result)return fail(result.operation,result.hr);
+        if(FAILED(end))return fail("Scene EndScene",end);
+        if(FAILED(hr=device->GetRenderTargetData(back.p,readback.p)))return fail("Scene readback",hr);
+        D3DLOCKED_RECT lock{};
+        if(FAILED(hr=readback->LockRect(&lock,nullptr,D3DLOCK_READONLY)))return fail("Scene LockRect",hr);
+        unsigned visible=0,empty=0,peak=0;
+        for(UINT y=0;y<desc.Height;++y)for(UINT x=0;x<desc.Width;++x) {
+            DWORD colour=0;
+            std::memcpy(&colour,static_cast<const char*>(lock.pBits)+std::size_t(y)*lock.Pitch+x*sizeof(DWORD),sizeof(DWORD));
+            const unsigned value=colour&255;
+            visible+=value>8;empty+=value<=2;peak=std::max(peak,value);
+        }
+        readback->UnlockRect();
+        std::printf("Flight scene x=%.1f y=%.1f z=%.1f: %d planes, %u visible pixels, %u clear pixels, peak %u\n",
+            pos.x,pos.y,pos.z,mesh.slices,visible,empty,peak);
+        if(visible<desc.Width*desc.Height/64 || (pos.z>settings.maxSpawnZ&&empty<desc.Width*desc.Height/64) || peak<25 || peak>209)
+            return fail("Flight scene readback has no cloud/sky contrast");
+    }
     return 0;
 }
 }

@@ -42,6 +42,11 @@ int main() {
     const auto lightning=canopy::liveLighting(s,dark,{0,-1,-.8f},flash);
     CHECK(light.bright.r>220 && storm.bright.r<light.bright.r*.8f && n.bright.r<60);
     CHECK(lightning.bright.r==255 && lightning.bright.g==255 && lightning.bright.b==255);
+    const auto dawn=canopy::liveLighting(s,noon,{-.8f,-.5f,.15f},sunny);
+    CHECK(banks::bankLight(dawn,sunny).r<dawn.bright.r*.85f);
+    CHECK(banks::bankLight(light,sunny).r>light.bright.r*.85f);
+    CHECK(close(banks::bankLight(n,rainy).r,n.bright.r));
+    CHECK(banks::bankLight(lightning,flash).r==255);
     Settings reduced=s;reduced.badWeatherDensityMultiplier=.45f;
     // At full geometry opacity the optical union reproduces the actual
     // clear and overcast endpoint alpha maps, including reversed density.

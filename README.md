@@ -83,7 +83,7 @@ text retains the default. Inline comments are supported.
 | CumulusNightLight | 1 | Mode 2: night illumination multiplier (0–2); smooth transition to daylight |
 | CumulusContrast | 0.65 | Mode 2: directional relief and occlusion contrast (0–1) |
 | CumulusRimStrength | 0.85 | Mode 2: subtle thin-edge illumination (0–1), no additive halo |
-| CumulusDetail | 0 | Mode 2: 0 = 512² canopy masks + 128×128×32 volume endpoints, at most 16 slices; 1 = 1024² masks + 256×256×32 volumes, at most 24 slices |
+| CumulusDetail | 0 | Mode 2: 0 = 512² canopy masks + 128×128×32 volume endpoints, 40 m sample interval, at most 36 slices; 1 = 1024² masks + 256×256×32 volumes, 28 m interval, at most 52 slices |
 | InteriorHaze | 0.85 | Mode 2: retain nearby volume opacity on cloud entry (0–1); 0 fades the closest samples |
 | CanopyFlightClouds | 0 | Optional native crossed wisps near the canopy height (0–24); off for lowest cost |
 | PuffsPerCloud | 5 | Mode 1: number of puffs (1–8); core uses three fixed planes, each satellite one |
@@ -140,14 +140,18 @@ toward a continuous 3D field derived from the same macro weather map.
   erosion and a flatter base form continuous banks. XYZ density remains
   in world space, translated by native wind, including during flight.
 - **Lighting:** static optical-depth accumulation down the cloud column
-  and two oblique neighborhood taps give bright tops, diffuse shaded
-  undersides and soft edges. Native sky/timecycle RGB and lightning are
-  applied live. This is approximate baked relief, not dynamic directional
+  and four oblique density taps give stronger top/underside relief;
+  a sharper density core leaves more defined gaps and taller crowns.
+  Native sky/timecycle RGB and lightning are applied live, with daylight
+  headroom for SA’s post-processing colour filter, especially at dawn. This is approximate baked relief, not dynamic directional
   shadowing or full multiple scattering.
 - **Rendering:** ordinary hardware-filtered RGBA volume textures
   (128×128×32 each, clear/overcast endpoints). A bounded stack of
-  view-aligned sample planes carries actual world XYZ texture coordinates.
-  Spatial density does not rotate as the sample-plane orientation changes.
+  parallel view-aligned sample planes carries actual world XYZ texture coordinates.
+  Planes have a fixed 40 m (28 m in detail mode) interval and world phase
+  advected by wind. Changing camera position or clip range cannot rescale
+  the sampling grid as the initial volume iteration did. Pitch/yaw still
+  changes quadrature orientation, but does not rotate the density itself.
   Fixed-function texture stages linearly interpolate the weather endpoints
   and multiply live vertex RGB/alpha. The indexed triangle list is submitted
   back-to-front in one draw, with existing scene depth testing, no depth
@@ -157,14 +161,18 @@ toward a continuous 3D field derived from the same macro weather map.
   camera far clip remains the limit.
 - **Flight:** the volume exists at its actual sampled depths, including
   in front of and behind the player/aircraft. Sampling near the eye
-  creates natural local visibility loss, replacing the depth-unaware
-  full-screen haze. InteriorHaze now controls the near-sample fade rather
+  creates local visibility loss, replacing the depth-unaware
+  full-screen haze. Closest planes fade more gently to prevent one slice
+  suddenly occupying the entire view. InteriorHaze controls the residual
+  near-sample opacity rather
   than a separate overlay. There may be gaps between slices and banding
   at very close range. Limited sampling does not provide true per-pixel
   volumetric integration.
 - **Cost:** one 3D draw (plus one or two existing canopy draws). Economy
-  caps at 16 × 12 × 10 × 2 = 3,840 slice triangles before rejection,
-  plus up to 960 distant canopy triangles; detail caps at 24 × 12 × 10 × 2.
+  caps at 36 × 12 × 10 × 2 = 8,640 slice triangles before rejection,
+  plus up to 960 distant canopy triangles; detail caps at 52 × 12 × 10 × 2.
+  The usual economy flight regression submits 3,374 triangles after culling.
+  Tighter spacing reduces undersampling at the cost of increased alpha fill.
   Two RGBA volume textures occupy 4 MiB (16 MiB at detail 1); total
   with mipmapped canopy ~6.67 MiB / ~26.67 MiB, excluding driver overhead.
   CPU keeps the 4/16 MiB volume pixels for device restore, plus a tiny
@@ -188,7 +196,7 @@ toward a continuous 3D field derived from the same macro weather map.
   GPU occlusion query records depth-passing samples without waiting.
   Device loss/reset and RW shutdown release owned resources.
 - **Initialization:** the original map and volume are generated once on
-  the game thread. The economy volume bake measured ~0.21 s in local Linux
+  the game thread. The economy volume bake measured ~0.18 s in local Linux
   release tests (plus canopy generation/upload); high detail takes longer.
   First-use hitch is possible, unlike the old gradual atlas bake.
 
@@ -230,7 +238,10 @@ The Win32 CTest `cloud_d3d9_volume` creates a native D3D9 device (attempts SA's
 pure-device flags first), uploads actual 3D textures with the same backend
 as the ASI, draws the clear/intermediate/wet endpoints, and reads pixels
 back to verify that changing the third texture coordinate changes the
-output. A machine without a volume-capable D3D9 device reports **skipped**,
+output. The expanded test then uploads generated cloud density and draws the
+actual perspective mesh at approximate positions from the flight recording,
+checking nonempty cloud pixels, sky gaps above the layer, and intensity.
+A machine without a volume-capable D3D9 device reports **skipped**,
 not passed. This does not test the GTA camera or integration.
 
 The log beside the ASI distinguishes `3D cloud device:`,
@@ -246,10 +257,13 @@ send the new log lines including HRESULT, not only the canopy screenshot.
 | ![Day](docs/previews/banks_ground.jpg) | ![Flight](docs/previews/banks_flight.jpg) |
 | ![Above](docs/previews/banks_above.jpg) | ![Rain](docs/previews/banks_rainflight.jpg) |
 | ![Night](docs/previews/banks_night.jpg) | ![Entry](docs/previews/banks_entry.jpg) |
+| ![Dawn, starting position](docs/previews/banks_dawn.jpg) | ![Dawn, after travel](docs/previews/banks_dawnmove.jpg) |
 
 Actual C++ density textures and slice triangles, software-rendered with
 trilinear filtering, synthetic sky, not GTA screenshots. They do not
-verify that the game successfully initialized or drew the volume.
+verify that the game successfully initialized or drew the volume. The last
+user-provided build log does confirm actual in-game 3D output on a pure D3D9
+device; the updated sampling/lighting still need in-game visual confirmation.
 
 ```sh
 g++ -std=c++17 -O2 tests/banks_preview.cpp -o banks_preview
