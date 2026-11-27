@@ -617,3 +617,7 @@ HybridClouds=1, CumulusDetail=0. Modes 0/1 and HybridClouds=0 fallback retained.
   artifacts, not exact GTA V/RDR2 appearance. Do not increase default
   sampling without weak-GPU evidence. Shader path only if actual results
   demonstrate it can improve visuals at equal or lower fill cost.
+
+- Win32 CI exposed the private RW flush prototype being hidden by SDK
+  header guards. Call the exact validated SA 1.0 US wrapper target
+  0x7FC200 (SDK RenderWare.cpp and supplied function list).

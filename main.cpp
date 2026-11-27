@@ -365,7 +365,9 @@ bool DrawBanks(RwCamera* camera,const vc::View& view,const vc::Range& range,
             Byte(light.bright.r),Byte(light.bright.g),Byte(light.bright.b)),v.u,v.v,v.w};
     }
     auto* d=bankDevice;
-    _rwD3D9RenderStateFlushCache();
+    // This internal SDK declaration depends on rwcore.h header guards.
+    // Pinned SDK RenderWare.cpp and SA 1.0 US IDB both resolve it here.
+    plugin::Call<0x7FC200>();
     IDirect3DStateBlock9* saved=nullptr;
     if(FAILED(d->CreateStateBlock(D3DSBT_ALL,&saved)))return false;
     struct Restore {IDirect3DStateBlock9* p;bool captured=false;~Restore(){if(captured)p->Apply();p->Release();}} restore{saved};
