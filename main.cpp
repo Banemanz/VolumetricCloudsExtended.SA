@@ -156,20 +156,6 @@ public:
     }
 };
 
-struct Colour { float r,g,b; };
-Colour Blend(Colour a,Colour b,float t) {
-    return {vc::mix(a.r,b.r,t),vc::mix(a.g,b.g,t),vc::mix(a.b,b.b,t)};
-}
-Colour BaseColour() {
-    const auto& cc=CTimeCycle::m_CurrentColours;
-    const float grey=std::min(255.f,(cc.m_nSkyTopRed+cc.m_nSkyTopGreen+cc.m_nSkyTopBlue+
-        cc.m_nSkyBottomRed+cc.m_nSkyBottomGreen+cc.m_nSkyBottomBlue)/6.f+settings.colorBrightnessBoost);
-    const Colour fallback{grey,grey,grey};
-    if (!settings.useTimecycTint) return fallback;
-    const Colour low{float(cc.m_nLowCloudsRed),float(cc.m_nLowCloudsGreen),float(cc.m_nLowCloudsBlue)};
-    const Colour bottom{float(cc.m_nFluffyCloudsBottomRed),float(cc.m_nFluffyCloudsBottomGreen),float(cc.m_nFluffyCloudsBottomBlue)};
-    return Blend(fallback,Blend(low,bottom,settings.fluffyCloudBottomBlend),settings.timecycTintStrength);
-}
 unsigned char Byte(float x) { return static_cast<unsigned char>(vc::clamp(x,0.f,255.f)+.5f); }
 
 bool Visible(RwCamera* camera, vc::Vec p, float radius) {
@@ -196,7 +182,7 @@ void Flush(int& count,RwRaster* raster) {
     count=0;
 }
 
-void Append(const vc::Card& card,Colour colour,int& count) {
+void Append(const vc::Card& card,const vc::CardColours& colours,int& count) {
     // Two triangles, identical UV convention to SA: top-left (0,0).
     constexpr int corners[6]={0,1,2,1,3,2};
     const auto normal=vc::unit(vc::Vec{
@@ -206,13 +192,13 @@ void Append(const vc::Card& card,Colour colour,int& count) {
     for (int index:corners) {
         const bool right=(index&1)!=0, bottom=(index&2)!=0;
         const auto p=card.center+card.right*(right?1.f:-1.f)+card.up*(bottom?-1.f:1.f);
-        const auto shade=bottom?settings.bottomShade:1.f;
+        const auto& colour=bottom?colours.bottom:colours.top;
         auto& v=vertices[count++];
         RwIm3DVertexSetPos(&v,p.x,p.y,p.z);
         RwIm3DVertexSetNormal(&v,normal.x,normal.y,normal.z);
         RwIm3DVertexSetU(&v,right?1.f:0.f);
         RwIm3DVertexSetV(&v,bottom?1.f:0.f);
-        RwIm3DVertexSetRGBA(&v,Byte(colour.r*shade),Byte(colour.g*shade),Byte(colour.b*shade),Byte(card.alpha*255.f));
+        RwIm3DVertexSetRGBA(&v,Byte(colour.r),Byte(colour.g),Byte(colour.b),Byte(card.alpha*255.f));
     }
 }
 
@@ -276,8 +262,13 @@ void __cdecl RenderClouds() {
 
     RenderStates states;
     if (!states.begin()) return;
-    const Colour base=BaseColour();
-    const Colour sky{float(cc.m_nSkyBottomRed),float(cc.m_nSkyBottomGreen),float(cc.m_nSkyBottomBlue)};
+    const vc::Palette palette{
+        {float(cc.m_nSkyTopRed),float(cc.m_nSkyTopGreen),float(cc.m_nSkyTopBlue)},
+        {float(cc.m_nSkyBottomRed),float(cc.m_nSkyBottomGreen),float(cc.m_nSkyBottomBlue)},
+        {float(cc.m_nLowCloudsRed),float(cc.m_nLowCloudsGreen),float(cc.m_nLowCloudsBlue)},
+        {float(cc.m_nFluffyCloudsBottomRed),float(cc.m_nFluffyCloudsBottomGreen),float(cc.m_nFluffyCloudsBottomBlue)}
+    };
+    const vc::CloudLighting lighting(settings,palette);
     int count=0;
     RwRaster* raster=nullptr;
     for (int i=0;i<drawCount;++i) {
@@ -285,10 +276,8 @@ void __cdecl RenderClouds() {
         // Batch only consecutive matching rasters: no texture regrouping that breaks alpha order.
         if (count+6>BatchVertices || raster!=d.raster) Flush(count,raster);
         raster=d.raster;
-        const auto shade=vc::mix(settings.bottomShade,1.f,d.card.shade);
-        const Colour lit{base.r*shade,base.g*shade,base.b*shade};
-        const float haze=settings.useGameFog?0.f:settings.hazeStrength*vc::smooth(vc::length(d.card.center-view.pos)/range.end);
-        Append(d.card,Blend(lit,sky,haze),count);
+        const float distanceNorm=settings.lightingMode==1?vc::length(d.card.center-view.pos)/range.end:0.f;
+        Append(d.card,lighting.colours(d.card.shade,distanceNorm),count);
     }
     Flush(count,raster);
 }
@@ -314,7 +303,9 @@ public:
         plugin::Events::initGameEvent += ResetField;
         plugin::Events::reInitGameEvent += ResetField;
         plugin::Events::shutdownRwEvent += ResetField;
-        Log("Procedural volumetric cloud renderer installed (SA 1.0 US).");
+        Log(settings.lightingMode==0
+            ? "Procedural volumetric cloud renderer installed (SA 1.0 US, native lighting)."
+            : "Procedural volumetric cloud renderer installed (SA 1.0 US, custom lighting).");
     }
 } gPlugin;
 } // namespace

@@ -61,3 +61,26 @@ next executable test target, not proof of in-game rendering.
 The offline renderer in `tests/dump_preview.cpp` + `tests/preview.py` projects
 the portable model's real cards with a synthetic alpha texture and sky gradient.
 Examples in `docs/previews` are diagnostics, not GTA screenshots.
+
+## Lighting correction after user runtime feedback
+The original white high clouds and first PR build's dark, brown/gray clouds were
+compared in user-supplied GTA screenshots. They are different geographic and camera
+positions/times, so not a controlled pixel comparison. Nevertheless the code had
+a clear cause: it used unrelated timecycle low-cloud/fluffy-bottom RGB at 100%
+strength and darkened it twice (per puff and bottom vertex), plus sky-colour haze.
+
+The IDA text in part 14, 0x716693–0x7166EB, loads six unsigned sky channels,
+sums them, divides by six (0x2AAAAAAB multiply), adds 0x40 and clamps to 0xFF.
+It uses a neutral value, not the low-cloud palette. The stock blend is SRCALPHA /
+INVSRCALPHA with scene fog disabled (gta-reversed PostEffects and native cloud
+override). The new default LightingMode=0 reproduces this neutral vertex
+colour (64 boost by default), bypassing old tint, shade and haze keys even if
+set by an old INI. LightingMode=1 retains custom lighting, with safer fresh
+defaults. No changes to opacity, geometry, spawning, or texture selection.
+
+Portable tests exercise old INIs, clear/dawn/night luminance, colour saturation,
+uniform top/bottom colours and explicit custom mode. The offline preview now
+uses the shared C++ lighting instead of independently approximating it; the
+two sunrise scenes illustrate the lighting difference using identical geometry
+and synthetic texture/palette. Test the new ASI in the same place, time/weather,
+and particle.txd to validate visually.

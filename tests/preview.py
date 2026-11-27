@@ -25,16 +25,19 @@ mask = np.uint8(np.clip(mask*2.7,0,1)**1.5*255)
 
 def render(scene, destination, executable):
     raw = subprocess.check_output([executable, scene], text=True)
-    storm = scene=="rain"
-    top = np.array([61,80,99] if storm else [59,127,197])
-    bottom = np.array([145,155,165] if storm else [192,218,236])
+    rows=csv.reader(io.StringIO(raw))
+    palette=list(map(float,next(rows)))
+    top=np.array(palette[:3])
+    bottom=np.array(palette[3:])
     y = np.linspace(0,1,HEIGHT)[:,None,None]
     sky = np.broadcast_to(top*(1-y)+bottom*y, (HEIGHT, WIDTH,3)).copy()
     canvas = Image.fromarray(sky.astype(np.uint8)).convert("RGBA")
-    base = np.array([190,199,205] if storm else [255,250,243])
-    for row in csv.reader(io.StringIO(raw)):
-        *coords, opacity, shade, haze = map(float,row)
-        p=np.array(coords).reshape(4,2)
+    for row in rows:
+        values=list(map(float,row))
+        p=np.array(values[:8]).reshape(4,2)
+        opacity=values[8]
+        top_colour=np.array(values[9:12])
+        bottom_colour=np.array(values[12:15])
         lo=np.maximum(0,np.floor(p.min(axis=0))).astype(int)
         hi=np.minimum([WIDTH,HEIGHT],np.ceil(p.max(axis=0))).astype(int)
         w,h=hi-lo
@@ -49,9 +52,9 @@ def render(scene, destination, executable):
         try: coeff=np.linalg.solve(np.array(mat),np.array(result))
         except np.linalg.LinAlgError: continue
         rgba=np.zeros((N,N,4),dtype=np.uint8)
-        lit=base*(.75+.25*shade)
-        colour=lit*(1-.35*haze)+bottom*.35*haze
-        rgba[:,:,:3]=(colour[None,None,:]*np.linspace(1,.75,N)[:,None,None]).astype(np.uint8)
+        # Actual shared C++ lighting, interpolated between vertex colours.
+        t=np.linspace(0,1,N)[:,None,None]
+        rgba[:,:,:3]=np.clip(top_colour*(1-t)+bottom_colour*t,0,255).astype(np.uint8)
         rgba[:,:,3]=(mask*opacity).astype(np.uint8)
         card=Image.fromarray(rgba).transform((int(w),int(h)),Image.Transform.PERSPECTIVE,tuple(coeff),Image.Resampling.BILINEAR)
         canvas.alpha_composite(card,tuple(lo))
@@ -62,5 +65,5 @@ def render(scene, destination, executable):
 
 if __name__=="__main__":
     dest=pathlib.Path(sys.argv[2]); dest.mkdir(parents=True,exist_ok=True)
-    for scene in ("clear","rain","flight","crossed"):
+    for scene in ("clear","rain","flight","crossed","sunrise","sunrise_old"):
         render(scene,dest/(scene+".jpg"),sys.argv[1])

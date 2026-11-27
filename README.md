@@ -27,7 +27,7 @@ pipeline may still need compatibility testing.
   Excess clouds fade out instead of remaining permanently allocated.
 - Clustered impostors (default): independently positioned soft cards form a cloud
   group. Each card faces the camera and is depth-sorted, with stable world positions,
-  varied sizes/rolls and mild vertical shading. Increasing the card count does not
+  varied sizes/rolls and native lighting (optional custom shading). Increasing the card count does not
   simply multiply opacity.
 - Crossed cards remain selectable for the native appearance.
 - Frustum rejection, actual camera far-plane limit, smooth range and near fades,
@@ -59,10 +59,11 @@ text retains the default. Inline comments are supported.
 | FarClipFadeRange | 450 | Requested distance fade width |
 | FarClipFadeMargin | 80 | Margin before the active far plane |
 | TimecycFarClipScale | 1.8 | Optional tighter timecycle-based cap, never extends projection |
-| UseTimecycTint | 1 | Use interpolated timecycle cloud RGB |
-| TimecycTintStrength | 1 | Mix native sky grayscale and cloud tint |
-| FluffyCloudBottomBlend | 0 | Mix low-cloud and fluffy-bottom timecycle RGB |
-| ColorBrightnessBoost | 64 | Addition to native grayscale fallback |
+| LightingMode | 0 | 0 = native high-cloud colour; 1 = custom tint, shade and haze |
+| UseTimecycTint | 1 | Custom mode: use interpolated low-cloud/fluffy RGB |
+| TimecycTintStrength | 0.20 | Custom mode: mix native sky grayscale and cloud tint |
+| FluffyCloudBottomBlend | 0 | Custom mode: mix low-cloud and fluffy-bottom timecycle RGB |
+| ColorBrightnessBoost | 64 | Addition to native sky luminance (64 is stock) |
 | UseAdditionalTextures | 1 | Look for listed textures in particle.txd |
 | IncludeOriginalTextureInRandom | 1 | Include native cloudhigh among variants |
 | CloudTextureNames | cloud2,cloud3,cloud4 | Comma-separated names; up to 15 |
@@ -71,13 +72,23 @@ text retains the default. Inline comments are supported.
 | SizeScale | 1 | Group dimensions multiplier |
 | Opacity | 1 | Group opacity multiplier (0–2) |
 | NearFadeDistance | 25 | Fade near the camera; 0 disables |
-| BottomShade | 0.75 | Bottom/vertical shading strength (1 disables) |
-| HazeStrength | 0.35 | Blend distant cards toward timecycle sky-bottom RGB |
+| BottomShade | 1 | Custom mode only: bottom/vertical shading (1 disables) |
+| HazeStrength | 0 | Custom mode only: blend distant cards toward sky-bottom RGB |
 | UseGameFog | 0 | Use RW scene fog rather than the plugin's manual distance haze |
 | Seed | 17321 | Deterministic local RNG seed |
 
-For a look closer to the old renderer, set `RenderMode=0`, `BottomShade=1`,
-`HazeStrength=0` and optionally `UseGameFog=1`. For a low-overhead clustered
+**Lighting correction:** `LightingMode=0` now uses the native high-cloud vertex
+colour from SA 1.0 US: average the six sky colour channels (integer division),
+add `ColorBrightnessBoost` (native 64) and clamp to 255. All vertices use that
+neutral brightness, with no extra puff/bottom shading or manual colour haze.
+An older INI without `LightingMode` automatically uses this corrected mode;
+no need to delete or regenerate it. The custom lighting settings are retained,
+but take effect only with `LightingMode=1`. `UseGameFog` is independently
+configurable and defaults off, like the native pass.
+
+For the stock appearance with the procedural field, use `RenderMode=0`,
+`LightingMode=0`, `UseAdditionalTextures=0`, `UseGameFog=0` and
+`ColorBrightnessBoost=64`. For a low-overhead clustered
 configuration try `PuffsPerCloud=3`. The new renderer deliberately does not
 extend the world/camera clip plane or change the game's native height-switch global.
 
@@ -120,12 +131,18 @@ See [handoff](new%20chat/HANDOFF.md) for implementation and verification details
 
 These images are generated from the actual portable cloud geometry using a **synthetic
 texture and sky**, not GTA assets or an in-game capture. They illustrate placement
-and the two geometry modes; real-game appearance must be tested separately.
+and the two geometry modes, plus the shared C++ lighting calculation; real-game
+appearance must be tested separately. The last row uses identical geometry,
+synthetic texture and illustrative sunrise palette; only lighting settings differ.
 
 | Clear / clustered | Rain / clustered |
 |---|---|
 | ![Clear scene](docs/previews/clear.jpg) | ![Rain scene](docs/previews/rain.jpg) |
 | ![Flight scene](docs/previews/flight.jpg) | ![Legacy crossed cards](docs/previews/crossed.jpg) |
+
+| Corrected sunrise (native colour) | Previous sunrise (full custom tint/shading) |
+|---|---|
+| ![Corrected](docs/previews/sunrise.jpg) | ![Previous](docs/previews/sunrise_old.jpg) |
 
 To regenerate the previews (requires Python, NumPy and Pillow):
 

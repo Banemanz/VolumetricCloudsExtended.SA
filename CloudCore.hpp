@@ -41,14 +41,15 @@ struct Settings {
     float windMoveScale = .9f, minSpacing2D = 45.f, spawnFadeInSpeed = .02f;
     float quadFacingMin = .2f, farClipFadeRange = 450.f, farClipFadeMargin = 80.f;
     float timecycFarClipScale = 1.8f;
+    int lightingMode = 0; // 0: native volumetric cloud colour; 1: custom tint/shade/haze
     bool useTimecycTint = true;
-    float timecycTintStrength = 1.f, fluffyCloudBottomBlend = 0.f;
+    float timecycTintStrength = .20f, fluffyCloudBottomBlend = 0.f;
     int colorBrightnessBoost = 64;
     bool useAdditionalTextures = true, includeOriginalTextureInRandom = true;
     std::vector<std::string> textureNames{"cloud2", "cloud3", "cloud4"};
     int renderMode = 1, puffsPerCloud = 5; // 0: crossed cards, 1: clustered soft cards
     float sizeScale = 1.f, opacity = 1.f, nearFadeDistance = 25.f;
-    float bottomShade = .75f, hazeStrength = .35f;
+    float bottomShade = 1.f, hazeStrength = 0.f;
     bool useGameFog = false;
     int seed = 17321;
 };
@@ -86,7 +87,7 @@ inline bool boolean(const std::string& s, bool& v) {
     X(Opacity,opacity,0.f,2.f) X(NearFadeDistance,nearFadeDistance,0.f,500.f) \
     X(BottomShade,bottomShade,0.f,1.f) X(HazeStrength,hazeStrength,0.f,1.f)
 #define VC_INTS(X) X(TargetProcClouds,targetProcClouds,0,MaxClouds) \
-    X(ColorBrightnessBoost,colorBrightnessBoost,0,255) X(RenderMode,renderMode,0,1) \
+    X(ColorBrightnessBoost,colorBrightnessBoost,0,255) X(LightingMode,lightingMode,0,1) X(RenderMode,renderMode,0,1) \
     X(PuffsPerCloud,puffsPerCloud,1,MaxPuffs) X(Seed,seed,1,16777215)
 #define VC_BOOLS(X) X(UseTimecycTint,useTimecycTint) X(UseAdditionalTextures,useAdditionalTextures) \
     X(IncludeOriginalTextureInRandom,includeOriginalTextureInRandom) X(UseGameFog,useGameFog)
@@ -142,6 +143,44 @@ inline void write(std::ostream& out, const Settings& c) {
 #undef VC_FLOATS
 #undef VC_INTS
 #undef VC_BOOLS
+
+// The native high/volumetric cloud pass does NOT use the low-cloud or fluffy
+// bottom RGB values. It averages all six sky-top/bottom channels, adds 64,
+// clamps to 255, and passes that neutral luminance to every card vertex.
+// Verified in the SA 1.0 US IDA dump at 0x716693..0x7166EB.
+struct RGB { float r,g,b; };
+struct Palette { RGB skyTop,skyBottom,lowCloud,fluffyBottom; };
+inline RGB mixRGB(RGB a, RGB b, float t) {
+    return {mix(a.r,b.r,t),mix(a.g,b.g,t),mix(a.b,b.b,t)};
+}
+inline RGB scaleRGB(RGB c,float v) { return {c.r*v,c.g*v,c.b*v}; }
+inline RGB nativeCloudColour(const Settings& s,const Palette& p) {
+    const int sum=int(p.skyTop.r)+int(p.skyTop.g)+int(p.skyTop.b)+
+                  int(p.skyBottom.r)+int(p.skyBottom.g)+int(p.skyBottom.b);
+    const float grey=float(std::clamp(sum/6+s.colorBrightnessBoost,0,255));
+    return {grey,grey,grey};
+}
+struct CardColours { RGB top,bottom; };
+class CloudLighting {
+    RGB base,sky;
+    bool custom;
+    float shade,haze;
+public:
+    CloudLighting(const Settings& s,const Palette& p)
+        : base(nativeCloudColour(s,p)),sky(p.skyBottom),custom(s.lightingMode==1),
+          shade(s.bottomShade),haze(s.useGameFog?0.f:s.hazeStrength) {
+        if (custom && s.useTimecycTint)
+            base=mixRGB(base,mixRGB(p.lowCloud,p.fluffyBottom,s.fluffyCloudBottomBlend),s.timecycTintStrength);
+    }
+    CardColours colours(float puffShade,float distanceNorm) const {
+        // Native mode bypasses all custom colour multipliers (even stale values
+        // in an older INI). The original texture provides its own shading.
+        if (!custom) return {base,base};
+        const RGB lit=scaleRGB(base,mix(shade,1.f,sat(puffShade)));
+        const RGB top=mixRGB(lit,sky,haze*smooth(distanceNorm));
+        return {top,scaleRGB(top,shade)};
+    }
+};
 
 struct View { Vec pos, right, up, forward; float farClip, nearClip; };
 struct Range { float end, begin, spawnMin, spawnMax, recycle; };

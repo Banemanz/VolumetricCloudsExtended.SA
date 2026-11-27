@@ -24,6 +24,32 @@ int main() {
     Settings roundtrip; std::istringstream input(ini.str()); load(input,roundtrip);
     CHECK(roundtrip.targetProcClouds==cfg.targetProcClouds && roundtrip.textureNames==cfg.textureNames);
 
+    // Stock cloud vertices use neutral sky luminance, not low-cloud/underside RGB.
+    // An old generated INI must not silently restore the overly dark/tinted look.
+    Settings legacy;
+    std::istringstream oldIni("UseTimecycTint=1\nTimecycTintStrength=1\nBottomShade=.75\nHazeStrength=.35\n");
+    load(oldIni,legacy);
+    const Palette dawn{{156,255,255},{255,170,90},{60,30,20},{40,20,10}};
+    const Palette clear{{60,128,197},{192,218,236},{40,40,40},{20,20,20}};
+    const Palette night{{5,6,12},{14,15,20},{0,0,0},{0,0,0}};
+    auto bright=CloudLighting(legacy,dawn).colours(0.f,1.f);
+    CHECK(legacy.lightingMode==0 && bright.top.r==255 && bright.top.g==255 && bright.top.b==255);
+    CHECK(bright.bottom.r==255 && bright.bottom.g==255 && bright.bottom.b==255);
+    const auto clearColour=CloudLighting(legacy,clear).colours(.5f,.9f);
+    CHECK(clearColour.top.r==235 && clearColour.top.g==235 && clearColour.top.b==235);
+    CHECK(clearColour.bottom.r==clearColour.top.r && clearColour.bottom.g==clearColour.top.g && clearColour.bottom.b==clearColour.top.b);
+    const auto nightColour=CloudLighting(legacy,night).colours(0,1);
+    CHECK(nightColour.top.r==76 && nightColour.top.g==76 && nightColour.top.b==76);
+    // Explicit opt-in to old tint/shading must remain available.
+    std::istringstream customMode("LightingMode=1\n");
+    load(customMode,legacy);
+    auto custom=CloudLighting(legacy,dawn).colours(.5f,0.f);
+    CHECK(legacy.lightingMode==1 && close(custom.top.r,52.5f));
+    CHECK(close(custom.bottom.r,39.375f) && custom.top.r!=custom.top.b);
+    CHECK(CloudLighting(legacy,dawn).colours(.5f,1.f).top.r>custom.top.r);
+    legacy.useGameFog=true;
+    CHECK(close(CloudLighting(legacy,dawn).colours(.5f,1.f).top.r,custom.top.r));
+
     cfg=Settings{};
     View view{{0,0,100},{1,0,0},{0,0,1},{0,1,0},1800,1};
     const Range r=range(cfg,view.farClip,1000);
@@ -107,6 +133,6 @@ int main() {
     for(int i=0;i<100;++i) f.update(cfg,view,r,0,{},1);
     CHECK(used(f)==0);
 
-    std::cout << "PASS: INI, clip range, weather transitions, density retirement, spawn distribution, "
+    std::cout << "PASS: INI, native/custom lighting, clip range, weather transitions, density retirement, spawn distribution, "
                  "wind/timestep, determinism, teleport, geometry, opacity and capacity\n";
 }

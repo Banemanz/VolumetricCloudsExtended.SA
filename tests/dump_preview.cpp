@@ -13,6 +13,17 @@ int main(int argc,char** argv) {
     float height=20.f;
     if(scene=="crossed") cfg.renderMode=0;
     if(scene=="flight") { height=520.f; pitch=-.13f; }
+    Palette palette{{60,128,197},{192,218,236},{75,75,75},{50,50,50}};
+    if(scene=="rain") palette={{61,80,99},{145,155,165},{65,65,65},{45,45,45}};
+    if(scene=="sunrise" || scene=="sunrise_old") {
+        palette={{156,255,255},{255,170,90},{60,30,20},{40,20,10}};
+        height=306.f; pitch=.06f;
+    }
+    if(scene=="sunrise_old") {
+        // Reproduce the previous build, not a separate geometry/texture fixture.
+        cfg.lightingMode=1; cfg.timecycTintStrength=1.f; cfg.bottomShade=.75f; cfg.hazeStrength=.35f;
+    }
+    const CloudLighting lighting(cfg,palette);
     View v{{0,0,height},{1,0,0},{0,-std::sin(pitch),std::cos(pitch)},
         {0,std::cos(pitch),std::sin(pitch)},2000,1};
     const auto r=range(cfg,v.farClip,1600);
@@ -37,6 +48,8 @@ int main(int argc,char** argv) {
         return true;
     };
     std::cout << std::setprecision(8);
+    auto rgb=[](RGB c) { std::cout<<c.r<<','<<c.g<<','<<c.b; };
+    rgb(palette.skyTop); std::cout<<','; rgb(palette.skyBottom); std::cout<<'\n';
     for(auto& c:items) {
         float x[4],y[4];
         bool valid=true;
@@ -46,6 +59,8 @@ int main(int argc,char** argv) {
         }
         if(!valid)continue;
         for(int i=0;i<4;++i) std::cout<<x[i]<<','<<y[i]<<',';
-        std::cout<<c.alpha<<','<<c.shade<<','<<smooth(length(c.center-v.pos)/r.end)<<'\n';
+        const auto colours=lighting.colours(c.shade,length(c.center-v.pos)/r.end);
+        std::cout<<c.alpha<<',';
+        rgb(colours.top); std::cout<<','; rgb(colours.bottom); std::cout<<'\n';
     }
 }
