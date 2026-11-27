@@ -11,6 +11,7 @@
 #include "CTimer.h"
 #include "CTxdStore.h"
 #include "CScene.h"
+#include "common.h"
 #include "CloudD3D9.hpp"
 #include "CloudBillboards.hpp"
 #include <cstdio>
@@ -390,7 +391,7 @@ bool DrawCanopy(const vc::View& view,const vc::Range& range,float hybridFade,
                 const vc::weather::State& weather,const vc::canopy::Light& light,
                 const D3DMATRIX& transform,const D3DVIEWPORT9& viewport,vc::RGB fog) {
     if(settings.opacity<=0.f||settings.cumulusDensity<=0.f||!settings.targetProcClouds)return true;
-    const auto mesh=vc::canopy::mesh(settings,view,range,canopyDrift,vc::banks::radius(settings,range),hybridFade,true);
+    const auto mesh=vc::canopy::mesh(settings,view,range,canopyDrift,hybridFade);
     const auto weights=vc::canopy::layerWeights(settings,weather);
     canopyProjected.clip.clear();canopyProjected.clip.reserve(mesh.vertices.size());
     for(const auto& v:mesh.vertices)canopyProjected.clip.push_back(vc::d3d9::clipVertex(
@@ -421,8 +422,8 @@ bool DrawCanopy(const vc::View& view,const vc::Range& range,float hybridFade,
 
 bool DrawBillboards(const vc::View& view,const vc::Range& range,const vc::weather::State& climate,
                     const vc::canopy::Light& light,const D3DMATRIX& transform,
-                    const D3DVIEWPORT9& viewport,vc::RGB fog,float wx,float wy) {
-    const float visibility=vc::weather::visibility(climate)*vc::weather::clearOpacity(climate);
+                    const D3DVIEWPORT9& viewport,vc::RGB fog,float wx,float wy,float handover) {
+    const float visibility=vc::weather::visibility(climate)*vc::weather::clearOpacity(climate)*handover;
     if(visibility<=1.f/255.f)return true;
     vc::billboards::buildMesh(billboardMesh,settings,view,range,canopyDrift,billboardAtlas,wx,wy,
         billboardOptions.dual?climate.coverage:(climate.coverage>=.5f?1.f:0.f));
@@ -439,16 +440,23 @@ bool DrawBillboards(const vc::View& view,const vc::Range& range,const vc::weathe
 }
 bool DrawBanks(RwCamera* camera,const vc::View& view,const vc::Range& range,
                const vc::weather::State& climate,const vc::canopy::Light& light,
-               const D3DMATRIX& transform,const D3DVIEWPORT9& viewport,vc::RGB fog) {
+               const D3DMATRIX& transform,const D3DVIEWPORT9& viewport,vc::RGB fog,float handover,float playerZ) {
     if(!bankDevice||!bankTextures[0]||!bankTextures[1])return false;
     auto* window=RwCameraGetViewWindow(camera);
     if(!window)return false;
     const auto* offset=RwCameraGetViewOffset(camera);
     const float wx=window->x+(offset?std::abs(offset->x):0.f),
                 wy=window->y+(offset?std::abs(offset->y):0.f);
+    // Alpha accumulates through many volume planes. Ease in per-plane
+    // extinction to prevent a dense cloud appearing almost fully opaque
+    // the instant the altitude blend begins. Atlas cards are pre-integrated.
+    const float handoverVisibility=vc::weather::visibility(climate)*vc::weather::clearOpacity(climate)*handover;
+    if(handoverVisibility<=1.f/255.f)return true;
+    const float visibility=handoverVisibility*handover;
     bool farReady=EnsureBillboards();
     try {
-        if(farReady)farReady=DrawBillboards(view,range,climate,light,transform,viewport,fog,wx,wy);
+        if(farReady)farReady=DrawBillboards(view,range,climate,light,transform,viewport,fog,wx,wy,handover);
+        if(visibility<=1.f/255.f)return true;
         vc::banks::buildMesh(bankMesh,settings,view,range,canopyDrift,wx,wy,bankDownsampled?nullptr:&bankVolume,
             bankOptions.dual?climate.coverage:(climate.coverage>=.5f?1.f:0.f),farReady);
     }
@@ -457,8 +465,6 @@ bool DrawBanks(RwCamera* camera,const vc::View& view,const vc::Range& range,
         if(!bankEmptyLogged&&!bankDrawLogged){Log("3D cloud bank ready; no occupied slices in current camera frustum yet.");bankEmptyLogged=true;}
         return true;
     }
-    const float visibility=vc::weather::visibility(climate)*vc::weather::clearOpacity(climate);
-    if(visibility<=1.f/255.f)return true;
     const auto bankLight=vc::banks::bankLight(light,climate);
     try {
         bankProjected.clip.clear();bankProjected.clip.reserve(bankMesh.vertices.size());
@@ -484,8 +490,9 @@ bool DrawBanks(RwCamera* camera,const vc::View& view,const vc::Range& range,
     if(!result){LogD3DFailure("draw",result);return false;}
     if(!bankDrawLogged) {
         char info[256];
-        std::snprintf(info,sizeof(info),"3D cloud draw submitted: %d radial shells, %lu triangles, camera Z=%.1f, coverage=%.2f.",
-            bankMesh.slices,static_cast<unsigned long>(bankProjected.indices.size()/3),view.pos.z,climate.coverage);
+        std::snprintf(info,sizeof(info),"3D cloud draw submitted: %d world-fixed slice patches, %lu triangles, player Z=%.1f, canopy Z=%.1f, camera Z=%.1f, handover=%.2f, coverage=%.2f.",
+            bankMesh.slices,static_cast<unsigned long>(bankProjected.indices.size()/3),playerZ,vc::canopy::altitude(settings),
+            view.pos.z,handover,climate.coverage);
         Log(info);bankDrawLogged=true;
     }
     return true;
@@ -567,7 +574,12 @@ void __cdecl RenderClouds() {
         modern=EnsureCanopy();
         if(modern && newFrame) canopyDrift.update(settings,windVector,dt);
         if(modern) {
-            const bool useBanks=EnsureBanks();
+            // Use the actual player (or their occupied vehicle), not the
+            // camera height. Orbiting/looking upward cannot trigger a handover.
+            const auto* player=FindPlayerEntity();
+            const float playerZ=player?player->GetPosition().z:0.f;
+            const float requestedBlend=player?vc::canopy::handover(settings,playerZ):0.f;
+            const float volumeBlend=requestedBlend>1.f/255.f&&EnsureBanks()?requestedBlend:0.f;
             const auto independent=vc::cloudRange(settings);
             const auto& viewMatrix=*reinterpret_cast<const D3DMATRIX*>(0xC9BC80);
             const auto& projection=*reinterpret_cast<const D3DMATRIX*>(0x8E2458);
@@ -584,8 +596,8 @@ void __cdecl RenderClouds() {
                     bool drawn=false;
                     try {
                         const auto fog=vc::canopy::fogColour(palette);
-                        drawn=DrawCanopy(view,independent,useBanks?1.f:0.f,climate,light,transform,viewport,fog);
-                        if(drawn&&useBanks&&!DrawBanks(camera,view,independent,climate,light,transform,viewport,fog)) {
+                        drawn=DrawCanopy(view,independent,volumeBlend,climate,light,transform,viewport,fog);
+                        if(drawn&&volumeBlend>0.f&&!DrawBanks(camera,view,independent,climate,light,transform,viewport,fog,volumeBlend,playerZ)) {
                             bankFailed=true;Log("3D cloud draw failed; retaining full canopy from next frame.");
                         }
                     } catch(const std::bad_alloc&) {Log("Cloud projection allocation failed.");}

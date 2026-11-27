@@ -42,6 +42,22 @@ int main() {
         if(a.a>0)CHECK(b.potentiallyOccupied(u,v,w,u,v,w,0.f));
     }
     CHECK(b.sample(0,.5f,.5f,-3).a==0 && b.sample(1,.5f,.5f,6).a==0);
+    // Prefix lookup must be identical to a conservative block scan, even
+    // for negative coordinates, multiple periods and weather endpoints.
+    for(int i=0;i<240;++i) {
+        const float u0=i*.013f-2.f,v0=i*.031f-3.f,w0=float(i%18)/20.f-.1f;
+        const float u1=u0+float(i%43)*.057f,v1=v0+float(i%33)*.071f,w1=w0+.17f;
+        for(float weather:{0.f,.5f,1.f}) {
+            bool expected=false;
+            for(int z=std::max(0,int(std::floor(w0*banks::OccupancyZ)));z<=std::min(banks::OccupancyZ-1,int(std::floor(w1*banks::OccupancyZ)));++z)
+                for(int y=int(std::floor(v0*banks::OccupancyXY));y<=int(std::floor(v1*banks::OccupancyXY));++y)
+                    for(int x=int(std::floor(u0*banks::OccupancyXY));x<=int(std::floor(u1*banks::OccupancyXY));++x) {
+                        const auto j=(z*banks::OccupancyXY+canopy::wrap(y,banks::OccupancyXY))*banks::OccupancyXY+canopy::wrap(x,banks::OccupancyXY);
+                        expected|=(weather<.999f&&b.occupied[0][j]>0)||(weather>.001f&&b.occupied[1][j]>0);
+                    }
+            CHECK(b.potentiallyOccupied(u0,v0,w0,u1,v1,w1,weather)==expected);
+        }
+    }
     const View ground{{2266,-1271,30},{1,0,0},{0,0,1},{0,1,0},2200,1};
     const auto r=cloudRange(s);
     banks::Mesh raw,culled;
@@ -53,7 +69,7 @@ int main() {
         banks::buildMesh(raw,s,v,r,{},.94f,.53f);
         banks::buildMesh(culled,s,v,r,{},.94f,.53f,&b,0);
         CHECK(raw.indices.size()>=culled.indices.size());
-        CHECK(culled.slices<=(detail?banks::DetailSlices:banks::MaxSlices) && culled.vertices.size()<44001);
+        CHECK(culled.vertices.size()<=banks::MaxVertices);
         for(const auto& p:culled.vertices) {
             const float u=p.pos.x/canopy::tileWorldSize(s),vv=p.pos.y/canopy::tileWorldSize(s);
             CHECK(std::abs(u-p.u-std::round(u-p.u))<.001f);
@@ -88,7 +104,7 @@ int main() {
             const float av=a.v+(q.v-a.v)*u+(c.v-a.v)*v;
             const float aw=a.w+(q.w-a.w)*u+(c.w-a.w)*v;
             const auto p=b.sample(0,au,av,aw);
-            hits.push_back({d,au,av,aw,a.alpha,float(p.a)});
+            hits.push_back({d,au,av,aw,a.alpha+(q.alpha-a.alpha)*u+(c.alpha-a.alpha)*v,float(p.a)});
         }
         std::sort(hits.begin(),hits.end(),[](const auto& a,const auto& b){return a[0]>b[0];});
         return hits;
@@ -119,9 +135,50 @@ int main() {
         CHECK(samples==reference);
     }
     std::cout<<"PASS: "<<reference.size()<<" identical world-ray intersections through yaw/pitch and camera clip changes\n";
+    // Camera translation along one world ray must not drag its density
+    // samples along with the camera. Restrict to a common distance interval
+    // where the nested lattice is fully coarse at BOTH eye positions;
+    // compare actual intersections and texture density, ignoring distance
+    // fade and optical weight (which should change with the moved eye).
+    for(Vec direction:{unit(Vec{1,.16f,.012f}),unit(Vec{1,.92f,.014f})}) {
+        auto still=pose;still.forward=direction;
+        still.right=unit(cross(still.forward,{0,0,1}));still.up=cross(still.right,still.forward);
+        const auto line=unit(direction+still.right*.017f+still.up*.001f);
+        banks::buildMesh(raw,s,still,r,wind,.94f,.53f,&b,0);
+        const auto fixed=raySamples(raw,still,line);
+        for(float advance:{17.f,61.f,143.f,231.f}) {
+            auto moving=still;moving.pos=still.pos+line*advance;
+            banks::buildMesh(culled,s,moving,r,wind,.94f,.53f,&b,0);
+            const auto shifted=raySamples(culled,moving,line);
+            int common=0;
+            for(const auto& sample:fixed) {
+                if(sample[0]<1700.f||sample[0]>2800.f||sample[4]<.02f)continue;
+                const auto found=std::find_if(shifted.begin(),shifted.end(),[&](const auto& v) {
+                    return std::abs(v[0]+advance-sample[0])<.02f;
+                });
+                CHECK(found!=shifted.end());
+                CHECK(std::abs(sample[1]-(*found)[1]-std::round(sample[1]-(*found)[1]))<.0001f);
+                CHECK(std::abs(sample[2]-(*found)[2]-std::round(sample[2]-(*found)[2]))<.0001f);
+                CHECK(std::abs(sample[3]-(*found)[3])<.0001f&&std::abs(sample[5]-(*found)[5])<=1.f);
+                ++common;
+            }
+            CHECK(common>5);
+        }
+    }
+    for(float d=20.f;d<2000.f;d+=13.f) {
+        float path=0;for(int i=-4;i<0;++i)path+=banks::planeWeight(i,20.f,d);
+        CHECK(std::abs(path-80.f)<.001f);
+    }
+    Vec previousWeights=banks::axisWeights({1,.70f,0});
+    for(float y=.701f;y<1.30f;y+=.001f) {
+        const auto w=banks::axisWeights({1,y,0});
+        CHECK(std::abs(w.x+w.y+w.z-1.f)<.00001f && length(w-previousWeights)<.015f);
+        previousWeights=w;
+    }
+    std::cout<<"PASS: fixed world intersections during translation, continuous diagonal axis and distance LOD weights\n";
     // Range must actually control volumetric geometry, not just the canopy.
     const auto farthest=[&](const banks::Mesh& mesh) {
-        float d=0;for(const auto& p:mesh.vertices)d=std::max(d,length(p.pos-flight.pos));return d;
+        float d=0;for(const auto& p:mesh.vertices)if(p.alpha>0.f)d=std::max(d,length(p.pos-flight.pos));return d;
     };
     float previous=0;
     for(float range:{1800.f,4200.f,6000.f,8000.f,12000.f}) {

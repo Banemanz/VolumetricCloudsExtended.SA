@@ -213,16 +213,26 @@ inline const auto& directions() {
     }();
     return d;
 }
-inline float flightWeight(const Settings& s,const View& v) {
-    const float fade=std::max(70.f,s.nearFadeDistance+55.f);
-    return 1.f-smooth(std::abs(v.pos.z-altitude(s))/fade);
+// Player altitude, NOT camera height or pitch. Begin just below the
+// physical canopy and finish at the canopy; the same curve on descent.
+// At the defaults this is 390.6m -> 434m above sea level.
+constexpr float HandoverRatio=.90f;
+inline float handover(const Settings& s,float playerZ) {
+    if(!s.hybridClouds||!std::isfinite(playerZ))return 0.f;
+    const float height=altitude(s);
+    // For negative/zero custom heights, retain an ordered, nonzero blend.
+    const float width=std::max(1.f,std::abs(height)*(1.f-HandoverRatio));
+    return smooth((playerZ-(height-width))/width);
 }
-inline Mesh mesh(const Settings& s,const View& v,const Range& r,const Drift& drift,float hybridRadius=0.f,float hybridFade=0.f,bool connected=false) {
+inline Mesh mesh(const Settings& s,const View& v,const Range& r,const Drift& drift,float hybridFade=0.f) {
     Mesh m;
     const float base=altitude(s),radius=r.end*.96f;
     // A very shallow sag at the horizon, zero camera tilt. Recenter XY only;
     // UVs are derived from world XY and thus never rotate or slide with the view.
-    const float sag=std::min((s.maxSpawnZ-s.minSpawnZ)*.55f,radius*.14f)*(connected?mix(1.f,.12f,hybridFade):1.f);
+    // Hybrid canopy stays at one world altitude throughout handover.
+    // Bending a camera-centred sheet shifts the height of the same world
+    // XY as we travel, especially conspicuous during the altitude blend.
+    const float sag=s.hybridClouds?0.f:std::min((s.maxSpawnZ-s.minSpawnZ)*.55f,radius*.14f);
     const float tile=tileWorldSize(s);
     const double u=double(v.pos.x)/tile-drift.x,vv=double(v.pos.y)/tile-drift.y;
     const float originU=float(u-std::floor(u)),originV=float(vv-std::floor(vv));
@@ -236,9 +246,7 @@ inline Mesh mesh(const Settings& s,const View& v,const Range& r,const Drift& dri
         // flat cloud plane, or kills the entire sheet at flight altitude.
         // The faint distant underlay follows the radial range; the actual
         // density field (or its volume-projected billboards) supplies shape.
-        const float blend=connected&&hybridFade>0.f
-            ?mix(1.f,.22f*smooth((dist-r.end*.58f)/(r.end*.29f)),hybridFade)
-            :hybridRadius>0.f?1.f-.83f*hybridFade*smooth((hybridRadius-length(delta))/(hybridRadius*.38f)):1.f;
+        const float blend=mix(1.f,.22f*smooth((dist-r.end*.58f)/(r.end*.29f)),hybridFade);
         return Vertex{p,originU+delta.x/tile,originV+delta.y/tile,a*strength*blend};
     };
     m.vertices[0]=vertex({},0);

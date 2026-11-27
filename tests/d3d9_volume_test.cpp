@@ -232,7 +232,7 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
             visible+=value>8;empty+=value<=2;peak=std::max(peak,value);
         }
         readback->UnlockRect();
-        std::printf("Flight scene x=%.1f y=%.1f z=%.1f: %d shells, %u visible pixels, %u clear pixels, peak %u\n",
+        std::printf("Flight scene x=%.1f y=%.1f z=%.1f: %d fixed slice patches, %u visible pixels, %u clear pixels, peak %u\n",
             pos.x,pos.y,pos.z,mesh.slices,visible,empty,peak);
         if(visible<desc.Width*desc.Height/64 || (pos.z>settings.maxSpawnZ&&empty<desc.Width*desc.Height/64) || peak<25 || peak>209)
             return fail("Flight scene readback has no cloud/sky contrast");

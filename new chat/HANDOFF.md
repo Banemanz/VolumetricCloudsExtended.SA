@@ -847,3 +847,67 @@ shaders or copying another game's assets.
   poses, rotate in place and translate slowly, try 4200/8000/12000
   with independent fog end adjusted accordingly. Compare FPS on weak
   hardware; longer range increases the scene's alpha fill despite LOD.
+
+## Player-height handover and fixed world lattice (2026-11-27)
+
+User supplied `gta_sa_ld7LQlESSy.mp4` (2560x1440, 30 fps, 526 frames at
+17.53s). Examined all decoded frames in contact sheets and contiguous
+eight-frame crops around 2.0s, 4.5s, 6.3s and 10.4s. The aircraft/airbreak
+movement visibly changes bank silhouettes and internal relief, with
+large changes during ascent/descent (especially around 4.67–4.73s).
+Actual parallax, rapid altitude changes and compression are mixed with
+rendering artifacts; this does not isolate the error pixel-for-pixel.
+The prior radial shells were rotation-invariant, but moved all density
+sampling surfaces with the camera during translation. That limitation
+remained a credible source of the swimming seen in flight.
+
+- Player Z is authoritative: Plugin-SDK `FindPlayerEntity()` at 0x56E120
+  returns ped or occupied vehicle, null if absent (also verified in
+  gta-reversed `source/game_sa/World_Helper.cpp`). No camera-height
+  substitution. User explicitly requested a 90% height ratio:
+  canopy altitude = min + .52 * (max-min). Default 434m, start 390.6m,
+  full volume at 434m. Smoothstep through the gap, reversed on descent;
+  at ground no per-frame 3D mesh, draw or far impostors. No new INI
+  option; changing layer heights automatically changes the threshold.
+  Bank alpha follows squared blend to account for accumulation through
+  multiple planes, atlas card alpha follows the normal blend.
+  No player or failed bank => full canopy. Hybrid canopy is fixed flat
+  at canopy Z, no geometry bending during the blend. Standalone curved
+  canopy retained. Bakes done once, volume/atlas GPU upload on demand.
+- Replace camera-centred shell geometry with world-anchored X/Y/Z
+  lattice. Economy 20/40/80m nested sample spacing, detail 16/32/64m;
+  vertical spacing aligns to height band. Per-vertex normalized
+  dominant-axis weights crossfade diagonals. LOD weights sum to a
+  constant optical path for each four consecutive lattice samples.
+  Never translate the sample lattice with the camera, including wind
+  (density/UV drift as before). Only texture-period integer offsets
+  change to retain precision. Spatial bricks subdivide locally where
+  angular interpolation requires it; exact same plane locations both
+  sides of subdivision. AABB frustum rejection, hierarchical distance
+  ordering, stable patch ties, conservative occupancy prefix sums (two
+  periodic XY copies, 16-bit counts). No shaders, new mode or render
+  targets, no per-frame texture allocation or texture generation. Intersecting
+  slices during the diagonal blend are still approximately sorted.
+- Existing independent cloud fog, draw distance and atlas LOD retained.
+  8km default: volume reaches ~7196m before taper, 76 atlas cards;
+  12km with impostors reaches ~10800m, without >11000m. The source
+  geometry budget remains 44k vertices. No claims about actual FPS on
+  low-end hardware: local 180-pose CPU mesh benchmark, prior shells
+  mean ~1.05ms / 8400 triangles, new ~1.46ms / 7717 triangles. Reference
+  flight ~7850 triangles vs old ~7643. Ground-level volume work is zero.
+  Local benchmark is only the mesh, not the GTA frame/GPU.
+- All four portable GCC release regressions pass, including real
+  triangle/ray intersections during yaw/pitch, translations up to
+  231m on the same world line, corresponding actual world XYZ/UVW and
+  density, axis/LOD continuity, occupancy prefix parity against brute
+  force across periodic boundaries, and player-height ratios at
+  custom heights. D3D9 Win32 tests retained for true native readback.
+  Updated ground/entry/flight/above diagnostics generated from same
+  C++ density geometry, using synthetic sky, not a GTA capture.
+- In-game priority for the next tester: hover with airbreak below
+  390m, move camera without moving CJ, ascend through 391–434m,
+  fly sideways at constant height then independently rotate, descend
+  through the same band. Look for remaining seam/diagonal/cell boundary
+  artifacts. Check 4200/8000/12000 ranges and frame times in flight.
+  No assertion that every real-game distortion is fixed; test the
+  actual ASI before making new changes to the density art.

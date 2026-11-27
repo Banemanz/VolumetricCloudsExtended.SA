@@ -156,7 +156,7 @@ inline void write(std::ostream& out, const Settings& c) {
 #define FIELD(name,member,comment) out << "; " comment "\n" #name "=" << c.member << "\n";
     out << "[Renderer]\n";
     FIELD(RenderMode,renderMode,"2 = 3D cloud banks (recommended), 1 = clustered classic clouds, 0 = classic crossed clouds.")
-    FIELD(HybridClouds,hybridClouds,"Mode 2: 1 = full 3D clouds; 0 = only the distant cloud layer for very weak hardware.")
+    FIELD(HybridClouds,hybridClouds,"Mode 2: 1 = distant layer below, 3D banks fade in at 90% of canopy height; 0 = distant layer only.")
     FIELD(CumulusDetail,cumulusDetail,"Mode 2: 0 = economy (recommended); 1 = finer textures and more samples.")
     out << "\n[Clouds]\n";
     FIELD(TargetProcClouds,targetProcClouds,"How much of the sky is covered (0-512; 0 disables all custom clouds). Classic modes use this as the group count.")

@@ -77,9 +77,26 @@ int main() {
     }
     for(int i=VertexCount-Segments;i<VertexCount;++i) CHECK(mesh0.vertices[i].alpha==0);
     auto inside=v;inside.pos.z=altitude(s);
-    CHECK(mesh(s,inside,rangeLimit,{}).vertices[0].alpha==0 && flightWeight(s,inside)==1);
-    CHECK(flightWeight(s,v)==0);
+    CHECK(mesh(s,inside,rangeLimit,{}).vertices[0].alpha==0 && handover(s,inside.pos.z)==1);
+    CHECK(handover(s,v.pos.z)==0);
     auto moved=v;moved.pos.x+=500;moved.pos.y-=800;
+    const float h=altitude(s),blendStart=h-std::max(1.f,std::abs(h)*(1.f-HandoverRatio));
+    CHECK(handover(s,blendStart-1)==0 && handover(s,blendStart)==0 && handover(s,h)==1 && handover(s,h+300)==1);
+    CHECK(std::abs(handover(s,(blendStart+h)*.5f)-.5f)<.0001f);
+    for(float offset:{100.f,500.f,2000.f}) {
+        auto elevated=s;elevated.minSpawnZ+=offset;elevated.maxSpawnZ+=offset;
+        const float canopyZ=altitude(elevated);
+        CHECK(handover(elevated,canopyZ*.90f-.01f)==0.f);
+        CHECK(std::abs(handover(elevated,canopyZ*.95f)-.5f)<.0001f);
+        CHECK(handover(elevated,canopyZ)==1.f);
+    }
+    auto hybridSettings=s;hybridSettings.hybridClouds=true;
+    const auto low=mesh(hybridSettings,v,rangeLimit,{},0.f);
+    const auto upperMesh=mesh(hybridSettings,v,rangeLimit,{},1.f);
+    for(std::size_t i=0;i<low.vertices.size();++i) {
+        CHECK(low.vertices[i].pos.z==upperMesh.vertices[i].pos.z);
+        CHECK(low.vertices[i].alpha>=upperMesh.vertices[i].alpha);
+    }
     const auto m=mesh(s,moved,rangeLimit,{});
     for(int i=0;i<VertexCount;++i) {
         const float expectedU=(m.vertices[i].pos.x-mesh0.vertices[i].pos.x)/tileWorldSize(s);

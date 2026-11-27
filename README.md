@@ -1,8 +1,8 @@
 # VolumetricCloudsExtended.SA
 
 A procedural replacement for GTA San Andreas' stock intersecting-card volumetric clouds.
-The default renderer combines a world-space continuous 3D density layer with the
-distant procedural canopy. It uses hardware-filtered volume texture slices and
+The default renderer uses the inexpensive procedural canopy below cloud
+altitude and smoothly hands over to a world-space continuous 3D density layer in flight. It uses hardware-filtered volume texture slices and
 fixed-function blending, not a per-pixel raymarch shader. It only
 replaces the volumetric cloud call in the original 3D effects pass. The sky background,
 low clouds, moving fog, rain and other effects remain native.
@@ -35,9 +35,10 @@ pipeline may still need compatibility testing.
 - **Continuous 3D cloud banks (default, mode 2):** the canopy's macro
   coverage drives a periodic, original 3D density field with billowing
   tops, flatter bases, and soft erosion. The nearby field is sampled by
-  bounded back-to-front radial shells with absolute world XYZ texture
-  coordinates. The world-axis tessellation is independent of camera rotation;
-  the same world ray retains the same samples when looking around.
+  fixed-world-axis slice patches with absolute world XYZ texture coordinates.
+  Neither rotating nor translating the camera moves the density-sampling
+  planes. 3D rendering begins at 90% of the canopy's height, based on the
+  actual player or occupied vehicle's Z, not the camera.
   `HybridClouds=0` selects the inexpensive original canopy-only renderer.
 - Frustum rejection, independent mode 2 cloud range, smooth range and near fades,
   back-to-front view-depth ordering and bounded RenderWare batches.
@@ -56,7 +57,7 @@ old draw and fog distances, and any explicit UseAdditionalTextures setting.
 | Setting | Default | Meaning |
 |---|---:|---|
 | RenderMode | 2 | 2 = continuous volume banks + distant layer; 1 = clustered classic cards; 0 = crossed classic cards |
-| HybridClouds | 1 | Mode 2: 0 uses only the inexpensive distant cloud layer |
+| HybridClouds | 1 | Mode 2: canopy below 90% of its height, 3D above; 0 keeps canopy everywhere |
 | CumulusDetail | 0 | Economy (recommended); 1 = larger textures and more samples |
 | TargetProcClouds | 160 | Sky coverage in mode 2; classic cloud group count otherwise; 0 disables |
 | BadWeatherDensityMultiplier | 1.4 | Cloud density in bad weather relative to clear (0–3) |
@@ -142,7 +143,7 @@ depth-buffer precision and other mods' rendering remain limitations.
 See Microsoft's [vertex fog documentation](https://learn.microsoft.com/en-us/windows/win32/direct3d9/vertex-fog)
 and [pure-device GetViewport documentation](https://learn.microsoft.com/en-us/windows/win32/api/d3d9/nf-d3d9-idirect3ddevice9-getviewport).
 
-### One density field with orientation-independent samples and far LOD
+### One density field with world-fixed samples and far LOD
 
 - **Shape:** original periodic multi-scale 3D noise distorts a smoothed
   version of the canopy coverage. Height envelopes, irregular crowns,
@@ -157,24 +158,26 @@ and [pure-device GetViewport documentation](https://learn.microsoft.com/en-us/wi
   headroom for SA’s post-processing colour filter. This is approximate
   baked relief, not dynamic directional shadowing.
 - **Rendering:** hardware-filtered RGBA volume textures (128×128×32
-  each, clear/overcast endpoints) sampled on concentric shells centred
-  at the current camera position. A static cube-sphere tessellation
-  uses world-axis directions, not the view basis; camera yaw, pitch,
-  FOV and far clip cannot change the world sample locations for a
-  common ray. Translation still changes the integration samples
-  continuously, so finite-sampling aliasing remains possible. Near
-  shells use 16m steps, 6×6 quads per cube face; farther shells
-  use 32/64/90m steps and 12×12 quads (detail: 12/24/48/72m).
-  All distances are fixed, independent of configured range.
-  Frustum rejection is performed once on the angular topology,
-  triangles are clipped to the physical cloud height slab, and the
-  conservative 16×16×8 occupancy grid rejects empty space.
-  Back-to-front radial ordering never changes for a fixed eye.
-  The indexed volume is one fixed-function draw with existing depth
-  testing, no depth writes, no screen render targets, no shaders.
+  each, clear/overcast endpoints) sampled on fixed world X/Y/Z plane
+  lattices. Unlike the previous camera-centred shells, every plane retains
+  its position during translation as well as rotation. Nearby world cells
+  use 20m steps, smoothly transitioning to nested 40m/80m steps as
+  distance increases (detail: 16/32/64m; vertical spacing fits the slab).
+  Ray-angle weights select the dominant world axis and smoothly blend
+  the two axes near a diagonal rather than suddenly switching entire
+  stacks. Spatial bricks are culled by AABB/frustum and conservative
+  density occupancy, with finer patches near the camera/diagonals.
+  Constant-time periodic occupancy prefix sums reject empty blocks.
+  Bricks are ordered back to front in their spatial hierarchy. Intersecting
+  planes in the diagonal blend have approximate rather than exact
+  per-pixel ordering. The indexed volume remains one fixed-function
+  draw with existing depth testing, no depth writes, no screen render
+  targets, no shaders. Sparse, nested sampling and interpolated vertex
+  weights can still cause some residual finite-sampling artifacts; this
+  is not per-pixel raymarching.
 - **Range:** CloudDrawDistance now controls actual volume geometry.
   The previous 1400m radius and tile-size-dependent limit are removed.
-  With billboards off, shells extend to the configured range (with
+  With billboards off, fixed slices extend to the configured range (with
   squared distance opacity taper beginning at 75%). With far billboards
   on, the first transition distance is max(5000m, 0.8 × CloudDrawDistance)
   by default; the transition ends 10% of the draw distance later
@@ -195,26 +198,34 @@ and [pure-device GetViewport documentation](https://learn.microsoft.com/en-us/wi
   volume remains active over the full range if the atlas cannot be
   prepared/uploaded or if unusually tiny cells would require too many
   cards. Directional blending and slab projection are approximations.
-- **Canopy:** canopy-only mode is unchanged. In full-volume mode the
-  sheet is now a faint distant underlay, gently fading in beyond 58%
-  of the configured range, rather than cutting out a near hole around
-  the 1400m cap and turning off at aircraft height. Its sag is much
-  smaller in hybrid mode. The actual 3D field or volume-derived
-  far cards provide the visible cloud bank. This removes the old
-  hard near-volume / flat-sheet boundary, but finite range and slab
-  thickness can still be noticeable on grazing views.
+- **Altitude handover:** the default canopy is at
+  `MinSpawnZ + 0.52 * (MaxSpawnZ - MinSpawnZ)` (434m for 200–650m).
+  Below 90% of that height (~390.6m), the canopy is the only active
+  rendering path: no per-frame bank mesh, volume draw or far card draw.
+  From 90% to 100%, the canopy smoothly fades to a faint distant underlay
+  while 3D opacity fades in (eased per-slice alpha to account for
+  accumulated optical depth). Above canopy height the volume stays active;
+  descending reverses the same curve. The actual player or occupied
+  vehicle position is used, not camera altitude. With no player, or when
+  the volume cannot be used, retain the full canopy. The hybrid canopy
+  is flat at its physical altitude throughout the handover, so transitioning
+  never moves/bends the sheet. Standalone `HybridClouds=0` retains its curve.
+  For custom zero/negative canopy heights the blend starts below the
+  canopy by at least one unit, avoiding an inverted threshold.
 - **Cost:** one 3D draw, one far billboard batch only when needed, and
-  one or two canopy draws. Source geometry is guarded below 44k
-  vertices for unusual view/configurations. In the reference economy
-  flight pose, the 4200m setting submits about 5200 triangles and
-  extends to ~4005m; default 8000m submits ~7643 triangles plus 76
-  distant cards. Earlier 1400m-limited version drew 3514 triangles.
-  A 2×2 reduction in near shell tessellation saves geometry where
-  the volume texture supplies detail. At 8000m, only a narrow area
-  of the distant sky is covered by the extra shells. GPU fill rate
-  can still increase significantly, notably inside overcast banks;
-  no old-GPU benchmark is claimed.
-  Economy GPU texture memory: 4 MiB volume + ~2.67 MiB canopy +
+  one or two canopy draws. Source geometry is guarded below 44k vertices
+  for unusual view/configurations. At ground level only canopy draws
+  remain (the density/atlas are still baked once to avoid regenerating
+  during flight). GPU volume/atlas uploads are deferred until required.
+  Economy uses fixed coarse texture samples at long range instead of
+  camera-centred shell intersections. At the reference flight pose the
+  source mesh submits ~7850 triangles and 76 distant cards. In a local
+  180-pose CPU mesh benchmark, the fixed lattice averaged 1.46ms vs
+  1.05ms for shells (7717 vs 8400 mean triangles). That slight CPU
+  increase in flight buys fixed sampling locations; ground rendering
+  skips that expense entirely. GPU fill rate still depends on
+  weather and flight height; no old-GPU benchmark is claimed.
+  Economy GPU texture memory in flight: 4 MiB volume + ~2.67 MiB canopy +
   2 MiB optional far atlas = ~8.67 MiB (detail ~28.67 MiB),
   excluding driver overhead. CPU source textures retained for reset.
   No per-frame texture generation, uploads, or full-screen overlay.
@@ -231,7 +242,7 @@ and [pure-device GetViewport documentation](https://learn.microsoft.com/en-us/wi
   if two-volume blending is unavailable, the nearest weather endpoint.
   No volume support or failed draws retain the canopy. Upload failures
   log the precise operation and HRESULT, and a successful first draw
-  logs submitted shell/triangle counts. A one-shot optional asynchronous
+  logs submitted fixed slice patch/triangle counts. A one-shot optional asynchronous
   GPU occlusion query records depth-passing samples without waiting.
   Device loss/reset and RW shutdown release owned resources.
 - **Initialization:** the original map and volume are generated once on
@@ -294,23 +305,22 @@ send the new log lines including HRESULT, not only the canopy screenshot.
 
 ### Linux software diagnostics — density/mesh only
 
-| From the ground | At aircraft altitude |
+| Below 90% canopy height | Mid-handover (412m) |
 |---|---|
-| ![Day](docs/previews/banks_ground.jpg) | ![Flight](docs/previews/banks_flight.jpg) |
-| ![Above](docs/previews/banks_above.jpg) | ![Rain](docs/previews/banks_rainflight.jpg) |
-| ![Night](docs/previews/banks_night.jpg) | ![Entry](docs/previews/banks_entry.jpg) |
-| ![Dawn, starting position](docs/previews/banks_dawn.jpg) | ![Dawn, after travel](docs/previews/banks_dawnmove.jpg) |
-| ![1.8 km range](docs/previews/banks_short.jpg) | ![12 km range](docs/previews/banks_long.jpg) |
+| ![Canopy on the ground](docs/previews/banks_ground.jpg) | ![Entry](docs/previews/banks_entry.jpg) |
+| ![Flight](docs/previews/banks_flight.jpg) | ![Above](docs/previews/banks_above.jpg) |
 
-Actual C++ density textures, radial shell triangles and distant cards, software-rendered with
-trilinear filtering, synthetic sky, not GTA screenshots. They do not
-verify that the game successfully initialized or drew the volume. The last
-user-provided build log does confirm actual in-game 3D output on a pure D3D9
-device; the updated sampling/lighting still need in-game visual confirmation.
+Actual C++ textures and fixed world sampling geometry, software-rendered
+with trilinear filtering against a synthetic sky; not GTA screenshots.
+The portable regression checks actual common world-ray intersections
+during yaw/pitch and up to 231m of translation, axis/LOD weight continuity,
+and handover at custom canopy heights. This addresses the previous
+camera-centred sampling motion but is not proof of perfect in-game
+temporal stability. The updated ASI needs another flight test.
 
 ```sh
 g++ -std=c++17 -O2 tests/banks_preview.cpp -o banks_preview
-python tests/banks_preview.py ./banks_preview docs/previews
+python tests/banks_preview.py ./banks_preview docs/previews ground entry flight above
 ```
 
 ### The distant canopy (also available standalone with HybridClouds=0)
@@ -340,8 +350,9 @@ not a copy of any game's assets, code or shaders.
 - **Geometry:** 257 vertices and 480 indexed triangles in one 32-segment,
   8-ring shallow disk. Absolute layer altitude and world-XY UVs stay stable
   under yaw, pitch, roll and camera altitude. The finite disk is recentered
-  horizontally to cover the independent cloud range; only its gentle
-  outer curvature and distance fade are camera-relative. There is no
+  horizontally to cover the independent cloud range. Hybrid mode is flat
+  at canopy height; only standalone canopy has gentle camera-relative
+  outer curvature. Distance fade is camera-relative in both. There is no
   facing sprite, texture rotation, or per-cloud sort in the default path.
   Near the surface the alpha fades locally to avoid a hard sheet crossing
   the camera. The two-sided mesh is depth-tested against world geometry.

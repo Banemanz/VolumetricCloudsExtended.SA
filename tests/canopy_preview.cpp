@@ -6,7 +6,7 @@ int main(int argc,char** argv) {
     if(argc!=3) return 1;
     using namespace vc;
     const std::string scene=argv[1];
-    Settings s;
+    Settings s;s.hybridClouds=false;
     const bool night=scene=="night",dawn=scene=="sunrise",storm=scene=="rain";
     const Palette p=night?Palette{{16,25,31},{34,49,48},{},{}}:
         dawn?Palette{{126,232,245},{255,169,91},{},{}}:
