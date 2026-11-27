@@ -10,6 +10,7 @@ constexpr int DetailWidth=256,DetailDepth=32;
 // scene far plane, and configured cloud range. For a fixed eye and world ray,
 // the tessellated surface and every sampled XYZ remain identical under a turn.
 constexpr int MaxSlices=156,DetailSlices=200,ShellGrid=12;
+constexpr std::size_t ShellVertexCount=6*(ShellGrid+1)*(ShellGrid+1);
 constexpr int OccupancyXY=16,OccupancyZ=8;
 constexpr float ReferenceStep=90.f; // opacity baked for this path length
 struct Vertex {Vec pos;float u{},v{},w{},alpha{},fog{1.f};};
@@ -253,9 +254,8 @@ inline void buildMesh(Mesh& m,const Settings& s,const View& view,const Range& r,
        !std::isfinite(wx)||!std::isfinite(wy)||wx<=0||wy<=0||wx>10.f||wy>10.f)return;
     const auto levels=lod(s,r,billboardAvailable,view.pos.z-(s.minSpawnZ+s.maxSpawnZ)*.5f);
     if(view.pos.z<s.minSpawnZ-levels.end||view.pos.z>s.maxSpawnZ+levels.end)return;
-    constexpr int n=6*(ShellGrid+1)*(ShellGrid+1);
     const auto visibleFor=[&](const ShellTopology& shell) {
-        std::array<unsigned,n> masks{};
+        std::array<unsigned,ShellVertexCount> masks{};
         for(std::size_t i=0;i<shell.directions.size();++i)masks[i]=directionMask(shell.directions[i],view,wx,wy);
         std::vector<const ShellTopology::Triangle*> result;
         result.reserve(shell.triangles.size()/3);
@@ -268,9 +268,9 @@ inline void buildMesh(Mesh& m,const Settings& s,const View& view,const Range& r,
     const float u0=float(double(view.pos.x)/tile-drift.x-std::floor(double(view.pos.x)/tile-drift.x));
     const float v0=float(double(view.pos.y)/tile-drift.y-std::floor(double(view.pos.y)/tile-drift.y));
     const auto& radial=samples(s.cumulusDetail!=0);
-    std::array<Vertex,n> cache{};
-    std::array<int,n> mapped{};
-    std::array<bool,n> ready{};
+    std::array<Vertex,ShellVertexCount> cache{};
+    std::array<int,ShellVertexCount> mapped{};
+    std::array<bool,ShellVertexCount> ready{};
     // The shell intersects the cloud slab in narrow arcs at long distance.
     // Reject those outside it before making vertices; clip boundary triangles
     // exactly to the slab, so distant shells do not repeatedly shade empty sky.
