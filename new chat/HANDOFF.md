@@ -49,3 +49,7 @@ next executable test target, not proof of in-game rendering.
 6. Compare RenderMode=0 and 1; profile with one texture and several textures.
    Multiple textures may increase draw calls since alpha order must be kept.
    No measured in-game frame-time improvement is claimed.
+
+The offline renderer in `tests/dump_preview.cpp` + `tests/preview.py` projects
+the portable model's real cards with a synthetic alpha texture and sky gradient.
+Examples in `docs/previews` are diagnostics, not GTA screenshots.

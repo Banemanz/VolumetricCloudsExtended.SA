@@ -265,8 +265,8 @@ inline float cloudAlpha(const Settings& s,const Cloud& c,const View& v,const Ran
     const float dist=length(c.position-v.pos);
     // Fade before the cloud's far edge reaches the range. Near fade reduces cockpit/aircraft intersections.
     const float edge=dist+bound(c)*.45f;
-    const float near=s.nearFadeDistance>0.f ? smooth(dist/(s.nearFadeDistance+bound(c)*.30f)) : 1.f;
-    return sat(c.alpha*s.opacity*smooth(c.fade)*distanceAlpha(r,edge)*near);
+    const float nearFade=s.nearFadeDistance>0.f ? smooth(dist/(s.nearFadeDistance+bound(c)*.30f)) : 1.f;
+    return sat(c.alpha*s.opacity*smooth(c.fade)*distanceAlpha(r,edge)*nearFade);
 }
 inline int cards(const Settings& s,const Cloud& c,const View& v,float alpha,Card* out) {
     if (s.renderMode==0) {

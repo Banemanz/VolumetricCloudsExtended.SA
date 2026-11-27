@@ -40,15 +40,15 @@ int main() {
     Field f,g; f.reset(cfg); g.reset(cfg);
     f.update(cfg,view,r,160,{},1); g.update(cfg,view,r,160,{},1);
     CHECK(used(f)==160);
-    int near=0;
+    int nearCount=0;
     for (int i=0;i<160;++i) {
         const auto& c=f.clouds[i]; const auto& d=g.clouds[i];
         CHECK(close(length(c.position-d.position),0));
         CHECK(c.position.z>=cfg.minSpawnZ && c.position.z<=cfg.maxSpawnZ);
         CHECK(horizontalSq(c.position-view.pos)<=r.spawnMax*r.spawnMax+1.f);
-        if (std::sqrt(horizontalSq(c.position-view.pos))<r.spawnMax*.6f) ++near;
+        if (std::sqrt(horizontalSq(c.position-view.pos))<r.spawnMax*.6f) ++nearCount;
     }
-    CHECK(near>20);
+    CHECK(nearCount>20);
     const Vec start=f.clouds[0].position;
     f.update(cfg,view,r,224,{1,0,0},1);
     CHECK(used(f)==224 && f.clouds[223].fade<.1f);

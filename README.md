@@ -115,3 +115,21 @@ and the supplied SA 1.0 function index. The native renderer uses three orthogona
 searchlights/post-effects, **not** inside `CClouds::Render`. The original repository's
 call site `0x53E1B4` is retained with a runtime opcode/target check.
 See [handoff](new%20chat/HANDOFF.md) for implementation and verification details.
+
+## Offline geometry previews
+
+These images are generated from the actual portable cloud geometry using a **synthetic
+texture and sky**, not GTA assets or an in-game capture. They illustrate placement
+and the two geometry modes; real-game appearance must be tested separately.
+
+| Clear / clustered | Rain / clustered |
+|---|---|
+| ![Clear scene](docs/previews/clear.jpg) | ![Rain scene](docs/previews/rain.jpg) |
+| ![Flight scene](docs/previews/flight.jpg) | ![Legacy crossed cards](docs/previews/crossed.jpg) |
+
+To regenerate the previews (requires Python, NumPy and Pillow):
+
+```sh
+g++ -std=c++17 -O2 tests/dump_preview.cpp -o dump_preview
+python tests/preview.py ./dump_preview docs/previews
+```
