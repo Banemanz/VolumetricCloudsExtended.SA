@@ -91,6 +91,16 @@ int main() {
     CHECK(cards(cfg,c,view,.5f,cardsOut)==3);
     for(int i=0;i<3;++i) CHECK(cardsOut[i].alpha>=0 && cardsOut[i].alpha<=.5f);
 
+    // Above the altitude band, initial/recycled clouds retain vertical variation.
+    Field highField; highField.reset(cfg);
+    View highView=view; highView.pos.z=10000.f;
+    highField.update(cfg,highView,r,160,{},1);
+    float minZ=cfg.maxSpawnZ,maxZ=cfg.minSpawnZ;
+    for (auto& cloud:highField.clouds) if(cloud.used) {
+        minZ=std::min(minZ,cloud.position.z); maxZ=std::max(maxZ,cloud.position.z);
+    }
+    CHECK(minZ>=cfg.minSpawnZ && maxZ<=cfg.maxSpawnZ && maxZ-minZ>100.f);
+
     // Maximum capacity stays bounded; retiring to zero fades out rather than popping.
     f.update(cfg,view,r,MaxClouds,{},1);
     CHECK(used(f)==MaxClouds);

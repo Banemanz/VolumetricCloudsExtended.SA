@@ -60,6 +60,7 @@ jobs:
           Copy-Item build/Release/VolumetricCloudsExtended.pdb dist/
           Copy-Item README.md dist/
           Copy-Item 'new chat' dist/ -Recurse
+          Copy-Item docs dist/ -Recurse
           Compress-Archive -Path dist/* -DestinationPath VolumetricCloudsExtended.SA-Win32.zip
       - uses: actions/upload-artifact@v4
         with:

@@ -199,8 +199,11 @@ class Field {
             const float radius=std::sqrt(rng.sample(inner*inner,r.spawnMax*r.spawnMax));
             // Absolute world altitude: flying upward does not drag the cloud layer with you.
             // Bias towards visible altitude when clip is short, but never violate the configured layer.
-            const float low=clamp(v.pos.z-r.end*.5f,s.minSpawnZ,s.maxSpawnZ);
-            const float high=clamp(v.pos.z+r.end*.5f,low,s.maxSpawnZ);
+            float low=std::max(v.pos.z-r.end*.5f,s.minSpawnZ);
+            float high=std::min(v.pos.z+r.end*.5f,s.maxSpawnZ);
+            if (high-low < (s.maxSpawnZ-s.minSpawnZ)*.1f) {
+                low=s.minSpawnZ; high=s.maxSpawnZ; // never flatten the cloud layer at extreme altitudes
+            }
             const Vec p{v.pos.x+radius*std::cos(angle),v.pos.y+radius*std::sin(angle),rng.sample(low,high)};
             float spacing=1e30f;
             for (const auto& other : clouds)
@@ -253,8 +256,10 @@ public:
             }
             // Only recycle after the entire cloud is outside the visible region.
             if (!c.used) spawn(c,s,v,r,false);
-            else if (horizontalSq(c.position-v.pos)>std::pow(std::max(r.recycle,r.end+bound(c)),2.f))
-                spawn(c,s,v,r,true);
+            else {
+                const float limit=std::max(r.recycle,r.end+bound(c));
+                if (horizontalSq(c.position-v.pos)>limit*limit) spawn(c,s,v,r,true);
+            }
             c.fade=std::min(1.f,c.fade+fadeStep);
         }
     }

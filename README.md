@@ -110,10 +110,10 @@ g++ -std=c++17 -O2 -Wall -Wextra -Werror tests/cloud_tests.cpp -o cloud_tests
 Reviewed gta-reversed [Clouds.cpp](https://github.com/gta-reversed/gta-reversed/blob/85bce0be4bd3229eb5ef445d3a7ac2e611a994f4/source/game_sa/Clouds.cpp),
 [app_game.cpp](https://github.com/gta-reversed/gta-reversed/blob/85bce0be4bd3229eb5ef445d3a7ac2e611a994f4/source/app/app_game.cpp)
 and [Weather.cpp](https://github.com/gta-reversed/gta-reversed/blob/85bce0be4bd3229eb5ef445d3a7ac2e611a994f4/source/game_sa/Weather.cpp)
-and the supplied SA 1.0 function index. The native renderer uses three orthogonal planes at
+and the supplied SA 1.0 function index and disassembly dump. The native renderer uses three orthogonal planes at
 `0x716380` and is called during `RenderEffects` at `0x53E170`, after moving fog and before
 searchlights/post-effects, **not** inside `CClouds::Render`. The original repository's
-call site `0x53E1B4` is retained with a runtime opcode/target check.
+call site `0x53E1B4` is verified against the IDB disassembly (part 06, E8 C7 81 1D 00) and retained with a runtime opcode/target check.
 See [handoff](new%20chat/HANDOFF.md) for implementation and verification details.
 
 ## Offline geometry previews

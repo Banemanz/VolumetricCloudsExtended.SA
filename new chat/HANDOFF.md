@@ -10,10 +10,18 @@ impostor rendering and is not a physically simulated volume.
 - gta-reversed: 85bce0be4bd3229eb5ef445d3a7ac2e611a994f4,
   `source/game_sa/Clouds.cpp`, `source/app/app_game.cpp`, `source/game_sa/Weather.cpp`.
 - Supplied SA IDB function index corroborates the native function entries
-  (image-base/section-relative names). Split IDB archive was identified but
-  not reconstructed or opened in IDA; no claim of instruction-level IDB validation.
+  (image-base/section-relative names). The split IDB archive consists of IDA
+  disassembly text; part 06 verifies the instruction at 0x53E1B4
+  (bytes E8 C7 81 1D 00), directly calling 0x716380, after MovingFogRender.
+  Part 14 confirms CClouds::Init at 0x7138D0 reads cloudhigh/cloudhighm into
+  the texture pointer at 0xC6BFC8, then initializes both native cloud and fog
+  tables. The stock distance getter at 0x713630 uses Scene's camera far plane
+  and a constant cap. These were verified against the actual dump without IDA.
 - Renderer call at 0x53E1B4 is checked for E8 rel32 to 0x716380 before patching.
   Plugin-SDK and reversed agree on the native function and texture structure.
+  The disassembly also confirms the native FX quality medium multiplier is
+  approximately 0.66, rather than the 1/3 in the current reversed source.
+  Our configurable density does not depend on this native global.
 - Native renderer constructs three orthogonal textured quads, weights alpha by
   the absolute view dot and uses a relatively small distance limit.
 - Previous mod used max of old/new bad-weather weights instead of interpolating,
