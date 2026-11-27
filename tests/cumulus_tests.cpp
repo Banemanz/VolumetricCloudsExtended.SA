@@ -14,23 +14,31 @@ int main() {
     CHECK(atlas.size()==std::size_t(cumulus::AtlasSize*cumulus::AtlasSize));
     const auto repeat=cumulus::bakeAtlas();
     CHECK(std::memcmp(atlas.data(),repeat.data(),atlas.size()*sizeof(cumulus::Pixel))==0);
-    for(int tile=0;tile<cumulus::Variants;++tile) {
+    for(int tile=0;tile<cumulus::Tiles;++tile) {
         int opaque=0,transparent=0,fringe=0;
         for(int y=0;y<cumulus::Tile;++y) for(int x=0;x<cumulus::Tile;++x) {
-            const auto p=atlas[(tile/2*cumulus::Tile+y)*cumulus::AtlasSize+tile%2*cumulus::Tile+x];
-            CHECK(p.r==p.g && p.g==p.b && p.r>=180);
+            const auto p=atlas[(tile/cumulus::AtlasColumns*cumulus::Tile+y)*cumulus::AtlasSize+tile%cumulus::AtlasColumns*cumulus::Tile+x];
+            CHECK(p.r==p.g && p.g==p.b && p.r>=208);
             if(x==0||y==0||x==cumulus::Tile-1||y==cumulus::Tile-1) CHECK(p.a==0);
             opaque+=p.a>=230; transparent+=p.a==0; fringe+=p.a>0&&p.a<230;
         }
-        CHECK(opaque>1800 && transparent>1000 && fringe>200);
+        CHECK(opaque>200 && transparent>1000 && fringe>1000);
         const auto min=cumulus::atlasUV(tile,0,0),max=cumulus::atlasUV(tile,1,1);
-        const float col=float(tile%2)*.5f,row=float(tile/2)*.5f;
-        CHECK(min.u>col && min.v>row && max.u<col+.5f && max.v<row+.5f);
+        const float col=float(tile%cumulus::AtlasColumns)/cumulus::AtlasColumns,row=float(tile/cumulus::AtlasColumns)/cumulus::AtlasColumns;
+        CHECK(min.u>col && min.v>row && max.u<col+.25f && max.v<row+.25f);
     }
     CHECK(std::memcmp(atlas.data(),atlas.data()+cumulus::Tile,cumulus::Tile*sizeof(cumulus::Pixel))==0); // padded first row
-    CHECK(cumulus::bakeAtlas(false).size()==atlas.size());
+    // All three projections of every archetype must differ, not just share UVs.
+    for(int tile=0;tile<cumulus::Tiles;++tile) for(int other=0;other<tile;++other) {
+        int different=0;
+        for(int y=0;y<cumulus::Tile;++y) for(int x=0;x<cumulus::Tile;++x) {
+            const auto at=[&](int t){return atlas[(t/cumulus::AtlasColumns*cumulus::Tile+y)*cumulus::AtlasSize+t%cumulus::AtlasColumns*cumulus::Tile+x].a;};
+            different+=at(tile)!=at(other);
+        }
+        CHECK(different>1000);
+    }
     Settings s;
-    CHECK(s.renderMode==1 && s.cumulusImpostors && s.cumulusNightLight==1.f);
+    CHECK(s.renderMode==1 && s.cumulusDetail==0 && s.cumulusImpostors && s.cumulusNightLight==1.f);
     std::istringstream in("RenderMode=2\nCumulusDetail=99\nCumulusDensity=-1\nCumulusContrast=nan\nCumulusRimStrength=9\nCumulusNightLight=9\nCumulusImpostors=0\n");
     load(in,s);
     CHECK(s.renderMode==2 && s.cumulusDetail==1 && s.cumulusDensity==0 && s.cumulusContrast==.65f && s.cumulusRimStrength==1 && !s.cumulusImpostors && s.cumulusNightLight==2);
@@ -42,8 +50,8 @@ int main() {
     const cumulus::Lighting front(s,p,{0,-.98f,.2f}),back(s,p,{0,.98f,.2f});
     const Card test{{0,100,400},{50,0,0},{0,0,32},1,.5f,0};
     const auto fb=front.basis(test,v),bb=back.basis(test,v);
-    CHECK(front.shade(fb,0,0).r>back.shade(bb,0,0).r);
-    CHECK(back.shade(bb,0,.8f).r>back.shade(bb,0,0).r+25);
+    CHECK(front.shade(fb,0,.8f).r>front.shade(fb,0,-.8f).r);
+    CHECK(back.shade(bb,0,.8f).r<=back.neutral);
     auto noRim=s; noRim.cumulusRimStrength=0;
     const cumulus::Lighting noRimLight(noRim,p,{0,.98f,.2f});
     CHECK(back.shade(bb,0,.8f).r>noRimLight.shade(noRimLight.basis(test,v),0,.8f).r);
@@ -58,78 +66,52 @@ int main() {
     CHECK(lunar.shade(lunar.basis(test,v),0,0).r>nightColour.r);
     CHECK(std::abs((1.f-cumulus::opticalPortion(.95f,.3f))*
                    (1.f-cumulus::opticalPortion(.95f,.7f))-.05f)<.0001f);
-    Card cards[MaxPuffs];
-    s.cumulusImpostors=false;
-    for(int count=1;count<=MaxPuffs;++count) {
-        s.puffsPerCloud=count;
-        for(const auto& c:f.clouds) {
-            CHECK(cumulus::cards(s,c,v,.8f,cards)==count);
-            for(int i=0;i<count;++i) {
-                const auto& card=cards[i];
-                CHECK(length(card.center-c.position)+cardBound(card)<=bound(c));
-                CHECK(std::abs(dot(unit(card.right),unit(card.up)))<.001f);
-                CHECK(card.alpha>=0.f && card.alpha<=.8f+.0001f);
-                CHECK(finite(card.center));
-            }
+    Card cards[MaxPuffs],rotated[MaxPuffs];
+    for(const auto& c:f.clouds) if(c.used) {
+        CHECK(cumulus::cards(s,c,v,.8f,cards)==3);
+        for(int i=0;i<3;++i) {
+            const auto& card=cards[i];
+            CHECK(length(card.center-c.position)+cardBound(card)<=bound(c));
+            CHECK(std::abs(dot(unit(card.right),unit(card.up)))<.001f);
+            CHECK(card.alpha>=0.f && card.alpha<=.8f+.0001f);
+            CHECK(finite(card.center));
         }
     }
-    // A camera facing straight up/down must still have a valid perpendicular basis.
-    View zenith=v;zenith.forward={0,0,1};zenith.up={0,-1,0};
-    cumulus::cards(s,f.clouds[0],zenith,.8f,cards);
-    CHECK(std::abs(dot(unit(cards[0].right),unit(cards[0].up)))<.001f);
-    CHECK(std::abs(dot(unit(cards[0].up),cumulus::eyeDirection(cards[0].center,zenith.pos)))<.001f);
-
-    View inside=v;
-    cumulus::cards(s,f.clouds[0],v,.8f,cards);
-    inside.pos=cards[0].center;
-    cumulus::cards(s,f.clouds[0],inside,.8f,cards);
-    CHECK(cards[0].alpha==0.f);
-    s.nearFadeDistance=0;
-    cumulus::cards(s,f.clouds[0],inside,.8f,cards);
-    CHECK(cards[0].alpha>0.f);
-    s.nearFadeDistance=25;
-
-    // The whole-cloud representation and every close layer are independent
-    // of yaw, pitch and roll at a fixed world eye. Exact geometric invariance.
-    s.cumulusImpostors=true;
-    s.puffsPerCloud=5;
+    // Exact geometry, UV and lighting invariance under yaw, roll, translation,
+    // and altitude changes, including a camera directly in the cloud center.
     Cloud fixed=f.clouds[0];
     fixed.size={300,180,85};fixed.position={0,0,500};
     View below=v;below.pos={0,0,0};below.forward={0,0,1};below.up={0,-1,0};
-    View rolled=below;rolled.right={0,1,0};rolled.up={1,0,0};rolled.forward={.6f,0,.8f};
-    Card rotated[MaxPuffs];
-    CHECK(cumulus::cards(s,fixed,below,.90f,cards)==1);
-    CHECK(cumulus::cards(s,fixed,rolled,.90f,rotated)==1);
-    CHECK(length(cards[0].right-rotated[0].right)==0 && length(cards[0].up-rotated[0].up)==0);
-    // The underside uses the X/Y radius (104m), not the 49m altitude radius.
-    CHECK(length(cards[0].right)>150.f && length(cards[0].up)>100.f);
-    View side=below;side.pos={0,-500,500};
-    CHECK(cumulus::cards(s,fixed,side,.90f,cards)==1);
-    CHECK(length(cards[0].up)<50.f);
-    // A near-horizontal antipodal ray and all zenith azimuths are finite.
-    for(int y=-8;y<=8;++y) for(int x=-8;x<=8;++x) {
-        Vec direction=unit(Vec{float(x)*.12f,float(y)*.12f,1.f});
-        Vec right,up;cumulus::facingAxes(direction,right,up);
-        CHECK(finite(right)&&finite(up));
-        CHECK(std::abs(length(right)-1.f)<1e-4f && std::abs(length(up)-1.f)<1e-4f);
-        CHECK(std::abs(dot(right,direction))<1e-4f && std::abs(dot(up,direction))<1e-4f);
-    }
-    Vec right,up;cumulus::facingAxes({0,-1,0},right,up);
-    CHECK(finite(right) && finite(up) && length(right)>.99f && length(up)>.99f);
-    View closeView=below;closeView.pos={0,0,450};
-    rolled.pos=closeView.pos;
-    for(int body=0;body<2;++body) {
-        s.cumulusImpostors=body!=0;
-        const int a=cumulus::cards(s,fixed,closeView,.9f,cards);
-        const int b=cumulus::cards(s,fixed,rolled,.9f,rotated);
-        CHECK(a==b && a>=1 && a<=MaxPuffs);
-        for(int i=0;i<a;++i) {
+    const float a=.85f;
+    CHECK(cumulus::cards(s,fixed,below,a,cards)==3);
+    CHECK(cards[0].alpha==0 && cards[1].alpha==0 && std::abs(cards[2].alpha-a)<1e-5f);
+    CHECK(std::abs(length(cards[2].right)-150.f)<1e-4f);
+    CHECK(std::abs(length(cards[2].up)-90.f)<1e-4f);
+    for(int x=-2;x<=2;++x) for(int y=-2;y<=2;++y) for(int z=-3;z<=3;++z) {
+        View moved=below;moved.pos=fixed.position+Vec{float(x)*300,float(y)*300,float(z)*200};
+        moved.forward={.6f,.8f,0};moved.up={0,0,1};moved.right={.8f,-.6f,0};
+        s.cumulusImpostors=(z%2)==0; s.puffsPerCloud=1+(z+3);
+        CHECK(cumulus::cards(s,fixed,moved,a,rotated)==3);
+        float trans=1.f;
+        for(int i=0;i<3;++i) {
             CHECK(length(cards[i].center-rotated[i].center)==0.f);
             CHECK(length(cards[i].right-rotated[i].right)==0.f);
             CHECK(length(cards[i].up-rotated[i].up)==0.f);
+            CHECK(cards[i].textureKey==rotated[i].textureKey);
+            CHECK(std::isfinite(rotated[i].alpha));
+            trans*=1.f-rotated[i].alpha;
+            cumulus::LitVertex va[cumulus::MaxVertices],vb[cumulus::MaxVertices];
+            cumulus::mesh(cards[i],below,back,3,va);
+            cumulus::mesh(rotated[i],moved,back,3,vb);
+            for(int n=0;n<9;++n) {
+                CHECK(length(va[n].pos-vb[n].pos)==0.f);
+                CHECK(va[n].uv.u==vb[n].uv.u && va[n].uv.v==vb[n].uv.v);
+                CHECK(va[n].colour.r==vb[n].colour.r && va[n].colour.g==vb[n].colour.g && va[n].colour.b==vb[n].colour.b);
+            }
         }
+        CHECK(std::abs(trans-(1.f-a))<1e-5f);
+        if(z==0 && (x||y)) CHECK(rotated[2].alpha==0);
     }
-    s.cumulusImpostors=true;
 
     // Index count, UV bounds and finite lighting across complete geometry at both qualities.
     volatile float sink=0.f;
@@ -139,6 +121,8 @@ int main() {
         s.cumulusDetail=detail;
         s.puffsPerCloud=5;
         const int n=cumulus::grid(s);
+        CHECK(n==2+detail);
+        CHECK(3*(n-1)*(n-1)*2==(detail?24:6));
         for(const auto& c:f.clouds) {
             const int count=cumulus::cards(s,c,v,1.f,cards);
             for(int i=0;i<count;++i) {
@@ -161,13 +145,14 @@ int main() {
     }
     const double meshMs=std::chrono::duration<double,std::milli>(Clock::now()-start).count();
     CHECK(sink>0);
-    // Modern opacity maps native low alpha to solid masses only in opt-in mode.
+    // Modern opacity uses a bounded, more translucent remapping only in opt-in mode.
     Cloud c=f.clouds[0]; c.position={0,500,400};c.fade=1.f;c.alpha=.25f;
     Settings old=s;old.renderMode=1;
-    CHECK(cloudAlpha(s,c,v,r)>cloudAlpha(old,c,v,r)*2);
+    CHECK(cloudAlpha(s,c,v,r)>cloudAlpha(old,c,v,r));
+    CHECK(cloudAlpha(s,c,v,r)<.80f);
     c.fade=0;CHECK(cloudAlpha(s,c,v,r)==0);
-    std::cout << "PASS: coherent RGBA atlas, padded UVs, world-locked card basis, solar/lunar response, "
-              << "silver lining, night, projected geometry, quality, index/vertex bounds, optical LOD.\n"
+    std::cout << "PASS: shared-density projection atlas, padded UVs, invariant world geometry/UV/light, solar/lunar response, "
+              << "restrained edge light, night, triangle budget, index/vertex bounds, optical weights.\n"
               << "CPU diagnostics (not GPU or in-game): bake " << bakeMs << " ms; "
               << meshCount << " card meshes including checks " << meshMs << " ms\n";
 }

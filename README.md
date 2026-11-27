@@ -30,11 +30,12 @@ pipeline may still need compatibility testing.
   varied sizes/rolls and native lighting (optional custom shading). Increasing the card count does not
   simply multiply opacity.
 - Crossed cards remain selectable for the native appearance.
-- Experimental shader-free cumulus mode (opt-in): rounded, opaque cloud
-  groups with an original integrated-density RGBA atlas, CPU-calculated sunlight,
-  soft self-shading, restrained night light and a backlit silver lining. Uses the same world-space
-  field and a single fixed-function texture/blend pass. No external texture
-  or shader dependency.
+- Experimental shader-free cumulus mode (opt-in): airy, procedurally textured
+  clouds on three **fixed world-space planes** with separate projections of
+  a common density field, gentle sunlight and restrained night illumination.
+  Geometry, UVs and the light gradient do not rotate as the camera moves.
+  The economy setting draws at most six triangles per cloud. No external
+  texture or shader dependency.
 - Frustum rejection, actual camera far-plane limit, smooth range and near fades,
   back-to-front view-depth ordering and bounded RenderWare batches.
 - Additional textures are borrowed directly from the loaded particle TXD. Missing
@@ -75,12 +76,12 @@ text retains the default. Inline comments are supported.
 | CloudTextureNames | cloud2,cloud3,cloud4 | Comma-separated names; up to 15 |
 | RenderMode | 1 | 0 = crossed cards; 1 = clustered camera-facing cards; 2 = experimental shader-free cumulus |
 | CumulusDensity | 0.95 | Mode 2: optical density multiplier (0–1) |
-| CumulusImpostors | 1 | Mode 2: coherent whole-cloud impostors outside; 0 = all layered puffs |
+| CumulusImpostors | 1 | Legacy key, accepted but ignored; mode 2 always uses fixed geometry |
 | CumulusNightLight | 1 | Mode 2: night illumination multiplier (0–2); smooth transition to daylight |
 | CumulusContrast | 0.65 | Mode 2: directional and underside lighting contrast (0–1) |
-| CumulusRimStrength | 0.85 | Mode 2: forward-scattering rim strength (0–1) |
-| CumulusDetail | 1 | Mode 2: 0 = economy 3×3 lattice (8 triangles), 1 = 5×5 lattice (32 triangles) |
-| PuffsPerCloud | 5 | Number of cards per group (1–8) in clustered/cumulus modes |
+| CumulusRimStrength | 0.85 | Mode 2: subtle sunward edge softening (0–1), never above native daytime luminance |
+| CumulusDetail | 0 | Mode 2: 0 = 2×2 grid (up to 6 triangles/cloud); 1 = 3×3 (up to 24 triangles/cloud) |
+| PuffsPerCloud | 5 | Number of cards per group (1–8) in clustered mode (1) only |
 | SizeScale | 1 | Group dimensions multiplier |
 | Opacity | 1 | Group opacity multiplier (0–2) |
 | NearFadeDistance | 25 | Fade near the camera; 0 disables |
@@ -110,87 +111,91 @@ Add or change these values in your existing INI, then restart:
 
 ```ini
 RenderMode=2
-CumulusDetail=1
+CumulusDetail=0
 CumulusDensity=0.95
-CumulusImpostors=1
 CumulusNightLight=1
 CumulusContrast=0.65
 CumulusRimStrength=0.85
-PuffsPerCloud=5
 Opacity=1
 ColorBrightnessBoost=64
 ```
 
-For low-end hardware, try `CumulusDetail=0` and `PuffsPerCloud=3`;
-reduce `TargetProcClouds` only if transparent fill-rate remains the bottleneck.
 The default renderer remains mode 1, so existing installations do not switch.
-Mode 2 uses its own texture and lighting; native/additional texture selection
-and the legacy custom tint/shade/haze keys do not affect it. Native sky luminance,
-global opacity, wind, altitude, weather, visibility and clipping still apply.
+Mode 2 deliberately favors a period-appropriate, semi-transparent cloud over
+a near-opaque modern impostor. Mode 2 uses its own texture and lighting;
+native/additional texture choice and the custom tint/shade/haze keys do not
+affect it. Native sky luminance, global opacity, wind, altitude, weather,
+visibility and clipping still apply. `PuffsPerCloud` applies to mode 1 only.
+The obsolete `CumulusImpostors` key is accepted but ignored, so an older INI
+cannot accidentally restore rotating billboards.
 
-**How it works (second iteration):** four original 256×256 cloud variants are
-generated into a 512×512 RGBA atlas the first time it is needed (~1 MiB of raw
-pixels). The CPU bake integrates noisy optical thickness across overlapping
-sub-lobes before evaluating alpha (Beer–Lambert) and softly blended surface
-relief. It does not stack translucent sphere images to create the silhouette.
+**World-fixed geometry:** inspired by SA's original three orthogonal planes
+(see engine reference below), each group has two vertical crossed planes and
+one horizontal plane. Their orientation is set by a deterministic cloud yaw
+and their sizes are the actual world-axis dimensions of the cloud. They never
+turn to face the player, including when moving vertically or through the cloud.
+The cloud's orientation, UVs and vertex lighting depend on its geometry and
+the environment only. The viewing direction changes *opacity* via squared,
+normalized direction cosines. Splitting optical depth across the planes
+smooths transitions at oblique angles; it is exact for equal full-mask samples
+but a visual approximation for real silhouettes. Edge-on planes can be culled.
+Near the center of the volume, the existing group proximity fade reduces
+cockpit intersections. There is no billboard-distance LOD or view-basis flip.
 
-Outside the cloud, the complete body is one depth-sorted impostor (32 triangles
-at detail 1, eight at detail 0). The body dimensions are projected from the
-world ellipsoid into the viewing plane, rather than using its vertical height
-as its apparent height even when looking straight up. As the camera enters a
-cloud, the renderer transitions to depth-separated world-space puffs using
-split optical depth, with individual near-camera fades. `PuffsPerCloud` limits
-this close-range representation. `CumulusImpostors=0` uses layered puffs
-at all distances and the previous lobe texture generation, with the corrected
-orientation and updated lighting.
+**Textures:** the one-time CPU bake projects four deterministic, irregular
+3D lobe fields into three corresponding 128×128 textures each (XZ, YZ, XY).
+The twelve tiles fit a single 512×512 RGBA atlas (~1 MiB raw, as before).
+Integrated optical thickness, gentle erosion, organic density variation and
+a neutral low-contrast grayscale texture create soft fringes and avoid
+hard sphere boundaries. The coherent horizontal projection is particularly
+important when looking up from the ground. Cloud opacity is less aggressive
+than the previous nearly opaque body-plus-puff mode.
 
-The cloud facing basis depends on the world eye-to-cloud vector, not screen
-orientation. Thus rotating or rolling the camera at a fixed location does not
-rotate the cloud texture/geometry in world space. Translation around a cloud
-can still reveal that it is a projected impostor; it is not a true 3D volume.
-The transported basis has a singularity at the antipodal horizontal direction;
-there is a world-axis fallback for this exceptional orientation.
+**Lighting:** the game's current sun vector and native neutral daytime
+luminance drive world-aligned gradients; texture RGB provides restrained
+density relief rather than exaggerated color or a white outline. Sunward
+edge softening never exceeds native daytime luminance. Night uses a small
+ambient floor and sky luminance, and a weak lunar directional gradient gated
+by an approximate midnight window and weather. `CumulusNightLight` scales
+night illumination. No brightness-equation changes to modes 0 or 1.
 
-CPU vertex lighting uses the current game sun vector, original neutral
-daytime sky luminance, diffuse light and a view-dependent bright rim.
-The underside is softly shaded. At night it transitions to ambient sky
-luminance and a small diffuse floor rather than the stock +64 brightness
-addition. A weak lunar directional term follows the native lunar sprite's
-world offset (0,-100,15), with a smooth approximate midnight visibility window
-and weather attenuation. `CumulusNightLight` scales night illumination.
-There is no change to the native brightness equation in modes 0 or 1.
+**Cost:** at detail 0 each plane uses four vertices and two triangles (up to
+12 vertices and six triangles per cloud); detail 1 uses nine vertices and
+eight triangles per plane (up to 27 vertices and 24 triangles per cloud).
+For 160 clouds this is at most 960/3840 triangles before culling, respectively.
+One fixed-function texture/blend pass, one shared atlas, same bounded
+RenderWare batches, no shaders, runtime raymarches, scene copies, extra
+targets or post-processing. Allocation failure falls back to mode 0 and is
+logged; the texture is destroyed before RenderWare shutdown. Fresh INIs
+default to detail 0. An existing INI with detail 1 stays at detail 1.
+If fill-rate is the bottleneck, reduce `TargetProcClouds`: all transparent
+renderers still incur overdraw and three intersecting planes may cover more
+pixels than one old impostor from oblique angles. This is not a measured
+performance guarantee.
 
-The tessellated billboard interpolates these colours using ordinary RW
-Gouraud shading and alpha blending. There is no shader compilation,
-runtime raymarching, scene-copy, extra render target or post-process, and
-the single atlas stays bound across all depth-sorted indexed batches.
-Allocation failure falls back to mode 1 and is logged; the owned texture
-is destroyed before RenderWare shutdown.
-
-This approach is inspired by early flight simulation impostors, in particular
-[Harris and Lastra (2001)](https://markmark.net/clouds/) and the older
-[SimGear cloud field](https://github.com/FlightGear/simgear/blob/next/simgear/scene/sky/cloudfield.cxx)
-implementation (world-space structures, impostors and distance-based detail).
-The implementation and atlas are original; no external cloud assets or source
-code are incorporated. It approximates light scattering, not physically accurate
-volume rendering. Individual cards can still become apparent at very close
-distances. Transparent overlap/fill-rate, actual timecycle palettes and
-interactions with graphics mods need in-game profiling.
+The implementation and textures are original. It's still an approximation,
+not a raymarched volume. At very close range or some oblique angles flat
+intersections can become apparent; retaining this limitation is preferable
+to introducing expensive rendering passes for the target hardware.
 
 | Looking toward the sun | Looking away |
 |---|---|
-| ![Backlit cumulus](docs/previews/cumulus_back.jpg) | ![Frontlit cumulus](docs/previews/cumulus_front.jpg) |
+| ![Backlit clouds](docs/previews/cumulus_back.jpg) | ![Frontlit clouds](docs/previews/cumulus_front.jpg) |
 | ![Above clouds](docs/previews/cumulus_flight.jpg) | ![From the ground](docs/previews/cumulus_ground.jpg) |
 | ![Economy geometry](docs/previews/cumulus_low.jpg) | ![Night](docs/previews/cumulus_night.jpg) |
-| ![Previous overhead day](docs/previews/cumulus_zenith_previous.jpg) | ![Reworked overhead day](docs/previews/cumulus_zenith.jpg) |
-| ![Previous overhead night](docs/previews/cumulus_night_previous.jpg) | ![Reworked overhead night](docs/previews/cumulus_night.jpg) |
+| ![Looking upward](docs/previews/cumulus_zenith.jpg) | ![Within the cloud layer](docs/previews/cumulus_inside.jpg) |
 
-These are offline renders of the actual C++ cumulus atlas, mesh, UVs and vertex
+| Identical world field, camera Z=30 | Camera Z=210 | Camera Z=390 |
+|---|---|---|
+| ![Low altitude](docs/previews/cumulus_height_low.jpg) | ![Middle altitude](docs/previews/cumulus_height_mid.jpg) | ![High altitude](docs/previews/cumulus_height_high.jpg) |
+
+These are offline renders of the actual C++ atlas, mesh, UVs and vertex
 colours. The sky and sun glare are illustrative backgrounds, not GTA assets,
 and the preview omits near-plane-crossing cards rather than clipping them.
-The previous overhead comparison uses the previous release source at
-`94fbeaa15b9d0adf76ab18a43fc9e9d9592a3f3a` with the same diagnostic field,
-camera and palette.
+The altitude sequence retains the same field and view axes; changes represent
+perspective and opacity weights, not rotation of the cloud geometry. The
+historical previews with a `_previous` or `_layers` suffix remain as
+references for the old implementation, not current output.
 
 ## Build
 

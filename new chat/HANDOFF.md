@@ -185,3 +185,48 @@ with the same camera/weather. Protect modes 0 and 1 and keep PR #1.
 - Re-test actual game by rotating camera while stationary, then walking and
   flying underneath/through clouds, checking sunset, night, moon direction,
   circling clouds, and performance on weak GPUs. No actual game run in Linux.
+
+## Cumulus follow-up: altitude rotation and SA art direction
+The user's 07:04 screenshot (street level, airbreak) revealed that even the
+world-eye-facing impostor from the prior iteration rotated as they climbed.
+The dense cream silhouettes and silver fringe also felt out of place in SA.
+Target is still old PCs; keep PR #1, modes 0/1, native lighting, the pinned
+Plugin-SDK and the original call site unaffected.
+
+- Mode 2 no longer has any facing basis, whole-card impostor, or near-layer
+  LOD. It uses three world-fixed orthogonal planes (XZ, YZ, XY in a cloud-local
+  stable yaw frame) based on the cloud's actual dimensions. Position,
+  orientation, UVs and vertex colours are invariant to camera yaw, roll,
+  translation and elevation. Wind still shifts centers in world space.
+  The squared normalized eye direction cosines only split alpha via
+  1-(1-alpha)^weight. At the exact center, use equal weights; common near fade
+  hides the center if enabled. This is optical-depth normalization for full
+  masks, not exact volume compositing; intersections remain possible.
+- Twelve 128x128 grayscale-alpha projections (four deterministic common
+  3D lobe fields, each projected onto the three planes) share the existing
+  512x512 RGBA atlas. Softer density taper and procedural erosion, more
+  neutral texture, lower mode-2 alpha remap (.48-.80 times CumulusDensity).
+  Keep stock daytime grey calculation (+64 by default), with very restrained
+  world-fixed directional and height gradient and no additive bright rim.
+  Night stays subdued; no camera-aligned lighting or bloom.
+- Detail 0 now uses 2x2 grids, up to 12 vertices / 6 triangles per group,
+  and is the default for fresh configurations. Detail 1 uses 3x3 grids,
+  up to 27 vertices / 24 triangles per group; existing config choices respected.
+  Same RGBA atlas size, one fixed-function texture/blend path, bounded
+  batches, no shaders or extra passes/targets. Oblique viewpoints can
+  require handling up to three planes versus the prior one: triangle cost
+  is lower but transparent fill-rate must still be tested on actual hardware.
+  CumulusImpostors is legacy/no-op; PuffsPerCloud applies only to mode 1.
+  Atlas failure falls back to mode 0, not rotating mode 1.
+- Linux regression suite checks projections, UV isolation, full-mask alpha
+  weights, repeated deterministic atlas, stable world vertices/UVs/light
+  across 175 observer positions (including center, below, above, side), legacy
+  INI compatibility, portable mesh capacity, geometry cost and night response.
+  Software renders use actual C++ atlas and mesh, synthetic sky only. Height
+  sequence at Z=30/210/390 uses the same initialized field and view axes.
+  Historical *_previous and *_layers previews are prior versions.
+- Test in SA: ascend/descend at fixed X/Y and rotate/roll camera, compare
+  sunrise/noon/night, fly around and through the layer, profile at detail 0
+  on a weak card before changing count or draw distance. Some crossed-plane
+  silhouettes and overdraw remain inherent trade-offs. No actual game capture
+  or measured GPU FPS from the Linux environment.

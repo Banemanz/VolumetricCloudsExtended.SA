@@ -49,9 +49,9 @@ struct Settings {
     std::vector<std::string> textureNames{"cloud2", "cloud3", "cloud4"};
     int renderMode = 1, puffsPerCloud = 5; // 0: crossed, 1: clustered, 2: cumulus
     float cumulusDensity = .95f, cumulusContrast = .65f, cumulusRimStrength = .85f;
-    bool cumulusImpostors = true;
+    bool cumulusImpostors = true; // legacy INI compatibility; mode 2 is always world-fixed
     float cumulusNightLight = 1.f;
-    int cumulusDetail = 1; // 0: 3x3 vertex lattice; 1: 5x5
+    int cumulusDetail = 0; // 0: 2x2 vertex lattice; 1: 3x3
     float sizeScale = 1.f, opacity = 1.f, nearFadeDistance = 25.f;
     float bottomShade = 1.f, hazeStrength = 0.f;
     bool useGameFog = false;
@@ -319,7 +319,7 @@ inline float cloudAlpha(const Settings& s,const Cloud& c,const View& v,const Ran
     const float nearFade=s.nearFadeDistance>0.f ? smooth(dist/(s.nearFadeDistance+bound(c)*.30f)) : 1.f;
     const float randomDensity=sat((c.alpha*255.f-36.f)/92.f);
     const float density=s.renderMode==2
-        ? s.cumulusDensity*(s.cumulusImpostors?mix(.90f,1.05f,randomDensity):mix(.72f,1.f,randomDensity))
+        ? s.cumulusDensity*mix(.48f,.80f,randomDensity)
         : c.alpha;
     return sat(density*s.opacity*smooth(c.fade)*distanceAlpha(r,edge)*nearFade);
 }

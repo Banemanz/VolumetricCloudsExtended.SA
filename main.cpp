@@ -78,7 +78,7 @@ bool EnsureCumulusAtlas() {
     RwImage* img=RwImageCreate(AtlasSize,AtlasSize,32);
     if (img) {
         if (RwImageAllocatePixels(img) && RwImageGetPixels(img) && RwImageGetStride(img)>=AtlasSize*4) {
-            const auto pixels=bakeAtlas(settings.cumulusImpostors);
+            const auto pixels=bakeAtlas();
             for (int y=0;y<AtlasSize;++y)
                 std::memcpy(RwImageGetPixels(img)+y*RwImageGetStride(img),
                             pixels.data()+y*AtlasSize,AtlasSize*sizeof(Pixel));
@@ -95,7 +95,7 @@ bool EnsureCumulusAtlas() {
         RwImageDestroy(img);
     }
     Log(cumulusRaster?"Cumulus: shader-free procedural atlas generated."
-                      :"Cumulus: atlas creation failed; using clustered native textures.");
+                      :"Cumulus: atlas creation failed; using crossed native textures.");
     return cumulusRaster!=nullptr;
 }
 
@@ -294,7 +294,7 @@ void __cdecl RenderClouds() {
     // Allocation/format failure falls back without rewriting the user's INI.
     const int requestedMode=settings.renderMode;
     struct RestoreMode { int mode; ~RestoreMode(){settings.renderMode=mode;} } restore{requestedMode};
-    if (!modern && requestedMode==2) settings.renderMode=1;
+    if (!modern && requestedMode==2) settings.renderMode=0;
     const Textures textures=modern?Textures{}:GetTextures();
     if (!modern && !textures.count) return;
 
