@@ -30,11 +30,17 @@ pipeline may still need compatibility testing.
   varied sizes/rolls and native lighting (optional custom shading). Increasing the card count does not
   simply multiply opacity.
 - Crossed cards remain selectable for the native appearance.
+- Experimental shader-free cumulus mode (opt-in): rounded, opaque cloud
+  groups with an original procedural RGBA atlas, CPU-calculated sunlight,
+  soft self-shading and a backlit silver lining. Uses the same world-space
+  field and a single fixed-function texture/blend pass. No external texture
+  or shader dependency.
 - Frustum rejection, actual camera far-plane limit, smooth range and near fades,
   back-to-front view-depth ordering and bounded RenderWare batches.
 - Additional textures are borrowed directly from the loaded particle TXD. Missing
   names are ignored; the native cloudhigh texture is the fallback. No global game
-  RNG consumption, native cloud-table reset or persistent graphics resources.
+  RNG consumption or native cloud-table reset. Only optional cumulus mode owns
+  a small ordinary RW texture raster.
 
 ## INI controls
 
@@ -67,8 +73,12 @@ text retains the default. Inline comments are supported.
 | UseAdditionalTextures | 1 | Look for listed textures in particle.txd |
 | IncludeOriginalTextureInRandom | 1 | Include native cloudhigh among variants |
 | CloudTextureNames | cloud2,cloud3,cloud4 | Comma-separated names; up to 15 |
-| RenderMode | 1 | 0 = crossed cards; 1 = clustered camera-facing cards |
-| PuffsPerCloud | 5 | Number of cards per group (1–8) in clustered mode |
+| RenderMode | 1 | 0 = crossed cards; 1 = clustered camera-facing cards; 2 = experimental shader-free cumulus |
+| CumulusDensity | 0.95 | Mode 2: optical density multiplier (0–1) |
+| CumulusContrast | 0.65 | Mode 2: directional and underside lighting contrast (0–1) |
+| CumulusRimStrength | 0.85 | Mode 2: forward-scattering rim strength (0–1) |
+| CumulusDetail | 1 | Mode 2: 0 = economy 3×3 lattice (8 triangles), 1 = 5×5 lattice (32 triangles) |
+| PuffsPerCloud | 5 | Number of cards per group (1–8) in clustered/cumulus modes |
 | SizeScale | 1 | Group dimensions multiplier |
 | Opacity | 1 | Group opacity multiplier (0–2) |
 | NearFadeDistance | 25 | Fade near the camera; 0 disables |
@@ -92,6 +102,61 @@ For the stock appearance with the procedural field, use `RenderMode=0`,
 configuration try `PuffsPerCloud=3`. The new renderer deliberately does not
 extend the world/camera clip plane or change the game's native height-switch global.
 
+## Experimental cumulus mode (no shaders)
+
+Add or change these values in your existing INI, then restart:
+
+```ini
+RenderMode=2
+CumulusDetail=1
+CumulusDensity=0.95
+CumulusContrast=0.65
+CumulusRimStrength=0.85
+PuffsPerCloud=5
+Opacity=1
+ColorBrightnessBoost=64
+```
+
+For low-end hardware, try `CumulusDetail=0` and `PuffsPerCloud=3`;
+reduce `TargetProcClouds` only if transparent fill-rate remains the bottleneck.
+The default renderer remains mode 1, so existing installations do not switch.
+Mode 2 uses its own texture and lighting; native/additional texture selection
+and the legacy custom tint/shade/haze keys do not affect it. Native sky luminance,
+global opacity, wind, altitude, weather, visibility and clipping still apply.
+
+**How it works:** four original 128×128 puff variants are generated into a
+256×256 RGBA atlas the first time it is needed (~256 KiB of raw pixels).
+Each variant combines overlapping rounded sub-lobes with optical thickness,
+soft edge erosion and subtle micro-relief. A handful of stable, world-space
+puffs forms each cloud. CPU vertex lighting uses the current game sun vector,
+native neutral sky luminance, a soft diffuse floor and a view-dependent
+bright rim. A tessellated billboard interpolates those values using RW's
+Gouraud shading and ordinary alpha blending. There is no shader compilation,
+raymarching, scene-copy, extra render target or post-process. The single atlas
+allows consecutive depth-sorted cards to be submitted in indexed batches.
+Allocation failure falls back to mode 1 and is logged; the owned texture is
+destroyed before RenderWare shutdown.
+
+This approach is inspired by early flight simulation impostors, in particular
+[Harris and Lastra (2001)](https://markmark.net/clouds/) and the older
+[SimGear cloud field](https://github.com/FlightGear/simgear/blob/next/simgear/scene/sky/cloudfield.cxx)
+implementation (world-space structures, impostors and distance-based detail).
+The implementation and atlas are original; no external cloud assets or source
+code are incorporated. It approximates light scattering, not physically accurate
+volume rendering. Individual cards can still become apparent at very close
+distances. Transparent overlap/fill-rate, actual timecycle palettes and
+interactions with graphics mods need in-game profiling.
+
+| Looking toward the sun | Looking away |
+|---|---|
+| ![Backlit cumulus](docs/previews/cumulus_back.jpg) | ![Frontlit cumulus](docs/previews/cumulus_front.jpg) |
+| ![Above clouds](docs/previews/cumulus_flight.jpg) | ![From the ground](docs/previews/cumulus_ground.jpg) |
+| ![Economy geometry](docs/previews/cumulus_low.jpg) | ![Night](docs/previews/cumulus_night.jpg) |
+
+These are offline renders of the actual C++ cumulus atlas, mesh, UVs and vertex
+colours. The sky and sun glare are illustrative backgrounds, not GTA assets,
+and the preview omits near-plane-crossing cards rather than clipping them.
+
 ## Build
 
 Exact Plugin-SDK revision: [624a6a49265fd7a6fc63bda1611013ceabeacb8a](https://github.com/DK22Pac/plugin-sdk/commit/624a6a49265fd7a6fc63bda1611013ceabeacb8a)
@@ -114,6 +179,8 @@ Portable regression tests on Linux (no game required):
 ```sh
 g++ -std=c++17 -O2 -Wall -Wextra -Werror tests/cloud_tests.cpp -o cloud_tests
 ./cloud_tests
+g++ -std=c++17 -O2 -Wall -Wextra -Werror tests/cumulus_tests.cpp -o cumulus_tests
+./cumulus_tests
 ```
 
 ## Engine reference
@@ -149,4 +216,11 @@ To regenerate the previews (requires Python, NumPy and Pillow):
 ```sh
 g++ -std=c++17 -O2 tests/dump_preview.cpp -o dump_preview
 python tests/preview.py ./dump_preview docs/previews
+```
+
+To regenerate the cumulus previews:
+
+```sh
+g++ -std=c++17 -O2 tests/cumulus_preview.cpp -o cumulus_preview
+python tests/cumulus_preview.py ./cumulus_preview docs/previews
 ```

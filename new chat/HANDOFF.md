@@ -84,3 +84,49 @@ uses the shared C++ lighting instead of independently approximating it; the
 two sunrise scenes illustrate the lighting difference using identical geometry
 and synthetic texture/palette. Test the new ASI in the same place, time/weather,
 and particle.txd to validate visually.
+
+## Optional shader-free cumulus mode
+User requested a cheap approximation of modern dense cumulus clouds that
+would run on old hardware. Keep the existing PR #1 and native defaults;
+RenderMode=2 opts into the new mode rather than installing a second competing ASI.
+
+Reference: Mark Harris/Anselmo Lastra, Real-Time Cloud Rendering (2001) and
+SkyWorks (https://markmark.net/clouds/), plus SimGear's cloudfield.cxx,
+cloudfield.hxx and cloud.cxx (FlightGear/simgear, branch next). Reviewed
+world-space cloud fields, wind, impostor/LOD organization and CPU-side
+particle illumination concepts. All new code and procedural pixels are original;
+no GPL source or assets reused.
+
+- Cumulus.hpp: 4 padded, deterministic 128x128 grayscale RGBA cloud textures
+  from 22 sub-lobes/variant, soft noisy optical thickness, straight-alpha
+  composition. One 256x256 atlas (256 KiB RGBA). 3D puff centers arranged as
+  broad bodies and raised towers, camera-facing world-up basis for roll.
+- Lighting uses CTimeCycle::m_VectorToSun[m_CurrentStoredValue] from the
+  pinned SDK. It uses original neutral sky brightness, diffuse contrast
+  and broad backscatter rim approximated on 3x3 or 5x5 CPU-lit lattices.
+  It has no dependency on the old custom tint settings or particle TXD.
+- Mode 2 uses a different optical-density mapping, with the same native
+  field, near/distance/weather fades and solid world geometry occlusion.
+  Modes 0 and 1 are unchanged (including old INI defaults).
+- main.cpp lazily creates one ordinary RW texture raster, uploads from a
+  32-bit RwImage, uses one indexed batch sampler, and releases before RW
+  shutdown. Creation failure logs and falls back to clustered mode for the
+  remainder of the RW lifetime. No programmable shaders or offscreen targets.
+  A 5x5 mesh is 25 vertices and 96 indices/card; 3x3 is 9 and 24.
+  Vertex/index batches capped at 480/1920 respectively.
+- Tests: cumulus_tests.cpp validates deterministic atlas and padding, coverage,
+  UV inset, native-mode compatibility, INI limits, physically intuitive
+  sun/backlight ordering, night behavior, bounds and index safety, full
+  512-cloud geometry at both details and mode-specific opacity.
+  CMake runs both portable regression suites on Linux/Windows.
+- Offline software renderer: tests/cumulus_preview.cpp emits the real mesh,
+  atlas and lit vertices; cumulus_preview.py rasterizes perspective-correct
+  triangles and composites with straight alpha against a synthetic sky.
+  It renders front/back light, above cloud, ground, economy mesh and night.
+  The software sky glare is NOT a new game effect.
+- Actual SA runtime appearance, RW raster creation, alt-tab/resource lifetime,
+  compatibility with SkyGfx, sorting near aircraft and GPU fill-rate remain to
+  be verified. Billboards are not full volumes; distant cloud detail may alias
+  and close intersections may expose planes. Do not claim measured game FPS.
+  For a potato setup use CumulusDetail=0, PuffsPerCloud=3; tweak density only if
+  fill-rate remains a problem. Preserve the vanilla-like default mode.
