@@ -1,7 +1,7 @@
 #pragma once
 // Original fixed-function cloud sheet. CPU-generated periodic density and lighting;
 // the GPU sees a single ordinary RGBA texture on a shallow curved world-XY mesh.
-#include "CloudCore.hpp"
+#include "CloudWeather.hpp"
 #include <cassert>
 
 namespace vc::canopy {
@@ -84,11 +84,41 @@ inline Light lighting(const Settings& s,const Palette& p,Vec sun,float weather,f
     return {threshold(s,weather),day,storm,s.cumulusContrast,
         s.cumulusRimStrength,s.cumulusDensity*s.opacity*smooth(float(target(s,weather))/30.f),sun,bright,ambient};
 }
-inline bool different(const Light& a,const Light& b) {
-    return std::abs(a.density-b.density)>.025f || std::abs(a.threshold-b.threshold)>.009f || length(a.sun-b.sun)>.08f ||
-        std::abs(a.storm-b.storm)>.04f || std::abs(a.day-b.day)>.035f ||
-        std::abs(a.bright.r-b.bright.r)>4.f || std::abs(a.bright.g-b.bright.g)>4.f ||
-        std::abs(a.bright.b-b.bright.b)>4.f;
+// The live palette is vertex modulation, never queued behind texture baking.
+inline Light liveLighting(const Settings& s,const Palette& p,Vec sun,const weather::State& w) {
+    auto l=lighting(s,p,sun,w.coverage,w.storm,std::max(w.fog,w.dust));
+    const float sky=(p.skyTop.r+p.skyTop.g+p.skyTop.b+p.skyBottom.r+p.skyBottom.g+p.skyBottom.b)/6.f;
+    // Storm lighting leans toward actual timecycle luminance, not a blue/orange
+    // tint from the sky. The native sky flash is white for the same frame.
+    const float stormGrey=clamp(sky*.60f+60.f,65.f,180.f);
+    l.bright=mixRGB(l.bright,{stormGrey,stormGrey,stormGrey},w.storm*l.day*.64f);
+    l.ambient=mixRGB(l.ambient,scaleRGB(l.bright,.68f),w.storm*l.day);
+    if(w.flash) {
+        l.bright={255,255,255};l.ambient={210,210,210};
+    }
+    return l;
+}
+// Texture relief is normalized. Weather, dawn/night and lightning are
+// applied at draw time, so no stale colour can survive a weather switch.
+inline Light relativeLight(const Light& live) {
+    Light l=live;
+    l.threshold=0;l.density=1.f;l.day=1.f;l.storm=0.f;
+    l.bright={255,255,255};l.ambient={167,167,167};
+    // At night use a stable overhead scattering direction rather than a
+    // sun shining through the underside of the cloud from below the world.
+    const float solar=smooth((live.sun.z+.18f)/.38f);
+    l.sun=unit(Vec{live.sun.x*solar,live.sun.y*solar,mix(.9f,std::max(.16f,live.sun.z),solar)});
+    return l;
+}
+inline float directionalDifference(const Light& a,const Light& b) {
+    return length(a.sun-b.sun);
+}
+struct LayerWeights {float base,extra;};
+inline LayerWeights layerWeights(const Settings& s,const weather::State& w) {
+    // Both endpoint masks incorporate configured density/opacity. Clear and
+    // storm can be reversed by BadWeatherDensityMultiplier < 1.
+    const float vis=weather::visibility(w)*weather::clearOpacity(w);
+    return {vis,vis*(s.badWeatherDensityMultiplier>=1.f?w.coverage:1.f-w.coverage)};
 }
 inline std::uint8_t byte(float x) { return std::uint8_t(clamp(x,0.f,255.f)+.5f); }
 
@@ -97,7 +127,7 @@ class Map {
     std::vector<float> field;
     float get(int x,int y) const { return field[std::size_t(y&(n-1))*n+(x&(n-1))]; }
 public:
-    std::vector<Pixel> pixels;
+    std::vector<Pixel> pixels,extraPixels;
     int size() const { return n; }
     void build(int size,std::uint32_t seed) {
         assert(size==EconomySize || size==DetailSize);
@@ -108,6 +138,7 @@ public:
         for(int y=0;y<n;++y) for(int x=0;x<n;++x)
             field[std::size_t(y)*n+x]=shape((x+.5f)/n,(y+.5f)/n,seed);
     }
+    // Reference single-map bake for endpoint tests and historical previews.
     void shade(const Light& l,int first,int last) {
         const float horiz=std::sqrt(horizontalSq(l.sun));
         const Vec dir=horiz>.001f?l.sun/horiz:Vec{0,1,0};
@@ -130,26 +161,35 @@ public:
             pixels[std::size_t(y)*n+x]={byte(c.r),byte(c.g),byte(c.b),byte(sat(alpha)*255.f)};
         }
     }
-};
-// Rate-limit relighting, and amortize it over multiple render frames. The
-// previously completed texture remains visible until all rows are ready.
-struct Refresh {
-    Light shown{},pending{};
-    int row=0;
-    float elapsed=0.f;
-    bool busy=false;
-    void reset(const Light& l) { shown=pending=l;row=0;elapsed=0;busy=false; }
-    bool advance(Map& map,const Light& l,float dt) {
-        elapsed=std::min(50.f,elapsed+(std::isfinite(dt)?clamp(dt,0.f,5.f):0.f));
-        if(!busy && dt>0.f && elapsed>=50.f && different(shown,l)) {
-            pending=l;row=0;busy=true;
+    void shadeWeatherLayers(const Settings& s) {
+        // Two correlated static masks. Layer 2 is the optical union's
+        // additional opacity, not another full cloud texture; at either
+        // endpoint the combined opacity equals the corresponding mask.
+        extraPixels.resize(pixels.size());
+        const float a=threshold(s,0.f),b=threshold(s,1.f);
+        const float d0=s.cumulusDensity*s.opacity*smooth(float(target(s,0.f))/30.f);
+        const float d1=s.cumulusDensity*s.opacity*smooth(float(target(s,1.f))/30.f);
+        const auto mask=[](float f,float threshold,float density) {
+            const float t=f-threshold;
+            return sat(smooth(t/.060f)*(.80f+.20f*smooth(t/.14f))*density);
+        };
+        const int step=std::max(1,n/256);
+        for(int y=0;y<n;++y) for(int x=0;x<n;++x) {
+            const float f=get(x,y);
+            const float low=std::min(mask(f,a,d0),mask(f,b,d1));
+            const float high=std::max(mask(f,a,d0),mask(f,b,d1));
+            const float delta=low<.9999f?(high-low)/(1.f-low):0.f;
+            // Stable overhead diffuse relief. Keep fine billows, no
+            // per-weather raster upload or additional raymarch.
+            const float detail=(f-.25f*(get(x-step,y)+get(x+step,y)+get(x,y-step)+get(x,y+step)))*23.f;
+            const float shade=sat(.79f+s.cumulusContrast*(detail*.21f-(f-.4f)*.29f));
+            const auto grey=byte(255.f*shade);
+            const auto i=std::size_t(y)*n+x;
+            pixels[i]={grey,grey,grey,byte(low*255.f)};
+            extraPixels[i]={grey,grey,grey,byte(sat(delta)*255.f)};
         }
-        if(!busy) return false;
-        const int last=std::min(map.size(),row+16);
-        map.shade(pending,row,last);row=last;
-        if(row!=map.size()) return false;
-        shown=pending;busy=false;elapsed=0;return true;
     }
+
 };
 struct Drift {
     double x=0.,y=0.; // wrapped world displacement in tile units

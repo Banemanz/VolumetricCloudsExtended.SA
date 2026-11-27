@@ -37,7 +37,7 @@ pipeline may still need compatibility testing.
   meshes and a distant curved world-XY canopy. No camera yaw, pitch or roll
   rotates cloud geometry. View weights change with the actual eye-to-cloud
   position; cloud centers, shapes and capture planes remain world-fixed.
-  `HybridClouds=0` restores the previous inexpensive canopy-only renderer.
+  `HybridClouds=0` selects the inexpensive canopy-only renderer.
   Optional native flight cards remain disabled by default.
 - Frustum rejection, actual camera far-plane limit, smooth range and near fades,
   back-to-front view-depth ordering and bounded RenderWare batches.
@@ -83,7 +83,8 @@ text retains the default. Inline comments are supported.
 | CumulusNightLight | 1 | Mode 2: night illumination multiplier (0–2); smooth transition to daylight |
 | CumulusContrast | 0.65 | Mode 2: directional relief and occlusion contrast (0–1) |
 | CumulusRimStrength | 0.85 | Mode 2: subtle thin-edge illumination (0–1), no additive halo |
-| CumulusDetail | 0 | Mode 2: 0 = 512² canopy + 96² captures; 1 = 1024² canopy + 128² captures, same geometry |
+| CumulusDetail | 0 | Mode 2: 0 = two 512² canopy masks + 96² captures; 1 = two 1024² masks + 128² captures, same geometry |
+| InteriorHaze | 0.85 | Hybrid mode: local density-sampled flight haze strength (0–1; 0 disables) |
 | CanopyFlightClouds | 0 | Optional native crossed wisps near the canopy height (0–24); off for lowest cost |
 | PuffsPerCloud | 5 | Mode 1: number of puffs (1–8); core uses three fixed planes, each satellite one |
 | SizeScale | 1 | Group dimensions multiplier, or mode 2 world texture scale |
@@ -122,6 +123,7 @@ CumulusDensity=0.95
 CumulusContrast=0.65
 CumulusRimStrength=0.85
 CumulusNightLight=1
+InteriorHaze=0.85
 CanopyFlightClouds=0
 Opacity=1
 ```
@@ -146,23 +148,26 @@ altitude. Mode 2 now has a second representation for nearer formations:
   angular weights, with glancing directions suppressed. No screen-aligned
   billboards, no camera-facing UV rotation, no elevation-driven orientation
   switches. Approximate normalized optical alpha reduces multiple-blend
-  opacity buildup. This is still an impostor; oblique/close silhouettes can
-  ghost during transitions and real in-cloud scattering is not simulated.
+  opacity buildup. Close views concentrate the continuous angular weights
+  to reduce double contours. This is still an impostor; oblique/close
+  silhouettes can ghost during transitions.
 - **World placement:** deterministic jittered 440 m cells at default
   SizeScale, with positions advected by the same wind as the canopy.
   Coverage follows the same periodic macro density field and weather threshold.
-  Cloud sizes and heights are stable while traveling. Clouds fade with range
+  Cloud sizes and heights are stable while traveling. Fair weather favors
+  cumulus, overcast brings more banks, rain favors rising and bank formations. Clouds fade with range
   and when the camera approaches the interior. The far canopy fades into
   these formations and is suppressed above the layer to hide the flat ring.
 - **Budget:** up to 48 groups, three proxies per group, 32 triangles per proxy
-  plus 480 canopy triangles = 5,088 triangle conservative pre-culling upper
-  bound. Actual visible count is frustum-culled; default diagnostic position
+  plus up to 960 canopy triangles and 8 haze triangles = 5,576 triangle
+  conservative pre-culling upper bound. Actual visible count is frustum-culled; default diagnostic position
   yielded 25 clear and 32 rainy eligible groups before frustum culling.
   Proxies share one atlas and are grouped into bounded indexed Im3D batches
   without changing depth order. Default atlas 1024² RGBA (4 MiB GPU base),
   high detail 2048×1024 (8 MiB). No atlas mipmaps (prevent tile bleeding);
   transparent tile gutters with alpha fading before each image's edges.
-  Default canopy adds ~1.33 MiB with mipmaps. CPU coefficients are 8 MiB
+  Default two canopy masks add ~2.67 MiB with mipmaps (total ~6.67 MiB
+  default / ~18.67 MiB high detail). CPU coefficients are 8 MiB
   default / 16 MiB detail plus RGBA and RW staging. No screen render
   targets, 3D GPU texture, custom shaders or per-frame ray tracing.
 - **Initialization:** slices of density, optical-depth planes and capture
@@ -170,13 +175,20 @@ altitude. Mode 2 now has a second representation for nearer formations:
   frame. Allocation, a single work unit and final RW upload are not hard
   time-bounded. The canopy is visible during generation; the hybrid fades
   in over ~2 simulated seconds after the atlas is uploaded. The initial
-  light bake uses 32 rows/frame; relighting uses 16 rows/frame after at least
-  75 native timestep units and a meaningful light change, then one full
-  texture upload. On allocation/upload failure the canopy remains active.
+  light bake uses 32 rows/frame; normalized directional relighting uses
+  32 rows/frame after at least 30 native timestep units and a meaningful sun
+  change, then one full texture upload. Weather and day/night RGB do not
+  wait for a relight; they are applied live in vertex colors. On allocation/upload failure the canopy remains active.
   For the absolute minimum cost set HybridClouds=0.
+- **Flight haze:** retains three 24³ byte density grids (~40.5 KiB total)
+  downsampled from the actual capture density, not an unrelated fog sphere.
+  At most nine rays with six samples per nearby eligible group approximate
+  local extinction. An eight-triangle screen-space alpha overlay gradually
+  obscures the scenery on entry and clears on exit. No full-screen texture,
+  shader or change to native fog settings. Set InteriorHaze=0 to disable.
 - **Known limits:** approximated lighting and optical-depth interpolation,
-  only three density archetypes, no genuine participating medium when the
-  camera enters a formation. The formation and distant sheet are not
+  only three density archetypes, and the haze has no scene-depth input
+  (it may also tint nearby visible geometry/vehicles). The formation and distant sheet are not
   mutually depth-sorted across the two passes. A real game test is needed
   for fill rate, all-angle alpha artifacts and low-end hardware.
 
@@ -187,21 +199,39 @@ The supplied GTA V cloud XML and RSC7 files were inspected strictly as design
 reference; no extracted model, texture, game code or shader is included.
 See the handoff for metadata observations.
 
-### Linux software diagnostics — hybrid
+### Native weather synchronization
 
-| Clear day | Above the layer |
-|---|---|
-| ![Hybrid clear](docs/previews/hybrid_day.jpg) | ![Hybrid above](docs/previews/hybrid_flight.jpg) |
-| ![Hybrid sunrise](docs/previews/hybrid_sunrise.jpg) | ![Hybrid night](docs/previews/hybrid_night.jpg) |
-| ![Hybrid overhead](docs/previews/hybrid_zenith.jpg) | ![Hybrid rain](docs/previews/hybrid_rain.jpg) |
+Mode 2 takes the game's already-interpolated `CWeather::CloudCoverage`,
+`Foggyness` and `ExtraSunnyness` every frame. Rainy and sandstorm intent are
+interpolated from the old/new weather types and `InterpolationValue`.
+The independently step-limited rain/dust particle intensities do not
+hold the cloud field in an old weather state after a forced weather
+change (script-forced rain can additionally contribute). Fog and dust
+reduce cloud visibility, extra-sunny reduces coverage opacity, and
+lightning follows `LightningFlash` immediately. Native interpolated sky
+and timecycle colors set live brightness; ordinary weather changes no
+longer initiate or wait for texture generation.
 
-![Same coherent cloud at six nearby eye positions](docs/previews/hybrid_orbit.jpg)
+The canopy uses two correlated static masks: base coverage and extra
+coverage. Their alpha composition matches both baked endpoints at full
+geometry opacity; intermediate coverage and edge fades are approximate.
+If the density multiplier is below one, the mask weights reverse.
+Form membership stays deterministic while weather changes their opacity.
+Modes 0/1 retain their existing weather behavior.
 
-Actual generated RGBA atlases and C++ geometry rendered in a Linux
-software diagnostic against a synthetic sky, not GTA screenshots.
-The orbital sequence uses the same cloud at six positions with
-fixed lighting. It illustrates changing perspective, not a physical
-rotation of the cloud. To regenerate:
+### Linux software diagnostics — live weather and flight
+
+![Clear, cloudy, rain, forced clear, fog and sandstorm](docs/previews/weather_transition.jpg)
+
+![Neutral extra-sunny, night and lightning](docs/previews/weather_light.jpg)
+
+![Approach, entry and inside a cloud](docs/previews/weather_interior.jpg)
+
+Actual generated RGBA atlases, C++ geometry and density-sampled haze
+rendered in a Linux software diagnostic against synthetic skies and terrain,
+not GTA screenshots. The weather montage uses the same world position,
+sun direction and generated textures. The older hybrid and canopy images
+remain historical references. To regenerate:
 
 ```sh
 g++ -std=c++17 -O2 tests/hybrid_preview.cpp -o hybrid_preview
@@ -225,10 +255,11 @@ not a copy of any game's assets, code or shaders.
   billows form connected banks with gaps and finer detail. Coverage changes
   with the interpolated weather and configured group count/multiplier.
   The same cloud map drifts with native wind; the weather threshold exposes
-  more or less of the same field rather than regenerating random clouds.
-- **Light:** CPU directional density-gradient relief, two-scale occlusion,
-  fine detail and thin-edge illumination, based on the current SA sun vector.
-  Neutral daylight scattering with restrained warmth at sunrise/sunset;
+  more or less of the same field via two precomputed optical-alpha masks
+  rather than regenerating random clouds.
+- **Light:** static grayscale density-gradient relief, two-scale occlusion,
+  fine detail and thin-edge shading. Per-frame live vertex RGB supplies
+  neutral daylight, weather dimming and restrained sunrise/sunset warmth;
   nighttime uses the timecycle sky, not the stock +64 night brightness floor.
   Modes 0/1 retain their exact native/custom lighting options.
 - **Geometry:** 257 vertices and 480 indexed triangles in one 32-segment,
@@ -239,14 +270,13 @@ not a copy of any game's assets, code or shaders.
   facing sprite, texture rotation, or per-cloud sort in the default path.
   Near the surface the alpha fades locally to avoid a hard sheet crossing
   the camera. The two-sided mesh is depth-tested against world geometry.
-- **Cost:** one fixed-function texture+alpha blend submission in canopy-only
-  mode, no per-frame cloud raymarch, custom vertex/pixel shader, screen copy,
-  3D GPU texture or render target. Economy uses a 512² RGBA texture (1 MiB
-  base, ~1.33 MiB with mipmaps); detail 1 uses 1024² (4 MiB base, ~5.33 MiB
-  with mipmaps). One static CPU scalar map and RGBA buffer, plus RW image
-  staging. Lighting updates at most once per simulated second plus bake
-  time; 16 rows/frame, only when the sun/weather changes sufficiently.
-  The previous complete texture stays visible until the next upload.
+- **Cost:** one or two fixed-function texture+alpha blend submissions, no
+  per-frame cloud raymarch, custom vertex/pixel shader, screen copy,
+  3D GPU texture or render target. Economy uses two 512² RGBA masks
+  (~2.67 MiB with mipmaps); detail 1 uses two 1024² masks (~10.67 MiB
+  with mipmaps). The CPU scalar map, RGBA and RW staging are freed after
+  initial upload. No subsequent canopy texture uploads for weather or
+  lighting. Empty masks are skipped; clear usually needs only one pass.
   Automatic RW mipmaps are requested, with non-mipmapped fallback if
   unavailable; detail allocation failure retries economy. Texture creation
   or upload failure falls back to mode 0 and logs it. All owned resources
@@ -258,7 +288,7 @@ not a copy of any game's assets, code or shaders.
   and can reveal card geometry. The default purposely omits these optional native cards.
 
 Mode 2 uses HybridClouds, CumulusDetail, CumulusDensity, CumulusContrast, CumulusRimStrength,
-CumulusNightLight, TargetProcClouds, BadWeatherDensityMultiplier, SizeScale,
+CumulusNightLight, InteriorHaze, TargetProcClouds, BadWeatherDensityMultiplier, SizeScale,
 Opacity, Seed, WindMoveScale, the altitude and range/fade controls, and
 UseGameFog. ColorBrightnessBoost sets the native luminance reference for
 daylight; LightingMode and tint settings affect only native cards.
@@ -307,12 +337,15 @@ g++ -std=c++17 -O2 -Wall -Wextra -Werror -Dnear= -Dfar= tests/canopy_tests.cpp -
 ./canopy_tests
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -Dnear= -Dfar= tests/volume_tests.cpp -o volume_tests
 ./volume_tests
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -Dnear= -Dfar= tests/weather_tests.cpp -o weather_tests
+./weather_tests
 ```
 
 ## Engine reference
 
 Reviewed gta-reversed [Clouds.cpp](https://github.com/gta-reversed/gta-reversed/blob/85bce0be4bd3229eb5ef445d3a7ac2e611a994f4/source/game_sa/Clouds.cpp),
-[app_game.cpp](https://github.com/gta-reversed/gta-reversed/blob/85bce0be4bd3229eb5ef445d3a7ac2e611a994f4/source/app/app_game.cpp)
+[app_game.cpp](https://github.com/gta-reversed/gta-reversed/blob/85bce0be4bd3229eb5ef445d3a7ac2e611a994f4/source/app/app_game.cpp),
+ [TimeCycle.cpp](https://github.com/gta-reversed/gta-reversed/blob/85bce0be4bd3229eb5ef445d3a7ac2e611a994f4/source/game_sa/TimeCycle.cpp)
 and [Weather.cpp](https://github.com/gta-reversed/gta-reversed/blob/85bce0be4bd3229eb5ef445d3a7ac2e611a994f4/source/game_sa/Weather.cpp)
 and the supplied SA 1.0 function index and disassembly dump. The native renderer uses three orthogonal planes at
 `0x716380` and is called during `RenderEffects` at `0x53E170`, after moving fog and before

@@ -6,10 +6,10 @@
 using namespace vc;
 using namespace vc::volume;
 
-std::array<float,Views> allWeights(Vec dir) {
+std::array<float,Views> allWeights(Vec dir,float scale=0.f) {
     std::array<float,Views> a{};
     float sum=0.f;
-    for(auto w:weights(dir)) {
+    for(auto w:scale>0.f?renderWeights(dir,scale):weights(dir)) {
         CHECK(w.view>=0 && w.view<Views && w.amount>=0.f && w.amount<=1.f);
         a[w.view]+=w.amount;sum+=w.amount;
         CHECK(w.amount<.001f || dot(unit(dir),captures()[w.view].dir)>.50f);
@@ -29,6 +29,12 @@ int main() {
         float diff=0.f;
         for(int j=0;j<Views;++j) diff+=std::abs(w[j]-w2[j]);
         CHECK(diff<.01f);
+        for(float scale:{.25f,1.f,3.f}) {
+            const auto close=allWeights(dir,scale),next=allWeights(dir+Vec{.0001f,0,.0001f},scale);
+            float error=0.f;
+            for(int j=0;j<Views;++j) error+=std::abs(close[j]-next[j]);
+            CHECK(error<.01f);
+        }
     }
     for(int i=0;i<Views;++i) CHECK(allWeights(captures()[i].dir)[i]>.999f);
     const Palette p{{36,145,220},{151,220,245},{},{}},dark{{16,25,31},{34,49,48},{},{}};
@@ -90,7 +96,7 @@ int main() {
         const auto& g=clear.items[i];
         const auto it=std::find_if(turned.items.begin(),turned.items.begin()+turned.count,[&](const auto& h){return length(g.center-h.center)==0.f;});
         CHECK(it!=turned.items.begin()+turned.count && it->alpha==g.alpha && it->form==g.form);
-        for(auto w:weights(v.pos-g.center)) {
+        for(auto w:renderWeights(v.pos-g.center,g.scale)) {
             const auto m=mesh(a,g,w),n=mesh(a,*it,w);
             for(int k=0;k<MeshVertices;++k) {
                 CHECK(length(m.vertices[k].pos-n.vertices[k].pos)==0.f && m.vertices[k].alpha==n.vertices[k].alpha);

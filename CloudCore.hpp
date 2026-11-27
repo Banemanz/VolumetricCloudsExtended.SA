@@ -54,6 +54,7 @@ struct Settings {
     bool hybridClouds = true; // mode 2: original density-baked cloud formations
     bool cumulusImpostors = true; // legacy INI compatibility; mode 2 is always world-fixed
     float cumulusNightLight = 1.f;
+    float interiorHaze = .85f; // density-sampled local flight haze in hybrid mode
     int cumulusDetail = 0; // 0: economy, 1: higher texture detail
     int canopyFlightClouds = 0; // optional native crossed groups in the layer
     float sizeScale = 1.f, opacity = 1.f, nearFadeDistance = 25.f;
@@ -95,7 +96,7 @@ inline bool boolean(const std::string& s, bool& v) {
     X(Opacity,opacity,0.f,2.f) X(NearFadeDistance,nearFadeDistance,0.f,500.f) \
     X(BottomShade,bottomShade,0.f,1.f) X(HazeStrength,hazeStrength,0.f,1.f) \
     X(CumulusDensity,cumulusDensity,0.f,1.f) X(CumulusContrast,cumulusContrast,0.f,1.f) \
-    X(CumulusRimStrength,cumulusRimStrength,0.f,1.f) X(CumulusNightLight,cumulusNightLight,0.f,2.f)
+    X(CumulusRimStrength,cumulusRimStrength,0.f,1.f) X(CumulusNightLight,cumulusNightLight,0.f,2.f) X(InteriorHaze,interiorHaze,0.f,1.f)
 #define VC_INTS(X) X(TargetProcClouds,targetProcClouds,0,MaxClouds) \
     X(ColorBrightnessBoost,colorBrightnessBoost,0,255) X(LightingMode,lightingMode,0,1) X(RenderMode,renderMode,0,2) X(CumulusDetail,cumulusDetail,0,1) \
     X(PuffsPerCloud,puffsPerCloud,1,MaxPuffs) X(CanopyFlightClouds,canopyFlightClouds,0,24) X(Seed,seed,1,16777215)

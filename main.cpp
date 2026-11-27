@@ -27,12 +27,11 @@ constexpr int BatchVertices = 480; // multiple of 6; comfortably below the RW Im
 vc::Settings settings;
 vc::Field field;
 bool haveFrame = false;
-RwRaster* canopyRaster=nullptr; // owned only during the RW lifetime
-RwImage* canopyImage=nullptr;
-vc::canopy::Map canopyMap;
-vc::canopy::Refresh canopyRefresh;
+std::array<RwRaster*,2> canopyRasters{}; // owned during RW lifetime
+std::array<bool,2> canopyMipmaps{},canopyHasPixels{};
+bool canopyReady=false;
 vc::canopy::Drift canopyDrift;
-bool canopyAttempted=false,canopyMipmaps=false,flightFieldActive=false;
+bool canopyAttempted=false,flightFieldActive=false;
 unsigned int lastFrame = 0;
 RwRaster* volumeRaster=nullptr;
 RwImage* volumeImage=nullptr;
@@ -84,72 +83,64 @@ void LoadIni() {
 }
 
 void FreeCanopyResources() {
-    if (canopyRaster) RwRasterDestroy(canopyRaster);
-    if (canopyImage) RwImageDestroy(canopyImage);
-    canopyRaster=nullptr;
-    canopyImage=nullptr;
-    canopyMipmaps=false;
-    canopyMap={};
+    for(auto& raster:canopyRasters) {
+        if(raster) RwRasterDestroy(raster);
+        raster=nullptr;
+    }
+    canopyMipmaps={};canopyHasPixels={};canopyReady=false;
 }
 void ReleaseCanopy() {
     FreeCanopyResources();
     canopyAttempted=false;
 }
-void FillCanopyImage() {
-    const int size=canopyMap.size();
-    for (int y=0;y<size;++y)
-        std::memcpy(RwImageGetPixels(canopyImage)+y*RwImageGetStride(canopyImage),
-                    canopyMap.pixels.data()+std::size_t(y)*size,size*sizeof(vc::canopy::Pixel));
-}
-bool UploadCanopy() {
-    if (!canopyImage || !canopyRaster) return false;
-    FillCanopyImage();
-    return RwRasterSetFromImage(canopyRaster,canopyImage)!=nullptr;
-}
-bool EnsureCanopy(const vc::canopy::Light& light) {
-    if (canopyAttempted) return canopyRaster!=nullptr;
+bool EnsureCanopy() {
+    if(canopyAttempted) return canopyReady;
     canopyAttempted=true;
     const auto create=[&](int size) {
-        canopyImage=RwImageCreate(size,size,32);
-        if (!canopyImage || !RwImageAllocatePixels(canopyImage) ||
-            !RwImageGetPixels(canopyImage) || RwImageGetStride(canopyImage)<size*4) {
-            FreeCanopyResources();return;
-        }
         try {
-            canopyMap.build(size,std::uint32_t(settings.seed));
-            canopyMap.shade(light,0,size);
-            canopyRefresh.reset(light);
-            FillCanopyImage(); // format selection inspects the actual alpha channel
-            RwInt32 w=0,h=0,depth=0,format=0;
-            if (RwImageFindRasterFormat(canopyImage,rwRASTERTYPETEXTURE,&w,&h,&depth,&format)
-                && w==size && h==size) {
-                // Prefer native RW automatic mipmaps for the grazing-angle
-                // horizon. Driver/format limitation: retry without mipmaps.
-                const int mipFlags=rwRASTERFORMATMIPMAP|rwRASTERFORMATAUTOMIPMAP;
-                for (int flags:{mipFlags,0}) {
-                    canopyRaster=RwRasterCreate(w,h,depth,(format&~mipFlags)|rwRASTERTYPETEXTURE|flags);
-                    if (canopyRaster && RwRasterSetFromImage(canopyRaster,canopyImage)) {
-                        canopyMipmaps=RwRasterGetNumLevels(canopyRaster)>1;
-                        return;
+            vc::canopy::Map map;
+            map.build(size,std::uint32_t(settings.seed));
+            map.shadeWeatherLayers(settings);
+            auto* image=RwImageCreate(size,size,32);
+            if(!image) return false;
+            struct FreeImage {RwImage* p;~FreeImage(){RwImageDestroy(p);}} freeImage{image};
+            if(!RwImageAllocatePixels(image) || !RwImageGetPixels(image) || RwImageGetStride(image)<size*4) return false;
+            const int mipFlags=rwRASTERFORMATMIPMAP|rwRASTERFORMATAUTOMIPMAP;
+            for(int layer=0;layer<2;++layer) {
+                const auto& pixels=layer?map.extraPixels:map.pixels;
+                canopyHasPixels[layer]=std::any_of(pixels.begin(),pixels.end(),[](const auto& p){return p.a!=0;});
+                if(!canopyHasPixels[layer]) continue;
+                for(int y=0;y<size;++y)
+                    std::memcpy(RwImageGetPixels(image)+y*RwImageGetStride(image),
+                        pixels.data()+std::size_t(y)*size,size*sizeof(vc::canopy::Pixel));
+                RwInt32 w=0,h=0,depth=0,format=0;
+                if(RwImageFindRasterFormat(image,rwRASTERTYPETEXTURE,&w,&h,&depth,&format) && w==size && h==size) {
+                    for(int flags:{mipFlags,0}) {
+                        auto* raster=RwRasterCreate(w,h,depth,(format&~mipFlags)|rwRASTERTYPETEXTURE|flags);
+                        if(raster && RwRasterSetFromImage(raster,image)) {
+                            canopyRasters[layer]=raster;canopyMipmaps[layer]=RwRasterGetNumLevels(raster)>1;
+                            break;
+                        }
+                        if(raster) RwRasterDestroy(raster);
                     }
-                    if (canopyRaster) RwRasterDestroy(canopyRaster);
-                    canopyRaster=nullptr;
                 }
+                if(!canopyRasters[layer]) {FreeCanopyResources();return false;}
             }
-        } catch (const std::bad_alloc&) {
-            Log("Canopy: CPU allocation failed.");
+            return true;
+        } catch(const std::bad_alloc&) {
+            FreeCanopyResources();Log("Canopy: CPU allocation failed.");return false;
         }
-        FreeCanopyResources();
     };
     const int requested=vc::canopy::textureSize(settings);
-    create(requested);
-    if (!canopyRaster && requested!=vc::canopy::EconomySize) {
-        Log("Canopy: detail texture unavailable; trying economy.");
-        create(vc::canopy::EconomySize);
+    bool ok=create(requested);
+    if(!ok && requested!=vc::canopy::EconomySize) {
+        Log("Canopy: detail textures unavailable; trying economy.");
+        ok=create(vc::canopy::EconomySize);
     }
-    Log(canopyRaster?"Canopy: procedural cloud sheet generated."
-                    :"Canopy: texture creation failed; using crossed native textures.");
-    return canopyRaster!=nullptr;
+    canopyReady=ok;
+    Log(ok?"Canopy: static weather masks generated (live coverage)."
+          :"Canopy: texture creation failed; using crossed native textures.");
+    return ok;
 }
 
 // Only the portable CPU bake is incremental; all RW objects stay on the game thread.
@@ -176,7 +167,9 @@ void UpdateVolumes(const vc::canopy::Light& light,float dt) {
         }
         if(!volumeRaster) {
             const int w=volumeAtlas.width(),h=volumeAtlas.height();
-            if(!volumeInitialRow) volumeInitialLight=light;
+            if(!volumeInitialRow) volumeInitialLight=vc::canopy::relativeLight(light);
+            const auto relative=vc::canopy::relativeLight(light);
+            if(vc::canopy::directionalDifference(volumeInitialLight,relative)>.45f) {volumeInitialLight=relative;volumeInitialRow=0;}
             const int last=std::min(h,volumeInitialRow+32);
             volumeAtlas.shade(volumeInitialLight,volumeInitialRow,last);
             volumeInitialRow=last;
@@ -193,8 +186,9 @@ void UpdateVolumes(const vc::canopy::Light& light,float dt) {
             }
             // No atlas mip bleeding; all slots have transparent gutters.
             volumeRaster=RwRasterCreate(w,h,depth,(format&~(rwRASTERFORMATMIPMAP|rwRASTERFORMATAUTOMIPMAP))|rwRASTERTYPETEXTURE);
-            if(!volumeRaster || !UploadVolumes()) {FailVolumes();return;}
-            volumeRefresh.reset(volumeInitialLight);
+            if(!volumeRaster || !RwRasterSetFromImage(volumeRaster,volumeImage)) {FailVolumes();return;}
+            volumeRefresh.reset(light);
+            volumeRefresh.shown=volumeRefresh.pending=volumeInitialLight; // what was actually baked
             Log("Hybrid clouds: original density atlas ready (78 captures).");
         }
         if(volumeRaster && volumeRefresh.advance(volumeAtlas,light,dt) && !UploadVolumes()) {
@@ -320,36 +314,41 @@ std::array<RwIm3DVertex,BatchVertices> vertices;
 constexpr int BatchIndices=BatchVertices*4;
 std::array<RwImVertexIndex,BatchIndices> modernIndices;
 static_assert(sizeof(RwImVertexIndex)==sizeof(std::uint16_t));
-void DrawCanopy(const vc::View& view,const vc::Range& range,float hybridFade) {
-    if (settings.opacity<=0.f || settings.cumulusDensity<=0.f || !settings.targetProcClouds) return;
+void DrawCanopy(const vc::View& view,const vc::Range& range,float hybridFade,
+                const vc::weather::State& weather,const vc::canopy::Light& light) {
+    if(settings.opacity<=0.f || settings.cumulusDensity<=0.f || !settings.targetProcClouds) return;
     RenderStates states;
-    if (!states.begin()) return;
+    if(!states.begin()) return;
     const auto mesh=vc::canopy::mesh(settings,view,range,canopyDrift,vc::volume::radius(settings,range),hybridFade);
     static_assert(vc::canopy::VertexCount<=BatchVertices && vc::canopy::IndexCount<=BatchIndices);
-    bool visible=false;
-    for(int i=0;i<vc::canopy::VertexCount;++i) {
-        auto& v=vertices[i];
-        const auto& p=mesh.vertices[i];
-        visible|=p.alpha>1.f/255.f;
-        RwIm3DVertexSetPos(&v,p.pos.x,p.pos.y,p.pos.z);
-        RwIm3DVertexSetNormal(&v,0.f,0.f,1.f);
-        RwIm3DVertexSetU(&v,p.u);
-        RwIm3DVertexSetV(&v,p.v);
-        RwIm3DVertexSetRGBA(&v,255,255,255,Byte(p.alpha*255.f));
-    }
-    if (!visible) return;
+    const auto weights=vc::canopy::layerWeights(settings,weather);
     std::copy(mesh.indices.begin(),mesh.indices.end(),modernIndices.begin());
-    RwRenderStateSet(rwRENDERSTATETEXTURERASTER,canopyRaster);
-    if (canopyMipmaps) RwRenderStateSet(rwRENDERSTATETEXTUREFILTER,reinterpret_cast<void*>(rwFILTERLINEARMIPLINEAR));
     RwRenderStateSet(rwRENDERSTATETEXTUREADDRESSU,reinterpret_cast<void*>(rwTEXTUREADDRESSWRAP));
     RwRenderStateSet(rwRENDERSTATETEXTUREADDRESSV,reinterpret_cast<void*>(rwTEXTUREADDRESSWRAP));
-    if (RwIm3DTransform(vertices.data(),vc::canopy::VertexCount,nullptr,
-                         rwIM3D_VERTEXXYZ|rwIM3D_VERTEXUV|rwIM3D_VERTEXRGBA)) {
-        RwIm3DRenderIndexedPrimitive(rwPRIMTYPETRILIST,modernIndices.data(),vc::canopy::IndexCount);
-        RwIm3DEnd();
+    for(int layer=0;layer<2;++layer) {
+        const float alpha=layer?weights.extra:weights.base;
+        if(!canopyHasPixels[layer] || !canopyRasters[layer] || alpha<=1.f/255.f) continue;
+        bool visible=false;
+        for(int i=0;i<vc::canopy::VertexCount;++i) {
+            auto& v=vertices[i];
+            const auto& p=mesh.vertices[i];
+            visible|=p.alpha*alpha>1.f/255.f;
+            RwIm3DVertexSetPos(&v,p.pos.x,p.pos.y,p.pos.z);
+            RwIm3DVertexSetNormal(&v,0.f,0.f,1.f);
+            RwIm3DVertexSetU(&v,p.u);RwIm3DVertexSetV(&v,p.v);
+            RwIm3DVertexSetRGBA(&v,Byte(light.bright.r),Byte(light.bright.g),Byte(light.bright.b),Byte(p.alpha*alpha*255.f));
+        }
+        if(!visible) continue;
+        RwRenderStateSet(rwRENDERSTATETEXTURERASTER,canopyRasters[layer]);
+        RwRenderStateSet(rwRENDERSTATETEXTUREFILTER,reinterpret_cast<void*>(canopyMipmaps[layer]?rwFILTERLINEARMIPLINEAR:rwFILTERLINEAR));
+        if(RwIm3DTransform(vertices.data(),vc::canopy::VertexCount,nullptr,
+                            rwIM3D_VERTEXXYZ|rwIM3D_VERTEXUV|rwIM3D_VERTEXRGBA)) {
+            RwIm3DRenderIndexedPrimitive(rwPRIMTYPETRILIST,modernIndices.data(),vc::canopy::IndexCount);
+            RwIm3DEnd();
+        }
     }
 }
-void DrawVolumes(RwCamera* camera,const vc::View& view,const vc::volume::Groups& groups) {
+void DrawVolumes(RwCamera* camera,const vc::View& view,const vc::volume::Groups& groups,const vc::canopy::Light& light) {
     if(!volumeRaster || !groups.count) return;
     RenderStates states;
     if(!states.begin()) return;
@@ -365,8 +364,8 @@ void DrawVolumes(RwCamera* camera,const vc::View& view,const vc::volume::Groups&
     };
     for(int i=0;i<groups.count;++i) {
         const auto& group=groups.items[i];
-        if(!Visible(camera,group.center,group.scale*1.8f)) continue;
-        auto weights=vc::volume::weights(view.pos-group.center);
+        if(group.alpha<=1.f/255.f || !Visible(camera,group.center,group.scale*1.8f)) continue;
+        auto weights=vc::volume::renderWeights(view.pos-group.center,group.scale);
         // Fixed order: crossing equal view weights must not flip blend order.
         std::sort(weights.begin(),weights.end(),[](const auto& a,const auto& b) {return a.view<b.view;});
         for(const auto w:weights) {
@@ -379,13 +378,50 @@ void DrawVolumes(RwCamera* camera,const vc::View& view,const vc::volume::Groups&
                 RwIm3DVertexSetPos(&v,p.pos.x,p.pos.y,p.pos.z);
                 RwIm3DVertexSetNormal(&v,0.f,0.f,1.f);
                 RwIm3DVertexSetU(&v,p.u);RwIm3DVertexSetV(&v,p.v);
-                RwIm3DVertexSetRGBA(&v,255,255,255,Byte(p.alpha*255.f));
+                RwIm3DVertexSetRGBA(&v,Byte(light.bright.r),Byte(light.bright.g),Byte(light.bright.b),Byte(p.alpha*255.f));
             }
             for(const auto index:m.indices) modernIndices[ni++]=RwImVertexIndex(nv+index);
             nv+=vc::volume::MeshVertices;
         }
     }
     flush();
+}
+void DrawInteriorHaze(RwCamera* camera,const vc::View& view,const vc::volume::Groups& groups,const vc::canopy::Light& light) {
+    if(!volumeRaster || settings.interiorHaze<=0.f || !groups.count) return;
+    const auto* window=RwCameraGetViewWindow(camera);
+    const auto* raster=RwCameraGetRaster(camera);
+    if(!window || !raster) return;
+    const float width=float(RwRasterGetWidth(raster)),height=float(RwRasterGetHeight(raster));
+    if(width<=0.f || height<=0.f) return;
+    const auto haze=vc::volume::interiorHaze(settings,volumeAtlas,groups,view,window->x,window->y);
+    if(haze.maxAlpha<=1.f/255.f) return;
+    RenderStates states;
+    if(!states.begin()) return;
+    RwRenderStateSet(rwRENDERSTATETEXTURERASTER,nullptr);
+    RwRenderStateSet(rwRENDERSTATEZTESTENABLE,reinterpret_cast<void*>(FALSE));
+    RwRenderStateSet(rwRENDERSTATEFOGENABLE,reinterpret_cast<void*>(FALSE));
+    const auto color=vc::mixRGB(light.ambient,light.bright,.57f);
+    std::array<RwIm2DVertex,vc::volume::HazeVertices> verts{};
+    constexpr int side=vc::volume::HazeSide;
+    const float z=RwIm2DGetNearScreenZ(),rhw=1.f/std::max(.001f,view.nearClip);
+    for(int y=0;y<side;++y)for(int x=0;x<side;++x) {
+        const int i=y*side+x;
+        auto& v=verts[i];
+        RwIm2DVertexSetScreenX(&v,width*x/(side-1));
+        RwIm2DVertexSetScreenY(&v,height*y/(side-1));
+        RwIm2DVertexSetScreenZ(&v,z);
+        RwIm2DVertexSetRecipCameraZ(&v,rhw);
+        RwIm2DVertexSetIntRGBA(&v,Byte(color.r),Byte(color.g),Byte(color.b),Byte(haze.alpha[i]*255.f));
+    }
+    std::array<RwImVertexIndex,vc::volume::HazeIndices> indices{};
+    int n=0;
+    for(int y=0;y<side-1;++y)for(int x=0;x<side-1;++x) {
+        const auto a=RwImVertexIndex(y*side+x),b=RwImVertexIndex(a+1),c=RwImVertexIndex(a+side),d=RwImVertexIndex(c+1);
+        for(auto i:{a,c,b,b,c,d})indices[n++]=i;
+    }
+    // Drawn in RenderEffects before HUD/post-effects. This is a local
+    // approximation, not depth-correct fog and not a game-weather override.
+    RwIm2DRenderIndexedPrimitive(rwPRIMTYPETRILIST,verts.data(),int(verts.size()),indices.data(),n);
 }
 void Flush(int& count,RwRaster* raster) {
     if (!count) return;
@@ -456,24 +492,23 @@ void __cdecl RenderClouds() {
         if (!settings.targetProcClouds || settings.opacity<=0.f || settings.cumulusDensity<=0.f) return;
         const int index=std::clamp(CTimeCycle::m_CurrentStoredValue,0,15);
         const auto& sun=CTimeCycle::m_VectorToSun[index];
-        const auto light=vc::canopy::lighting(settings,palette,{sun.x,sun.y,sun.z},weather,CWeather::Rain,CWeather::Foggyness);
-        modern=EnsureCanopy(light);
-        if (modern && newFrame) {
-            canopyDrift.update(settings,windVector,dt);
-            if (canopyRefresh.advance(canopyMap,light,dt) && !UploadCanopy()) {
-                Log("Canopy: texture update failed; using crossed native textures.");
-                FreeCanopyResources();modern=false;
-            }
-        }
+        static_assert(WEATHER_RAINY_SF==8 && WEATHER_RAINY_COUNTRYSIDE==16 && WEATHER_FOGGY_SF==9 && WEATHER_SANDSTORM_DESERT==19);
+        const auto climate=vc::weather::sample({CWeather::OldWeatherType,CWeather::NewWeatherType,CWeather::InterpolationValue,
+            CWeather::CloudCoverage,CWeather::Rain,CWeather::Foggyness,CWeather::Sandstorm,CWeather::ExtraSunnyness,
+            CWeather::bScriptsForceRain,CWeather::LightningFlash});
+        const auto light=vc::canopy::liveLighting(settings,palette,{sun.x,sun.y,sun.z},climate);
+        modern=EnsureCanopy();
+        if(modern && newFrame) canopyDrift.update(settings,windVector,dt);
         if (modern) {
             if(newFrame && settings.hybridClouds) UpdateVolumes(light,dt);
-            const auto groups=vc::volume::groups(settings,view,range,canopyDrift,weather,volumeFade);
-            DrawCanopy(view,range,vc::volume::canopyBlend(groups,volumeFade));
-            DrawVolumes(camera,view,groups);
+            const auto groups=vc::volume::groups(settings,view,range,canopyDrift,climate,volumeFade);
+            DrawCanopy(view,range,vc::volume::canopyBlend(groups,volumeFade),climate,light);
+            DrawVolumes(camera,view,groups,light);
+            DrawInteriorHaze(camera,view,groups,light);
             // Optional legacy fixed cards are localized to flight altitude;
             // the volume proxies do not depend on these native textures.
             flightAlpha=vc::canopy::flightWeight(settings,view)*.65f;
-            desired=std::min(settings.canopyFlightClouds,desired);
+            desired=std::min(settings.canopyFlightClouds,vc::target(settings,climate.coverage));
             if (!desired || flightAlpha<=1.f/255.f) {
                 if(newFrame) {
                     if (flightFieldActive) field.reset(settings);

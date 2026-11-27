@@ -56,11 +56,6 @@ int main() {
         if(map.pixels[i].a>96 && std::abs(int(map.pixels[i].r)-int(repeat.pixels[i].r))>4) ++changed;
     }
     CHECK(changed>1000);
-    Refresh refresh;refresh.reset(day);
-    CHECK(!refresh.advance(repeat,night,0));
-    for(int i=0;i<10;++i) CHECK(!refresh.advance(repeat,night,4));
-    int uploads=0;for(int i=0;i<80;++i) uploads+=refresh.advance(repeat,night,1);
-    CHECK(uploads==1 && !refresh.busy && !different(refresh.shown,night));
     const View v{{2266,-1271,30},{1,0,0},{0,0,1},{0,1,0},2200,1};
     const auto rangeLimit=range(s,v.farClip,1600);
     const auto mesh0=mesh(s,v,rangeLimit,{});
@@ -98,6 +93,6 @@ int main() {
     Map high;high.build(DetailSize,s.seed);high.shade(day,0,high.size());
     CHECK(high.pixels.size()==std::size_t(DetailSize)*DetailSize);
     CHECK(std::abs(coverage(high)[0]-c[0])<.03);
-    std::cout<<"PASS: default mode, INI compatibility, periodic density, weather, day/night lighting, sun direction, refresh, "
+    std::cout<<"PASS: default mode, INI compatibility, periodic density, weather, day/night lighting, sun direction, "
         "world-fixed geometry, clip/fade and wind; clear coverage "<<c[0]<<", rainy "<<r[0]<<", initial 512 bake "<<ms<<" ms\n";
 }

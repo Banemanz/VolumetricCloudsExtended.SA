@@ -6,6 +6,7 @@
 
 namespace vc::volume {
 constexpr int Azimuths=8, Views=3*Azimuths+2, Forms=3, Grid=64;
+constexpr int InteriorGrid=24;
 constexpr int MeshSide=5, MeshVertices=MeshSide*MeshSide, MeshIndices=6*(MeshSide-1)*(MeshSide-1);
 constexpr int MaxGroups=48;
 constexpr float Extent=1.18f, Domain=1.25f, Step=2.f*Domain/(Grid-1);
@@ -86,8 +87,8 @@ public:
             lobes[i]=base[i];
             auto& l=lobes[i];
             l.p=l.p+Vec{rng.sample(-.08f,.08f),rng.sample(-.13f,.13f),rng.sample(-.08f,.08f)};
-            if(form==1) {l.p.x*=.78f;l.p.z*=1.25f;l.r.x*=.81f;l.r.z*=1.17f;}
-            if(form==2) {l.p.y*=1.22f;l.p.z*=.53f;l.r.y*=1.32f;l.r.z*=.58f;}
+            if(form==1) {l.p.x*=.76f;l.p.z*=1.36f;l.r.x*=.83f;l.r.z*=1.20f;}
+            if(form==2) {l.p.x*=1.10f;l.p.y*=1.27f;l.p.z*=.39f;l.r.x*=1.09f;l.r.y*=1.38f;l.r.z*=.52f;}
         }
         for(int i=9;i<int(lobes.size());++i) {
             const auto& b=lobes[rng.next()%9];
@@ -113,7 +114,7 @@ public:
                 }
                 // Erode the coherent surface rather than rendering individual lobes.
                 if(sdf<-.16f) continue;
-                const float detail=.093f*noise(p,5.3f,seed+1)+.055f*noise(p,11.f,seed+2)+.025f*noise(p,20.f,seed+3);
+                const float detail=.095f*noise(p,5.3f,seed+1)+.064f*noise(p,11.f,seed+2)+.030f*noise(p,20.f,seed+3);
                 const float t=sat((sdf+detail+.018f)/.085f);
                 // Fade the farthest wisps before the orthographic capture extent;
                 // otherwise a wide form can expose the rectangular texture edge.
@@ -164,6 +165,8 @@ class Atlas {
     int tile=0,bakeRow=0,formLoaded=-1;
     std::uint32_t seed{};
     std::vector<Coeff> coeff;
+    std::array<std::vector<std::uint8_t>,Forms> interior;
+    int interiorForm=-1,interiorSlice=0;
     std::array<std::array<float,MeshVertices>,Forms*Views> surface{};
     // Integrate front-to-back in the true 3D density field, including self-occlusion.
     Coeff integrate(const Capture& c,float x,float y) const {
@@ -190,6 +193,15 @@ class Atlas {
         const int slot=bakeRow/tile,row=bakeRow%tile,form=slot/Views;
         if(form!=formLoaded) {density.begin(form,seed);formLoaded=form;}
         if(!density.ready()) {density.advanceOne();return;}
+        if(interiorForm!=form) {interiorForm=form;interiorSlice=0;interior[form].resize(InteriorGrid*InteriorGrid*InteriorGrid);}
+        if(interiorSlice<InteriorGrid) {
+            const int z=interiorSlice++;
+            constexpr float step=2.f*Domain/(InteriorGrid-1);
+            for(int y=0;y<InteriorGrid;++y)for(int x=0;x<InteriorGrid;++x)
+                interior[form][(z*InteriorGrid+y)*InteriorGrid+x]=canopy::byte(255.f*density.sample(
+                    {-Domain+x*step,-Domain+y*step,-Domain+z*step}).rho);
+            return;
+        }
         const int ox=slot%cols()*tile,oy=slot/cols()*tile;
         if(row>=2 && row<tile-2) {
             const float y=Extent*(1.f-2.f*(row-2+.5f)/(tile-4));
@@ -224,7 +236,7 @@ public:
     bool ready() const {return tile && bakeRow==Forms*Views*tile;}
     void start(int size,std::uint32_t s) {
         assert(size==64 || size==96 || size==128);
-        tile=size;seed=s;bakeRow=0;formLoaded=-1;
+        tile=size;seed=s;bakeRow=0;formLoaded=-1;interiorForm=-1;interiorSlice=0;interior={};
         coeff.assign(std::size_t(width())*height(),{});
         pixels.assign(coeff.size(),{});
         density.clear();surface={};
@@ -236,6 +248,19 @@ public:
     }
     float progress() const {return tile?float(bakeRow)/(Forms*Views*tile):0.f;}
     const auto& depths(int form,int view) const {return surface[form*Views+view];}
+    // Only 3*24^3 bytes persist for inexpensive flight-through sampling.
+    float interiorDensity(int form,Vec p) const {
+        if(form<0 || form>=Forms || interior[form].empty() || !finite(p)) return 0.f;
+        const Vec q=(p+Vec{Domain,Domain,Domain})*((InteriorGrid-1)/(2.f*Domain));
+        if(q.x<0.f || q.y<0.f || q.z<0.f || q.x>=InteriorGrid-1 || q.y>=InteriorGrid-1 || q.z>=InteriorGrid-1) return 0.f;
+        const int x=int(q.x),y=int(q.y),z=int(q.z);
+        const float fx=q.x-x,fy=q.y-y,fz=q.z-z;
+        float a=0.f;
+        for(int dz=0;dz<2;++dz)for(int dy=0;dy<2;++dy)for(int dx=0;dx<2;++dx)
+            a+=interior[form][((z+dz)*InteriorGrid+y+dy)*InteriorGrid+x+dx]
+                *(dx?fx:1.f-fx)*(dy?fy:1.f-fy)*(dz?fz:1.f-fz);
+        return a/255.f;
+    }
     void shade(const canopy::Light& l,int first,int last) {
         const Vec sun=unit(l.sun);
         const float sum=std::max(.001f,std::abs(sun.x)+std::abs(sun.y)+std::abs(sun.z));
@@ -257,8 +282,15 @@ public:
                 // Straight-alpha RGB gutter: neutral colour, zero coverage.
                 pixels[i]={canopy::byte(l.bright.r),canopy::byte(l.bright.g),canopy::byte(l.bright.b),0};continue;
             }
-            float direct=0.f;
-            for(int j=0;j<6;++j) direct+=sw[j]*a.light[j]/255.f;
+            float direct=0.f,squared=0.f;
+            // Blend directional transmittance with a lower-bound-like
+            // harmonic optical response: more occlusion where directions
+            // disagree, without an expensive logarithm for every texel.
+            for(int j=0;j<6;++j) {
+                const float t=a.light[j]/255.f;
+                direct+=sw[j]*t;squared+=sw[j]*t*t;
+            }
+            direct=sat(direct-.42f*std::max(0.f,squared-direct*direct));
             const float rim=phase[slot%Views]*(1.f-a.alpha/255.f);
             // A little ambient bounce at the shadowed base and edge leakage;
             // no independent bright sprites or color boost at midnight.
@@ -280,30 +312,34 @@ struct Refresh {
     int row=0;
     float elapsed=0.f;
     bool busy=false;
-    void reset(const canopy::Light& l) {shown=pending=l;row=0;elapsed=0;busy=false;}
-    bool advance(Atlas& atlas,const canopy::Light& l,float dt) {
-        elapsed=std::min(75.f,elapsed+clamp(dt,0.f,5.f));
-        if(!busy && dt>0 && elapsed>=75.f && canopy::different(shown,l)) {busy=true;pending=l;row=0;}
+    void reset(const canopy::Light& l) {shown=pending=canopy::relativeLight(l);row=0;elapsed=0;busy=false;}
+    bool advance(Atlas& atlas,const canopy::Light& live,float dt) {
+        const auto l=canopy::relativeLight(live);
+        elapsed=std::min(30.f,elapsed+clamp(dt,0.f,5.f));
+        if(!busy && dt>0 && elapsed>=30.f && canopy::directionalDifference(shown,l)>.13f) {busy=true;pending=l;row=0;}
         if(!busy) return false;
-        const int last=std::min(atlas.height(),row+16);
+        // Direction is the only delayed quantity, and large sun jumps
+        // supersede an unfinished snapshot instead of publishing stale rows.
+        if(canopy::directionalDifference(pending,l)>.45f) {pending=l;row=0;}
+        const int last=std::min(atlas.height(),row+32);
         atlas.shade(pending,row,last);row=last;
         if(row!=atlas.height()) return false;
         shown=pending;busy=false;elapsed=0;return true;
     }
 };
-struct Group { Vec center;float scale,alpha;int form,order; };
+struct Group { Vec center;float scale,alpha;int form,order; float occupancy=1.f; };
 struct Groups { std::array<Group,MaxGroups> items{};int count{}; };
 inline float radius(const Settings& s,const Range& r) {return std::min(1480.f*s.sizeScale,r.end*.84f);}
-inline Groups groups(const Settings& s,const View& view,const Range& r,const canopy::Drift& drift,float weather,float ready) {
+inline Groups groups(const Settings& s,const View& view,const Range& r,const canopy::Drift& drift,const weather::State& climate,float ready) {
     Groups result;
-    if(ready<=0.f || !s.hybridClouds || !target(s,weather)) return result;
+    if(ready<=0.f || !s.hybridClouds || !target(s,climate.coverage)) return result;
     const float rad=radius(s,r),spacing=440.f*s.sizeScale,tile=canopy::tileWorldSize(s);
     const double dx=drift.worldX,dy=drift.worldY;
     const double cx=(view.pos.x-dx)/spacing,cy=(view.pos.y-dy)/spacing;
     // Only ordinary playable world coordinates are relevant, guard int conversion.
     if(std::abs(cx)>1e8 || std::abs(cy)>1e8) return result;
     const int ix=int(std::floor(cx)),iy=int(std::floor(cy)),span=int(std::ceil(rad/spacing))+1;
-    const float threshold=canopy::threshold(s,weather);
+    const float threshold=canopy::threshold(s,climate.coverage)+.055f*climate.extraSunny;
     for(int j=-span;j<=span;++j) for(int i=-span;i<=span;++i) {
         const int x=ix+i,y=iy+j;
         const auto h=canopy::hash(x,y,std::uint32_t(s.seed));
@@ -312,16 +348,19 @@ inline Groups groups(const Settings& s,const View& view,const Range& r,const can
         const float z=mix(s.minSpawnZ,s.maxSpawnZ,rng.sample(.35f,.75f));
         const Vec pos{float(wx+dx),float(wy+dy),z};
         const float scale=rng.sample(150.f,215.f)*s.sizeScale;
+        const int form=int(rng.next()%Forms);
         const Vec delta=pos-view.pos;
         const float horizontal=std::sqrt(horizontalSq(delta)),distance=length(delta);
         const float edge=smooth((rad-horizontal)/(rad*.28f));
         const float flight=smooth((distance/scale-.72f)/.58f);
         const float clip=distanceAlpha(r,distance);
-        if(edge*flight*clip<.015f) continue;
+        if(edge*clip<.015f) continue;
         const float coverage=smooth((canopy::shape(float(wx/tile),float(wy/tile),s.seed)-threshold+.075f)/.14f);
-        const float alpha=sat(coverage*edge*flight*clip*s.cumulusDensity*s.opacity*ready);
-        if(alpha<.015f || result.count>=MaxGroups) continue;
-        result.items[result.count++]={pos,scale,alpha,int(rng.next()%Forms),(j+span)*(2*span+1)+i+span};
+        const float occupancy=sat(coverage*edge*clip*s.cumulusDensity*s.opacity*ready
+            *weather::formWeight(climate,form)*weather::visibility(climate)*weather::clearOpacity(climate));
+        const float alpha=occupancy*flight;
+        if(occupancy<.015f || result.count>=MaxGroups) continue;
+        result.items[result.count++]={pos,scale,alpha,form,(j+span)*(2*span+1)+i+span,occupancy};
     }
     // Fixed identity tie-break, not camera-relative enumeration, for overlapping layers.
     std::sort(result.items.begin(),result.items.begin()+result.count,[&](const Group& a,const Group& b) {
@@ -331,9 +370,55 @@ inline Groups groups(const Settings& s,const View& view,const Range& r,const can
     });
     return result;
 }
+inline Groups groups(const Settings& s,const View& view,const Range& r,const canopy::Drift& drift,float coverage,float ready) {
+    return groups(s,view,r,drift,weather::State{sat(coverage),sat(coverage),0,0,0,false},ready);
+}
+// Mild center-weighted interior haze. Sample actual density along nine
+// short view rays; do not modify global fog, the game's weather or far clip.
+constexpr int HazeSide=3,HazeVertices=9,HazeIndices=24;
+struct Haze {std::array<float,HazeVertices> alpha{};float maxAlpha{};};
+inline Haze interiorHaze(const Settings& s,const Atlas& atlas,const Groups& groups,const View& view,float wx,float wy) {
+    Haze haze;
+    if(s.interiorHaze<=0.f || !atlas.ready() || !std::isfinite(wx) || !std::isfinite(wy))return haze;
+    // A finite, near-camera path keeps the overlay local and avoids
+    // filling the entire sky with fog from an ordinary distant cloud.
+    for(int i=0;i<groups.count;++i) {
+        const auto& g=groups.items[i];
+        const Vec delta=view.pos-g.center;
+        const float rel=length(delta)/g.scale;
+        if(rel>=1.34f || g.occupancy<=.001f) continue;
+        const float proximity=smooth((1.34f-rel)/.49f);
+        const Vec origin=delta/g.scale;
+        for(int y=0;y<HazeSide;++y)for(int x=0;x<HazeSide;++x) {
+            const Vec ray=unit(view.forward+view.right*((x-1)*wx)+view.up*((1-y)*wy));
+            float optical=0.f;
+            // World path capped at 90m; normalized traversal matches
+            // the actual density field even when SizeScale changes.
+            constexpr int steps=6;
+            const float ds=std::min(90.f/g.scale,.8f)/steps;
+            for(int j=0;j<steps;++j)
+                optical+=atlas.interiorDensity(g.form,origin+ray*((j+.5f)*ds))*ds;
+            const float a=(1.f-std::exp(-optical*8.f))*proximity*g.occupancy*s.interiorHaze;
+            auto& h=haze.alpha[y*HazeSide+x];
+            h=1.f-(1.f-h)*(1.f-sat(a));
+            haze.maxAlpha=std::max(haze.maxAlpha,h);
+        }
+    }
+    return haze;
+}
+// Concentrate the view blend slightly for close formations. Small angular
+// weights contribute less double contour; still continuous at all boundaries.
+inline std::array<Weight,3> renderWeights(Vec delta,float scale) {
+    auto result=weights(delta);
+    const float strength=smooth((scale/std::max(scale*.5f,length(delta))-.10f)/.45f);
+    float total=0.f;
+    for(auto& w:result) {w.amount=mix(w.amount,w.amount*w.amount,strength);total+=w.amount;}
+    if(total>0.f) for(auto& w:result)w.amount/=total;
+    return result;
+}
 inline float canopyBlend(const Groups& groups,float fade) {
     float strongest=0.f;
-    for(int i=0;i<groups.count;++i) strongest=std::max(strongest,groups.items[i].alpha);
+    for(int i=0;i<groups.count;++i) strongest=std::max(strongest,groups.items[i].occupancy);
     return fade*smooth(strongest/.35f);
 }
 struct Mesh {

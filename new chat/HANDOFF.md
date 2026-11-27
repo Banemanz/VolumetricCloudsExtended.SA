@@ -480,3 +480,74 @@ canopy-only fallback. No proprietary assets or extracted code included.
   mode 2 is a pseudo-volumetric approximation, not full GTA V cloud
   scattering. Compare HybridClouds=0 if GPU fill-rate limited; use
   CumulusDetail=0 by default. Do not claim measured minimum hardware.
+
+
+## Native weather synchronization / local flight haze (2026-11-27)
+
+Supersedes hybrid lighting and flight limitations described above. User
+reported weather lag; keep RenderMode=2, HybridClouds=1 and CumulusDetail=0
+as defaults, preserve explicit modes 0/1 and existing INI.
+
+- Source audit: gta-reversed 85bce0be4bd3229eb5ef445d3a7ac2e611a994f4
+  `source/game_sa/Weather.cpp` CWeather::Update interpolates coverage,
+  foggyness, extrasunnyness from old/new weather; Rain and Sandstorm are
+  separately stepped by timestep*.005. ForceWeatherNow changes both IDs.
+  `TimeCycle.cpp` interpolates timecycle colors across clock/weather;
+  `source/app/app_game.cpp` uses LightningFlash for scene lighting.
+  Pinned SDK 624a6a49265fd7a6fc63bda1611013ceabeacb8a provides CWeather
+  refs and RwIm2D vertex functions. No native weather globals written.
+- CloudWeather.hpp samples live weather on every draw. Rainy IDs 8/16,
+  fog ID 9, sandstorm ID 19 (SDK enum checks). Rain/dust formation intent
+  follows old/new interpolation, not residual particle intensity.
+  Native Rain only supplements storm intent under bScriptsForceRain
+  (native timecycle fog override flag). Fog/dust visibility suppression
+  and extra-sunny alpha are original artistic approximations.
+- Canopy.hpp static correlated grayscale base and added-coverage masks.
+  Added alpha = (hi-lo)/(1-lo), exact endpoints at full geometry fade;
+  interpolated mask alpha/geometry fade approximate. Lower-than-one
+  BadWeatherDensityMultiplier reverses mask weights. Two managed rasters
+  (non-mip fallback), one draw in clear and two at most; static density,
+  relief and alpha, current-frame RGB/alpha. CPU map/images freed after
+  upload. Empty masks skipped. No weather-driven upload or threshold lag.
+- Hybrid atlas shading decouples relative directional coefficients
+  from weather, timecycle luminance and lightning. Current-frame RGB
+  via Im3D vertices, neutral brighter fair weather, dimmer storm/night.
+  Solar direction refresh only, 32 rows/frame after 30 native time units,
+  pending large direction jumps superseded. First upload can still take
+  time; not a guaranteed instantaneous solar direction change.
+- CloudVolumes.hpp: sharper multi-scale erosion, different broad,
+  tower and bank silhouettes, fixed form per world cell with continuously
+  weighted opacity by weather. Near renderWeights concentrates normalized
+  blends continuously to reduce ghosting. Same fixed capture geometry
+  and per-group triangle cap. Three 24^3 byte density grids retained
+  during bake (41,472 bytes). Groups separately store occupancy and
+  exterior alpha; retiring external proxy on entry no longer destroys
+  density for haze. InteriorHaze=.85 default, clamped 0–1, 0 disables.
+- Interior alpha integrates six local density samples along each of up
+  to nine screen rays per nearby eligible group. Max local path 90m;
+  screen space 3x3 vertices / 8 triangles, textured state cleared,
+  Z/fog off, states restored by RAII. Existing scene/HUD rendering order
+  preserved, no native fog or other post-effects hooks added. This is a
+  depth-unaware fog approximation, not raymarched per-pixel clouds:
+  nearby geometry may also be tinted. Canopy-only has no density haze.
+- Budget: 48 groups * 3 views * 32 tris + 2*480 canopy + 8 haze =
+  5576 max conservative pre-cull triangles (optional native wisps excluded).
+  4 MiB atlas + ~2.67 MiB canopy with mipmaps; high detail 8 + 10.67 MiB.
+  No new GPU shader, screen render target, GPU volume texture, or extra
+  libraries. Alpha fill rate and actual ASI performance unmeasured.
+- Linux release g++ -O2 -DNDEBUG -Wall -Wextra -Werror: all four tests
+  passed (cloud, canopy, volume, weather), ASan/UBSan weather test passed.
+  weather_tests covers bidirectional native interpolation, forced clear
+  with residual rain, fog/dust/extra-sunny/lightning, static mask alpha
+  endpoints, live light/no weather uploads, direction supersession,
+  stable group identity and interior density/haze. Preview simulation
+  renders actual C++ meshes and textures with new live alpha/color/haze;
+  docs/previews/weather_transition.jpg, weather_light.jpg and
+  weather_interior.jpg show synthetic sky/terrain only. Not GTA captures.
+- In-game test next: rapidly switch sunny/cloudy/rain/fog/sand in both
+  directions and via ForceWeatherNow; compare native sky, thunder and
+  cloud latency. Fly through dense center and edge at day/night, cockpit
+  and third-person, check no HUD washout, low draw distance, RW reset,
+  fill-rate on integrated GPU. If haze is excessive near terrain, try
+  InteriorHaze=0.5 or 0, then consider depth-aware fixed-function near
+  geometry rather than adding shaders. Preserve legacy fallback modes.
