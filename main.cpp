@@ -11,8 +11,8 @@
 #include "CTimer.h"
 #include "CTxdStore.h"
 #include "CScene.h"
-#include "CloudBanks.hpp"
-#include <d3d9.h>
+#include "CloudD3D9.hpp"
+#include <cstdio>
 #include <new>
 
 #include <array>
@@ -38,13 +38,24 @@ vc::banks::Volume bankVolume;
 vc::banks::Mesh bankMesh;
 std::array<IDirect3DVolumeTexture9*,2> bankTextures{};
 IDirect3DDevice9* bankDevice=nullptr; // borrowed
-bool bankFailed=false,bankPrepared=false;
+bool bankFailed=false,bankPrepared=false,bankDrawLogged=false,bankEmptyLogged=false;
+vc::d3d9::Options bankOptions;
+IDirect3DQuery9* bankPixelQuery=nullptr; // One nonblocking diagnostic, not a per-frame readback.
+bool bankPixelQueryAttempted=false,bankDownsampled=false;
+int bankQueryFrames=0;
+IDirect3DDevice9* CurrentD3DDevice() {
+    // SA 1.0 US: _RwD3DDevice at C97C28. The SDK's public getter at
+    // 7F9D50 clears RW's matrix/stream cache every call; do not call it.
+    return *reinterpret_cast<IDirect3DDevice9**>(0xC97C28);
+}
 void ReleaseBankTextures() {
+    if(bankPixelQuery){bankPixelQuery->Release();bankPixelQuery=nullptr;}
+    bankPixelQueryAttempted=false;bankQueryFrames=0;bankDownsampled=false;
     for(auto& texture:bankTextures) {
         if(texture)texture->Release();
         texture=nullptr;
     }
-    bankDevice=nullptr;bankFailed=false;
+    bankDevice=nullptr;bankFailed=false;bankDrawLogged=false;bankEmptyLogged=false;
 }
 void ReleaseBanks() {
     ReleaseBankTextures();
@@ -150,43 +161,78 @@ bool EnsureCanopy() {
     return ok;
 }
 
-// Managed D3D9 textures are not legal on D3D9Ex. Use system-memory
-// staging and default-pool textures; the SDK's device-loss event releases
-// them before reset. The density remains in CPU memory for re-upload.
+void LogD3DFailure(const char* phase,vc::d3d9::Result result) {
+    char message[256];
+    std::snprintf(message,sizeof(message),"3D cloud %s: %s failed (HRESULT 0x%08lX).",
+        phase,result.operation,static_cast<unsigned long>(result.hr));
+    Log(message);
+}
 bool EnsureBanks() {
-    if(!settings.hybridClouds||!bankPrepared||bankFailed)return false;
-    auto* device=static_cast<IDirect3DDevice9*>(RwD3D9GetCurrentD3DDevice());
+    if(!settings.hybridClouds||!bankPrepared)return false;
+    auto* device=CurrentD3DDevice();
     if(!device)return false;
     if(device!=bankDevice)ReleaseBankTextures();
+    if(bankFailed)return false;
+    if(bankPixelQuery) {
+        DWORD samples=0;
+        const auto hr=bankPixelQuery->GetData(&samples,sizeof(samples),0); // no FLUSH / wait
+        if(hr==S_OK||FAILED(hr)||++bankQueryFrames>=120) {
+            char info[160];
+            if(hr==S_OK) {
+                std::snprintf(info,sizeof(info),"3D cloud first draw: %lu depth-passing samples (GPU occlusion query).",
+                    static_cast<unsigned long>(samples));Log(info);
+            } else Log("3D cloud GPU query unavailable or timed out; submission status still logged.");
+            bankPixelQuery->Release();bankPixelQuery=nullptr;
+        }
+    }
     if(bankTextures[0]&&bankTextures[1])return true;
     bankDevice=device;
-    const auto fail=[](){ReleaseBankTextures();bankFailed=true;Log("3D cloud bank unavailable; retaining canopy.");return false;};
+    const auto fail=[](){ReleaseBankTextures();bankDevice=CurrentD3DDevice();bankFailed=true;Log("3D cloud bank unavailable; retaining canopy.");return false;};
     D3DCAPS9 caps{};
     D3DDEVICE_CREATION_PARAMETERS creation{};
-    if(FAILED(device->GetDeviceCaps(&caps))||FAILED(device->GetCreationParameters(&creation))||
-        (creation.BehaviorFlags&D3DCREATE_PUREDEVICE)||
-        !(caps.TextureCaps&D3DPTEXTURECAPS_VOLUMEMAP)||
-        (caps.VolumeTextureFilterCaps&(D3DPTFILTERCAPS_MINFLINEAR|D3DPTFILTERCAPS_MAGFLINEAR))!=(D3DPTFILTERCAPS_MINFLINEAR|D3DPTFILTERCAPS_MAGFLINEAR)||
-        caps.MaxVolumeExtent<static_cast<DWORD>(bankVolume.width)||caps.MaxSimultaneousTextures<2||
-        caps.MaxTextureBlendStages<4||!(caps.TextureOpCaps&D3DTEXOPCAPS_LERP))return fail();
-    for(int layer=0;layer<2;++layer) {
-        IDirect3DVolumeTexture9* staging=nullptr;
-        const auto w=UINT(bankVolume.width),d=UINT(bankVolume.depth);
-        if(FAILED(device->CreateVolumeTexture(w,w,d,1,0,D3DFMT_A8R8G8B8,D3DPOOL_SYSTEMMEM,&staging,nullptr)))return fail();
-        struct Release {IDirect3DVolumeTexture9* p;~Release(){p->Release();}} release{staging};
-        D3DLOCKED_BOX lock{};
-        if(FAILED(staging->LockBox(0,&lock,nullptr,0)))return fail();
-        for(UINT z=0;z<d;++z)for(UINT y=0;y<w;++y) {
-            auto* dst=reinterpret_cast<DWORD*>(static_cast<char*>(lock.pBits)+z*lock.SlicePitch+y*lock.RowPitch);
-            const auto* src=bankVolume.pixels[layer].data()+(std::size_t(z)*w+y)*w;
-            for(UINT x=0;x<w;++x)dst[x]=D3DCOLOR_ARGB(src[x].a,src[x].r,src[x].g,src[x].b);
-        }
-        if(FAILED(staging->UnlockBox(0))||
-           FAILED(device->CreateVolumeTexture(w,w,d,1,0,D3DFMT_A8R8G8B8,D3DPOOL_DEFAULT,&bankTextures[layer],nullptr))||
-           FAILED(device->UpdateTexture(staging,bankTextures[layer])))return fail();
+    HRESULT hr=device->GetDeviceCaps(&caps);
+    if(FAILED(hr)){LogD3DFailure("initialization",vc::d3d9::failed(hr,"GetDeviceCaps"));return fail();}
+    const HRESULT creationResult=device->GetCreationParameters(&creation);
+    if(FAILED(creationResult))LogD3DFailure("diagnostic",vc::d3d9::failed(creationResult,"GetCreationParameters"));
+    bankOptions=vc::d3d9::options(caps);
+    char info[384];
+    std::snprintf(info,sizeof(info),"3D cloud device: flags=0x%08lX%s volume=%d maxExtent=%lu filters=0x%08lX textures=%lu stages=%lu ops=0x%08lX.",
+        static_cast<unsigned long>(creation.BehaviorFlags),
+        (creation.BehaviorFlags&D3DCREATE_PUREDEVICE)?" (pure device supported)":"",
+        !!(caps.TextureCaps&D3DPTEXTURECAPS_VOLUMEMAP),static_cast<unsigned long>(caps.MaxVolumeExtent),
+        static_cast<unsigned long>(caps.VolumeTextureFilterCaps),static_cast<unsigned long>(caps.MaxSimultaneousTextures),
+        static_cast<unsigned long>(caps.MaxTextureBlendStages),static_cast<unsigned long>(caps.TextureOpCaps));
+    Log(info);
+    if(!(caps.TextureCaps&D3DPTEXTURECAPS_VOLUMEMAP)||caps.MaxVolumeExtent<16) {
+        Log("3D cloud device does not advertise usable volume textures.");return fail();
     }
-    Log("3D cloud bank: bounded fixed-function volume slices, no impostor atlas.");
-    return true;
+    // Power-of-two downsampling for older caps and allocation failures.
+    // System-memory -> default works with D3D9Ex; managed fallback is only
+    // attempted if the driver rejects staging/upload.
+    if(!bankOptions.dual)Log("3D cloud device lacks dual-volume blending; using nearest weather endpoint.");
+    if(bankOptions.filter==D3DTEXF_POINT)Log("3D cloud device lacks linear volume filtering; using point filtering.");
+    for(UINT w=UINT(bankVolume.width);w>=16;w/=2) {
+        if(w>caps.MaxVolumeExtent)continue;
+        const UINT d=std::min(UINT(bankVolume.depth),w);
+        bool ready=true;
+        for(int layer=0;layer<2;++layer) {
+            auto result=vc::d3d9::upload(device,bankVolume,layer,w,d,&bankTextures[layer]);
+            if(!result) {
+                LogD3DFailure("staged upload",result);
+                result=vc::d3d9::upload(device,bankVolume,layer,w,d,&bankTextures[layer],true);
+                if(!result){LogD3DFailure("managed upload",result);ready=false;break;}
+            }
+        }
+        if(ready) {
+            bankDownsampled=w!=UINT(bankVolume.width)||d!=UINT(bankVolume.depth);
+            std::snprintf(info,sizeof(info),"3D cloud bank ready: %lux%lux%lu RGBA volumes, shader-free, %s weather, %s filtering.",
+                static_cast<unsigned long>(w),static_cast<unsigned long>(w),static_cast<unsigned long>(d),
+                bankOptions.dual?"interpolated":"endpoint",bankOptions.filter==D3DTEXF_LINEAR?"linear":"point");
+            Log(info);return true;
+        }
+        for(auto& texture:bankTextures){if(texture)texture->Release();texture=nullptr;}
+    }
+    return fail();
 }
 
 void ResetField() {
@@ -344,85 +390,58 @@ void DrawCanopy(const vc::View& view,const vc::Range& range,float hybridFade,
 // so the engine's cached state agrees with the device afterwards.
 bool DrawBanks(RwCamera* camera,const vc::View& view,const vc::Range& range,
                const vc::weather::State& climate,const vc::canopy::Light& light) {
-    if(!EnsureBanks())return false;
+    if(!bankDevice||!bankTextures[0]||!bankTextures[1])return false;
     auto* window=RwCameraGetViewWindow(camera);
     if(!window)return false;
     const auto* offset=RwCameraGetViewOffset(camera);
     const float wx=window->x+(offset?std::abs(offset->x):0.f),
                 wy=window->y+(offset?std::abs(offset->y):0.f);
-    try {vc::banks::buildMesh(bankMesh,settings,view,range,canopyDrift,wx,wy,&bankVolume,climate.coverage);}
+    try {vc::banks::buildMesh(bankMesh,settings,view,range,canopyDrift,wx,wy,bankDownsampled?nullptr:&bankVolume,bankOptions.dual?climate.coverage:(climate.coverage>=.5f?1.f:0.f));}
     catch(const std::bad_alloc&) {bankFailed=true;Log("3D cloud slice allocation failed.");return false;}
-    if(bankMesh.indices.empty())return true;
-    struct D3DVertex {float x,y,z;DWORD rgba;float u,v,w;};
-    static std::vector<D3DVertex> batch;
-    try {
-        batch.resize(bankMesh.vertices.size());
-    } catch(const std::bad_alloc&) {bankFailed=true;return false;}
+    if(bankMesh.indices.empty()) {
+        if(!bankEmptyLogged&&!bankDrawLogged){Log("3D cloud bank ready; no occupied slices in current camera frustum yet.");bankEmptyLogged=true;}
+        return true;
+    }
+    static std::vector<vc::d3d9::Vertex> batch;
+    try {batch.resize(bankMesh.vertices.size());}
+    catch(const std::bad_alloc&) {Log("3D cloud vertex allocation failed.");return false;}
     const float visibility=vc::weather::visibility(climate)*vc::weather::clearOpacity(climate);
+    if(visibility<=1.f/255.f)return true;
     for(std::size_t i=0;i<batch.size();++i) {
         const auto& v=bankMesh.vertices[i];
         batch[i]={v.pos.x,v.pos.y,v.pos.z,D3DCOLOR_ARGB(Byte(v.alpha*visibility*255.f),
             Byte(light.bright.r),Byte(light.bright.g),Byte(light.bright.b)),v.u,v.v,v.w};
     }
-    auto* d=bankDevice;
-    // This internal SDK declaration depends on rwcore.h header guards.
-    // Pinned SDK RenderWare.cpp and SA 1.0 US IDB both resolve it here.
-    plugin::Call<0x7FC200>();
-    IDirect3DStateBlock9* saved=nullptr;
-    if(FAILED(d->CreateStateBlock(D3DSBT_ALL,&saved)))return false;
-    struct Restore {IDirect3DStateBlock9* p;bool captured=false;~Restore(){if(captured)p->Apply();p->Release();}} restore{saved};
-    // Explicit capture: drivers may initialize the state block lazily.
-    if(FAILED(saved->Capture()))return false;
-    restore.captured=true;
-    HRESULT hr=S_OK;
-    const auto check=[&](HRESULT result){if(FAILED(result))hr=result;};
-    const auto rs=[&](D3DRENDERSTATETYPE st,DWORD value){check(d->SetRenderState(st,value));};
-    const auto ts=[&](DWORD stage,D3DTEXTURESTAGESTATETYPE st,DWORD value){check(d->SetTextureStageState(stage,st,value));};
-    const auto ss=[&](DWORD stage,D3DSAMPLERSTATETYPE st,DWORD value){check(d->SetSamplerState(stage,st,value));};
-    D3DMATRIX identity{};identity._11=identity._22=identity._33=identity._44=1.f;
-    check(d->SetTransform(D3DTS_WORLD,&identity));
-    check(d->SetVertexShader(nullptr));check(d->SetPixelShader(nullptr));
-    check(d->SetFVF(D3DFVF_XYZ|D3DFVF_DIFFUSE|D3DFVF_TEX1|D3DFVF_TEXCOORDSIZE3(0)));
-    rs(D3DRS_LIGHTING,FALSE);rs(D3DRS_SPECULARENABLE,FALSE);rs(D3DRS_VERTEXBLEND,D3DVBF_DISABLE);rs(D3DRS_INDEXEDVERTEXBLENDENABLE,FALSE);rs(D3DRS_FOGENABLE,settings.useGameFog?TRUE:FALSE);rs(D3DRS_ZENABLE,D3DZB_TRUE);rs(D3DRS_ZWRITEENABLE,FALSE);
-    rs(D3DRS_ZFUNC,D3DCMP_LESSEQUAL);rs(D3DRS_ALPHABLENDENABLE,TRUE);rs(D3DRS_ALPHATESTENABLE,TRUE);rs(D3DRS_ALPHAFUNC,D3DCMP_GREATER);rs(D3DRS_ALPHAREF,0);
-    rs(D3DRS_SRCBLEND,D3DBLEND_SRCALPHA);rs(D3DRS_DESTBLEND,D3DBLEND_INVSRCALPHA);rs(D3DRS_BLENDOP,D3DBLENDOP_ADD);
-    rs(D3DRS_SEPARATEALPHABLENDENABLE,FALSE);rs(D3DRS_CULLMODE,D3DCULL_NONE);rs(D3DRS_SHADEMODE,D3DSHADE_GOURAUD);
-    rs(D3DRS_COLORWRITEENABLE,0xF);rs(D3DRS_SRGBWRITEENABLE,FALSE);rs(D3DRS_STENCILENABLE,FALSE);
-    rs(D3DRS_CLIPPLANEENABLE,0);rs(D3DRS_WRAP0,0);rs(D3DRS_TEXTUREFACTOR,D3DCOLOR_ARGB(Byte(climate.coverage*255.f),
-        Byte(climate.coverage*255.f),Byte(climate.coverage*255.f),Byte(climate.coverage*255.f)));
-    const bool blend=climate.coverage>.001f&&climate.coverage<.999f;
-    const DWORD first=climate.coverage>=.999f?1:0;
-    check(d->SetTexture(0,bankTextures[first]));
-    for(DWORD i=0;i<(blend?2u:1u);++i) {
-        ss(i,D3DSAMP_ADDRESSU,D3DTADDRESS_WRAP);ss(i,D3DSAMP_ADDRESSV,D3DTADDRESS_WRAP);ss(i,D3DSAMP_ADDRESSW,D3DTADDRESS_CLAMP);
-        ss(i,D3DSAMP_MINFILTER,D3DTEXF_LINEAR);ss(i,D3DSAMP_MAGFILTER,D3DTEXF_LINEAR);ss(i,D3DSAMP_MIPFILTER,D3DTEXF_NONE);
-        ss(i,D3DSAMP_SRGBTEXTURE,FALSE);
-        ts(i,D3DTSS_TEXCOORDINDEX,0);ts(i,D3DTSS_TEXTURETRANSFORMFLAGS,D3DTTFF_DISABLE);
-        ts(i,D3DTSS_RESULTARG,D3DTA_CURRENT);
+    // CameraBeginUpdate (7F8F20) writes these matrices before applying
+    // them to D3D. Read the active camera matrices, not device GetTransform
+    // or the RW cache (which other mods may invalidate).
+    const auto& viewMatrix=*reinterpret_cast<const D3DMATRIX*>(0xC9BC80);
+    const auto& projectionMatrix=*reinterpret_cast<const D3DMATRIX*>(0x8E2458);
+    plugin::Call<0x7FC200>(); // flush pending RW state changes before snapshot
+    if(!bankPixelQueryAttempted) {
+        bankPixelQueryAttempted=true;
+        if(SUCCEEDED(bankDevice->CreateQuery(D3DQUERYTYPE_OCCLUSION,&bankPixelQuery))) {
+            if(FAILED(bankPixelQuery->Issue(D3DISSUE_BEGIN))) {
+                bankPixelQuery->Release();bankPixelQuery=nullptr;
+            }
+        }
     }
-    ts(0,D3DTSS_COLOROP,blend?D3DTOP_SELECTARG1:D3DTOP_MODULATE);
-    ts(0,D3DTSS_ALPHAOP,blend?D3DTOP_SELECTARG1:D3DTOP_MODULATE);
-    ts(0,D3DTSS_COLORARG1,D3DTA_TEXTURE);ts(0,D3DTSS_ALPHAARG1,D3DTA_TEXTURE);
-    ts(0,D3DTSS_COLORARG2,D3DTA_DIFFUSE);ts(0,D3DTSS_ALPHAARG2,D3DTA_DIFFUSE);
-    if(blend) {
-        check(d->SetTexture(1,bankTextures[1]));
-        ts(1,D3DTSS_COLOROP,D3DTOP_LERP);ts(1,D3DTSS_ALPHAOP,D3DTOP_LERP);
-        ts(1,D3DTSS_COLORARG0,D3DTA_TFACTOR);ts(1,D3DTSS_ALPHAARG0,D3DTA_TFACTOR);
-        ts(1,D3DTSS_COLORARG1,D3DTA_TEXTURE);ts(1,D3DTSS_ALPHAARG1,D3DTA_TEXTURE);
-        ts(1,D3DTSS_COLORARG2,D3DTA_CURRENT);ts(1,D3DTSS_ALPHAARG2,D3DTA_CURRENT);
-        check(d->SetTexture(2,nullptr));ts(2,D3DTSS_RESULTARG,D3DTA_CURRENT);
-        ts(2,D3DTSS_TEXCOORDINDEX,0);ts(2,D3DTSS_TEXTURETRANSFORMFLAGS,D3DTTFF_DISABLE);
-        ts(2,D3DTSS_COLOROP,D3DTOP_MODULATE);ts(2,D3DTSS_ALPHAOP,D3DTOP_MODULATE);
-        ts(2,D3DTSS_COLORARG1,D3DTA_CURRENT);ts(2,D3DTSS_ALPHAARG1,D3DTA_CURRENT);
-        ts(2,D3DTSS_COLORARG2,D3DTA_DIFFUSE);ts(2,D3DTSS_ALPHAARG2,D3DTA_DIFFUSE);
+    const bool queryThisDraw=bankPixelQuery&&bankQueryFrames==0&&!bankDrawLogged;
+    const auto result=vc::d3d9::draw(bankDevice,bankTextures,bankOptions,batch.data(),UINT(batch.size()),
+        bankMesh.indices.data(),UINT(bankMesh.indices.size()/3),climate.coverage,settings.useGameFog,&viewMatrix,&projectionMatrix);
+    if(queryThisDraw && FAILED(bankPixelQuery->Issue(D3DISSUE_END))) {
+        bankPixelQuery->Release();bankPixelQuery=nullptr;
     }
-    ts(blend?3:1,D3DTSS_COLOROP,D3DTOP_DISABLE);
-    ts(blend?3:1,D3DTSS_ALPHAOP,D3DTOP_DISABLE);
-    if(FAILED(hr))return false;
-    const HRESULT draw=d->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST,0,UINT(batch.size()),UINT(bankMesh.indices.size()/3),
-        bankMesh.indices.data(),D3DFMT_INDEX16,batch.data(),sizeof(D3DVertex));
-    return SUCCEEDED(draw);
+    if(!result){LogD3DFailure("draw",result);return false;}
+    if(!bankDrawLogged) {
+        char info[256];
+        std::snprintf(info,sizeof(info),"3D cloud draw submitted: %d slices, %lu triangles, camera Z=%.1f, coverage=%.2f.",
+            bankMesh.slices,static_cast<unsigned long>(bankMesh.indices.size()/3),view.pos.z,climate.coverage);
+        Log(info);bankDrawLogged=true;
+    }
+    return true;
 }
+
 void Flush(int& count,RwRaster* raster) {
     if (!count) return;
     RwRenderStateSet(rwRENDERSTATETEXTURERASTER,raster);
@@ -505,7 +524,7 @@ void __cdecl RenderClouds() {
             if(useBanks && !DrawBanks(camera,view,range,climate,light)) {
                 Log("3D cloud draw failed; falling back to canopy.");
                 bankFailed=true;
-                DrawCanopy(view,range,0.f,climate,light);
+                // Restore the full canopy from the next frame; avoid double compositing this frame.
             }
             // Optional legacy fixed cards are localized to flight altitude;
             // the 3D bank does not depend on these native textures.
@@ -601,7 +620,7 @@ public:
         plugin::Events::shutdownRwEvent += ReleaseCanopy;
         plugin::Events::d3dLostEvent += ReleaseBankTextures;
         plugin::Events::d3dResetEvent += ReleaseBankTextures;
-        Log(settings.renderMode==2 ? "Procedural volumetric cloud renderer installed (SA 1.0 US, shader-free 3D cloud banks)." : settings.lightingMode==0
+        Log(settings.renderMode==2 ? "Procedural volumetric cloud renderer installed (SA 1.0 US, shader-free D3D9 volume banks, pure-device compatible)." : settings.lightingMode==0
             ? "Procedural volumetric cloud renderer installed (SA 1.0 US, native lighting)."
             : "Procedural volumetric cloud renderer installed (SA 1.0 US, custom lighting).");
     }

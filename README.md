@@ -171,15 +171,22 @@ toward a continuous 3D field derived from the same macro weather map.
   occupancy grid and bounded mesh buffers. No recurring texture uploads.
   GPU fill rate, particularly inside a thick overcast, matters more than
   triangle counts. Performance on old/integrated hardware is not measured.
-- **Compatibility:** the direct D3D9 draw is necessary for the third
-  texture coordinate, which is not present in RW Im3D. Requires volume
-  textures, linear volume filtering, two simultaneous textures and four
-  texture blend stages with LERP support; unsupported devices or failed
-  allocations/draws retain the original world-space canopy. All device
-  state is captured/restored, and RW's pending states are flushed first.
-  Default-pool volume textures are uploaded from temporary system-memory
-  staging and released on SDK device-loss/reset and RW shutdown; no
-  managed volume textures (which D3D9Ex disallows).
+- **Compatibility:** the direct D3D9 draw carries actual three-component
+  texture coordinates, not a RenderWare 2D atlas. SA's normal pure-device
+  mode is accepted. The SA 1.0 US device pointer and camera matrices are
+  read directly (verified against the IDB); the SDK's device getter
+  invalidates RW's matrix cache and is deliberately avoided. Pipeline
+  state is captured/restored via D3DSBT_ALL, with no prohibited pure-device
+  state getters. RW's pending states are flushed first. Volume textures
+  are uploaded through system-memory staging into the default pool; a
+  managed-pool attempt and smaller power-of-two textures are tried on
+  failure. Lower-capability hardware can use point sampling and, only
+  if two-volume blending is unavailable, the nearest weather endpoint.
+  No volume support or failed draws retain the canopy. Upload failures
+  log the precise operation and HRESULT, and a successful first draw
+  logs submitted slice/triangle counts. A one-shot optional asynchronous
+  GPU occlusion query records depth-passing samples without waiting.
+  Device loss/reset and RW shutdown release owned resources.
 - **Initialization:** the original map and volume are generated once on
   the game thread. The economy volume bake measured ~0.21 s in local Linux
   release tests (plus canopy generation/upload); high detail takes longer.
@@ -214,10 +221,25 @@ The canopy uses two correlated static masks: base coverage and extra
 coverage. Their alpha composition matches both baked endpoints at full
 geometry opacity; intermediate coverage and edge fades are approximate.
 If the density multiplier is below one, the mask weights reverse.
-The nearby volume interpolates two density endpoints in the same draw.
+On hardware with dual-volume support, the nearby volume interpolates two density endpoints in the same draw.
 Modes 0/1 retain their existing weather behavior.
 
-### Linux software diagnostics — actual 3D density
+### Runtime validation and diagnostics
+
+The Win32 CTest `cloud_d3d9_volume` creates a native D3D9 device (attempts SA's
+pure-device flags first), uploads actual 3D textures with the same backend
+as the ASI, draws the clear/intermediate/wet endpoints, and reads pixels
+back to verify that changing the third texture coordinate changes the
+output. A machine without a volume-capable D3D9 device reports **skipped**,
+not passed. This does not test the GTA camera or integration.
+
+The log beside the ASI distinguishes `3D cloud device:`,
+`3D cloud bank ready:`, empty camera frustum, and
+`3D cloud draw submitted:`. A supported occlusion query also logs the
+first draw's depth-passing sample count. If the renderer falls back,
+send the new log lines including HRESULT, not only the canopy screenshot.
+
+### Linux software diagnostics — density/mesh only
 
 | From the ground | At aircraft altitude |
 |---|---|
@@ -226,8 +248,8 @@ Modes 0/1 retain their existing weather behavior.
 | ![Night](docs/previews/banks_night.jpg) | ![Entry](docs/previews/banks_entry.jpg) |
 
 Actual C++ density textures and slice triangles, software-rendered with
-trilinear filtering, synthetic sky, not GTA screenshots. Real D3D9
-performance and state compatibility remain to be validated in-game.
+trilinear filtering, synthetic sky, not GTA screenshots. They do not
+verify that the game successfully initialized or drew the volume.
 
 ```sh
 g++ -std=c++17 -O2 tests/banks_preview.cpp -o banks_preview

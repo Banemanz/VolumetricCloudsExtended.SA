@@ -621,3 +621,53 @@ HybridClouds=1, CumulusDetail=0. Modes 0/1 and HybridClouds=0 fallback retained.
 - Win32 CI exposed the private RW flush prototype being hidden by SDK
   header guards. Call the exact validated SA 1.0 US wrapper target
   0x7FC200 (SDK RenderWare.cpp and supplied function list).
+
+## Runtime failure: pure device and volume texture support (2026-11-27)
+
+User's actual log: Canopy: static weather masks generated (live coverage).
+3D cloud bank unavailable; retaining canopy. The previous portable
+previews did not establish runtime output. User explicitly wants to keep
+native 3D volume textures (no return to an atlas or RenderWare cards).
+No new mode or changes to density generation, settings or shader budget.
+
+- SA 1.0 US supplied Hoodlum IDB: D3D9System 0x7F5F70; 0x7F6741
+  tests D3DDEVCAPS_HWTRANSFORMANDLIGHT (0x10000), 0x7F6749 tests
+  D3DDEVCAPS_PUREDEVICE (0x100000), 0x7F6751 ORs 0x50
+  (D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_PUREDEVICE).
+  0x7F6781 invokes IDirect3D9::CreateDevice. The old EnsureBanks
+  unconditionally rejected pure mode, making its failure likely on
+  a normal SA installation. Actual user's flags were not previously logged.
+- RwD3D9GetCurrentD3DDevice at 0x7F9D50 is NOT a trivial getter:
+  invalidates surfaces, streams/FVF/shader state and _LastMatrixUsed.
+  Do not repeatedly call it during rendering. Read _RwD3DDevice
+  0xC97C28 directly (also confirmed in gta-reversed RenderWare.h).
+  CameraBeginUpdate 0x7F8F20 computes D3D view matrix at 0xC9BC80
+  and projection at 0x8E2458; 0x7F8FB1/0x7F9068 apply them through
+  RwD3D9SetTransform. Use these current matrices explicitly. Direct
+  state getters are prohibited on pure devices, but D3DSBT_ALL
+  captures/restores state independently; 0x7FC200 flush pending RW
+  changes before capture. Verify Apply HRESULT.
+- CloudD3D9.hpp factors the native upload/draw path so Win32 device
+  test exercises exact same code. Stage upload uses proper pitches and
+  checks every operation, logs HRESULT on failure; retry managed
+  resources only when staging fails, then progressively smaller
+  powers of two. Linear or point filter from actual caps. Dual-volume
+  interpolation requires 3 active blend stages (not 4), supports LERP
+  or BLENDFACTORALPHA; nearest endpoint only for hardware lacking both.
+  Pure device flags are diagnostic, never a rejection criterion.
+  Bounded world-space mesh, one hardware draw, same memory budget.
+  A one-time optional occlusion query is polled without flush or
+  waiting and released on reset; zero samples means no depth-passing
+  raster fragments on that frame, not necessarily broken density.
+- Win32 cloud_d3d9_volume test: native CreateDevice with pure flags
+  first, then non-pure HAL/REF if available; uploads actual volume
+  textures, renders two quads with distinct W coordinates and checks
+  RGB/alpha at all weather endpoints via GPU readback. No synthetic
+  rasterizer. Test skip code 77 if no volume-capable device, verbose CI
+  logs identify pure/non-pure/skip. Test does not exercise SA's camera
+  and engine state. Portable four tests passed locally with g++.
+- Next: install fresh ASI artifact from PR #1, keep RenderMode=2,
+  HybridClouds=1, inspect log device flags, ready dims, draw submission
+  and optional depth-passing sample count. If failure, exact HRESULT
+  and operation are now recorded. Do not infer successful in-game
+  rendering from Linux preview or build alone.
