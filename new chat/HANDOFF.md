@@ -786,3 +786,64 @@ and a concise, human-commented INI.
   and unchanged distant map/near CJ/objects. Cloud colour distance must
   no longer track world fog; test alternative CloudFogStart/End and
   CloudDrawDistance. Check SkyGfx and D3D9Ex alt-tab/reset. No new modes.
+
+## Radial shells and true long-range volume with far LOD (2026-11-27)
+
+User liked the independent-atmosphere iteration but supplied two new 30fps
+2560x1440 recordings: gta_sa_tQwqYibadk.mp4 (619 decoded frames) and
+gta_sa_9fGI0C9byo.mp4 (387). Decoded all frames to reduced-size diagnostics;
+inspected time sheets, 0.1-second successive crops, and adjacent pairs
+selected by sky-patch absolute difference after a small XY shift.
+First video: rapid airbreak travel around 2.0–3.1s visibly reshapes banks;
+5.23–5.30s and 9.60–9.67s contain abrupt cloud changes with substantial
+scene motion (15.1s peak is tree occlusion, not a cloud defect).
+Second: especially 0–7.7s the dense bank has a distinct lower boundary
+and nearly empty horizontal strip; 7.8–9.0s moving through the seam
+makes it obvious. Compression, physical parallax and motion are mixed
+in the recordings; cannot prove every change is a renderer error.
+
+Actual source problems: 1400m hard cap (also tile-size-dependent),
+hybrid canopy ring fading away with altitude, fixed-phase but rotating
+view-aligned quadrature. This revision removes these, without adopting
+shaders or copying another game's assets.
+
+- Static world-axis cube-sphere triangles, concentric about eye. Fixed
+  radial samples at 16/32/64/90m step (detail 12/24/48/72m), angle/FOV
+  independent; shells sorted by radial distance. At fixed eye, same
+  world ray sees identical interpolants regardless of view. Small
+  nearest shells use 6×6 grids instead of 12×12; conservative frustum
+  masks once per topology, slab clipping and occupancy skip. Source
+  vertex limit 44k protects 16-bit projection; extreme custom settings
+  may truncate geometry. Translation changes the samples continuously
+  and still may alias; cannot guarantee no motion artifacts in GTA.
+- 8000m default range, fog 1600–8000; old explicit INI values retained.
+  Squared opacity taper beyond 75% range softens terminal edge. New
+  FarBillboards=1, BillboardStartDistance=5000, BillboardStartRatio=.8.
+  Effective start max(minimum,ratio*range); blend across max(350,10% of
+  range), bounded by range. Full volume available with FarBillboards=0.
+  No billboard at 4200m. UseAdditionalTextures=0 new default.
+- Bake two 512² original atlas textures by integrating the SAME
+  3D density inside overlapping world cells, 4×4 periodic cells ×
+  eight azimuths, 64×32 tile each with guarded edges. Smooth cell
+  partition, front-to-back optical compositing, shared atlas draw,
+  no mip bleeding, continuous azimuth fade and radial distance sort.
+  Only generated if useful; fallback keeps full range on unsupported
+  allocation or extreme tiny cells. GPU +2 MiB optional. Atlas direction
+  fades and distant vertical cards are approximations, not true volume.
+- Full-volume canopy a faint distant underlay, no 1400m ring or height
+  cutoff. Canopy-only path unchanged. Slightly stronger fine erosion,
+  pale crown highlights and less heavy baked core shadows.
+- Local portable regression: all four pass with GCC O2/Werror. Actual
+  same-ray triangle intersections + trilinear alpha through ±35° yaw,
+  ±0.30 pitch and scene clip changes: all 98 samples match. Range
+  1800/4200/6000/8000/12000 yields max source radius
+  1665/4005/5445/7065/10665m; disabling billboards at 12000 reaches
+  >11000m. Default flight 7643 source triangles and 76 distant cards;
+  4200m 5200 triangles. Approx. 0.68s one-time atlas bake. Added native
+  D3D9 test with actual atlas geometry past 450m scene clip plus clear/
+  interpolated/wet rendering. Real-game validation still required.
+- Visual regression previews use actual portable density, shells and
+  atlas against synthetic sky, not GTA screenshots. Compare same flight
+  poses, rotate in place and translate slowly, try 4200/8000/12000
+  with independent fog end adjusted accordingly. Compare FPS on weak
+  hardware; longer range increases the scene's alpha fill despite LOD.

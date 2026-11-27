@@ -2,6 +2,7 @@
 // It does NOT mock a device or emulate the rasterizer. If the machine has
 // no usable D3D9 device, CTest marks it skipped (not passed).
 #include "../CloudD3D9.hpp"
+#include "../CloudBillboards.hpp"
 #include <windows.h>
 #include <cstdio>
 #include <cmath>
@@ -231,10 +232,50 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
             visible+=value>8;empty+=value<=2;peak=std::max(peak,value);
         }
         readback->UnlockRect();
-        std::printf("Flight scene x=%.1f y=%.1f z=%.1f: %d planes, %u visible pixels, %u clear pixels, peak %u\n",
+        std::printf("Flight scene x=%.1f y=%.1f z=%.1f: %d shells, %u visible pixels, %u clear pixels, peak %u\n",
             pos.x,pos.y,pos.z,mesh.slices,visible,empty,peak);
         if(visible<desc.Width*desc.Height/64 || (pos.z>settings.maxSpawnZ&&empty<desc.Width*desc.Height/64) || peak<25 || peak>209)
             return fail("Flight scene readback has no cloud/sky contrast");
+    }
+    // Test the actual distant atlas + projected card pipeline on the pure
+    // device, with far fog and weather blending. Only geometry beyond the
+    // 6400m LOD start is submitted; scene far clip remains 450m.
+    billboards::Atlas atlas;atlas.build(settings,volume);
+    std::array<Com<IDirect3DTexture9>,2> farTextures;
+    for(int layer=0;layer<2;++layer) {
+        auto result=d3d9::uploadCanopy(device,atlas.pixels[layer],billboards::AtlasSize,&farTextures[layer].p,false,false);
+        if(!result)return fail(result.operation,result.hr);
+        if(farTextures[layer]->GetLevelCount()!=1)return fail("Atlas must not allocate bleeding mip levels");
+    }
+    View distant{{2164,-1265,490},{1,0,0},{0,0,1},{0,1,0},450,1};
+    banks::Mesh cards;billboards::buildMesh(cards,settings,distant,cloudRange(settings),{},atlas,wx,wy,.5f);
+    if(cards.indices.empty())return fail("No far LOD geometry");
+    auto v=d3d9::identity();v._11=1;v._22=0;v._23=1;v._32=1;v._33=0;
+    v._41=-distant.pos.x;v._42=-distant.pos.z;v._43=-distant.pos.y;
+    D3DMATRIX proj{};proj._11=1.f/wx;proj._22=1.f/wy;proj._33=450.f/449.f;proj._34=1;proj._43=-proj._33;
+    const auto transformFar=d3d9::multiply(v,proj);
+    d3d9::ProjectedMesh farBatch;
+    for(const auto& p:cards.vertices)farBatch.clip.push_back(d3d9::clipVertex(p.pos,p.u,p.v,p.w,p.alpha,p.fog,transformFar));
+    d3d9::projectMesh(farBatch,viewport,{240,240,240},1.f,cards.indices.data(),cards.indices.size());
+    if(farBatch.indices.empty())return fail("Far LOD clipped at scene far plane");
+    auto atlasOpts=opts;atlasOpts.mip=false;
+    for(float coverage:{0.f,.5f,1.f}) {
+        if(FAILED(hr=device->Clear(0,nullptr,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER,0xFF000000,1.f,0)))return fail("Atlas clear",hr);
+        if(FAILED(hr=device->BeginScene()))return fail("Atlas begin",hr);
+        auto result=d3d9::drawProjected(device,{farTextures[0].p,farTextures[1].p},atlasOpts,farBatch,coverage,false,{90,120,160});
+        if(FAILED(hr=device->EndScene()))return fail("Atlas end",hr);
+        if(!result)return fail(result.operation,result.hr);
+        if(FAILED(hr=device->GetRenderTargetData(back.p,readback.p)))return fail("Atlas readback",hr);
+        D3DLOCKED_RECT lock{};
+        if(FAILED(hr=readback->LockRect(&lock,nullptr,D3DLOCK_READONLY)))return fail("Atlas lock",hr);
+        unsigned visible=0;
+        for(UINT y=0;y<desc.Height;++y)for(UINT x=0;x<desc.Width;++x) {
+            DWORD colour=0;std::memcpy(&colour,static_cast<const char*>(lock.pBits)+std::size_t(y)*lock.Pitch+x*4,4);
+            visible+=(colour&255)>2;
+        }
+        readback->UnlockRect();
+        std::printf("Far billboard coverage %.2f: %zu cards, %u visible pixels beyond scene far plane\n",coverage,cards.vertices.size()/4,visible);
+        if(visible<16)return fail("Far LOD not visible on real D3D9 device");
     }
     return 0;
 }

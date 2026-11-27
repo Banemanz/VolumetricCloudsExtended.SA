@@ -35,8 +35,9 @@ pipeline may still need compatibility testing.
 - **Continuous 3D cloud banks (default, mode 2):** the canopy's macro
   coverage drives a periodic, original 3D density field with billowing
   tops, flatter bases, and soft erosion. The nearby field is sampled by
-  bounded back-to-front view slices with absolute world XYZ texture
-  coordinates. Rotation of the camera does not rotate the density.
+  bounded back-to-front radial shells with absolute world XYZ texture
+  coordinates. The world-axis tessellation is independent of camera rotation;
+  the same world ray retains the same samples when looking around.
   `HybridClouds=0` selects the inexpensive original canopy-only renderer.
 - Frustum rejection, independent mode 2 cloud range, smooth range and near fades,
   back-to-front view-depth ordering and bounded RenderWare batches.
@@ -49,7 +50,8 @@ pipeline may still need compatibility testing.
 Fresh installations generate a small, commented INI (also included as
 `VolumetricCloudsExtended.defaults.ini` in the ZIP). Existing INIs are
 never rewritten. Copy the new example over only if you deliberately want
-to reset your settings; otherwise add the three new atmosphere options.
+to reset your settings; otherwise add or update the atmosphere options below. Previous INIs keep their
+old draw and fog distances, and any explicit UseAdditionalTextures setting.
 
 | Setting | Default | Meaning |
 |---|---:|---|
@@ -63,12 +65,15 @@ to reset your settings; otherwise add the three new atmosphere options.
 | WindMoveScale | 0.9 | Wind movement multiplier |
 | Opacity | 1 | Cloud thickness (0–2) |
 | Seed | 17321 | Repeatable cloud pattern |
-| CloudDrawDistance | 4200 | Independent cloud visibility distance in mode 2 (300–12000 world units) |
-| CloudFogStart / CloudFogEnd | 800 / 2800 | Cloud-only colour haze starts/ends here. Equal values disable colour fog. |
+| CloudDrawDistance | 8000 | Independent 3D and distant cloud visibility (300–12000 world units) |
+| FarBillboards | 1 | Beyond the far threshold, transition to cheap volume-projected cards; 0 keeps the full volume |
+| BillboardStartDistance | 5000 | Minimum distance for the billboard transition (5000–12000) |
+| BillboardStartRatio | 0.8 | Also start no sooner than this fraction of CloudDrawDistance (0.5–0.95) |
+| CloudFogStart / CloudFogEnd | 1600 / 8000 | Cloud-only colour haze starts/ends here. Equal values disable colour fog. |
 | CumulusContrast | 0.65 | Strength of baked cloud relief (0–1) |
 | CumulusNightLight | 1 | Cloud night brightness (0–2) |
 | PuffsPerCloud | 5 | Mode 1 only: overlapping puffs per group |
-| UseAdditionalTextures | 1 | Classic modes: use extra textures from particle.txd |
+| UseAdditionalTextures | 0 | Classic modes: opt in to additional textures from particle.txd |
 | CloudTextureNames | cloud2,cloud3,cloud4 | Classic modes: optional extra texture names |
 
 ### Existing INIs and advanced compatibility controls
@@ -103,9 +108,13 @@ To switch an existing installation to the recommended renderer:
 RenderMode=2
 HybridClouds=1
 CumulusDetail=0
-CloudDrawDistance=4200
-CloudFogStart=800
-CloudFogEnd=2800
+CloudDrawDistance=8000
+CloudFogStart=1600
+CloudFogEnd=8000
+FarBillboards=1
+BillboardStartDistance=5000
+BillboardStartRatio=0.8
+UseAdditionalTextures=0
 ```
 
 ## Continuous 3D cloud banks (mode 2, default)
@@ -133,82 +142,96 @@ depth-buffer precision and other mods' rendering remain limitations.
 See Microsoft's [vertex fog documentation](https://learn.microsoft.com/en-us/windows/win32/direct3d9/vertex-fog)
 and [pure-device GetViewport documentation](https://learn.microsoft.com/en-us/windows/win32/api/d3d9/nf-d3d9-idirect3ddevice9-getviewport).
 
-### One density field, not isolated impostors
-
-The 78-view atlas, individual cumulus groups, orientation blending and
-screen-space haze from earlier revisions are removed. The far canopy
-remains unchanged when HybridClouds=0. In the default path it fades
-toward a continuous 3D field derived from the same macro weather map.
+### One density field with orientation-independent samples and far LOD
 
 - **Shape:** original periodic multi-scale 3D noise distorts a smoothed
   version of the canopy coverage. Height envelopes, irregular crowns,
   erosion and a flatter base form continuous banks. XYZ density remains
   in world space, translated by native wind, including during flight.
-- **Lighting:** static optical-depth accumulation down the cloud column
-  and four oblique density taps, a local density gradient and a soft
-  multiple-scattering proxy give finer billow relief, softer shaded cores
-  and brighter edges. Original detailed noise erodes thinner edges.
+- **Lighting:** precomputed optical-depth accumulation down the cloud
+  column and four oblique density taps, a local density gradient and a
+  soft multiple-scattering proxy reveal shaded interiors and billows.
+  Finer erosion and subtle crown highlights add relief, with a lighter
+  scattering floor rather than a global brightness boost.
   Native sky/timecycle RGB and lightning are applied live, with daylight
-  headroom for SA’s post-processing colour filter, especially at dawn. This is approximate baked relief, not dynamic directional
-  shadowing or full multiple scattering.
-- **Rendering:** ordinary hardware-filtered RGBA volume textures
-  (128×128×32 each, clear/overcast endpoints). A bounded stack of
-  parallel view-aligned sample planes carries actual world XYZ texture coordinates.
-  A nested, wind-advected sampling lattice uses 20/40/80 m intervals
-  (14/28/56 m in detail mode). Smooth optical-weight transitions retain
-  the near samples and reduce distant overdraw. A persistent normal has
-  an eight-degree angular dead zone. Beyond it, the sampling planes rotate
-  about the eye rather than the world origin, retaining the sampling phase.
-  Changing camera position or scene clip range cannot rescale the lattice.
-  Large turns still change the finite quadrature orientation, not density.
-  Fixed-function texture stages linearly interpolate the weather endpoints
-  and multiply live vertex RGB/alpha. The indexed triangle list is submitted
-  back-to-front in one draw, with existing scene depth testing, no depth
-  writes, no screen render targets, no 3D noise generation per frame and
-  no custom shaders. The 16×16×8 conservative occupancy map rejects
-  transparent cells including a one-texel filtering halo. The cloud-only
-  range drives the distant layer; the actual 3D bank radius is separately
-  bounded to 1400m for fill-rate economy.
-- **Flight:** the volume exists at its actual sampled depths, including
-  in front of and behind the player/aircraft. Sampling near the eye
-  creates local visibility loss, replacing the depth-unaware
-  full-screen haze. Closest planes fade more gently to prevent one slice
-  suddenly occupying the entire view. InteriorHaze controls the residual
-  near-sample opacity rather
-  than a separate overlay. There may be gaps between slices and banding
-  at very close range. Limited sampling does not provide true per-pixel
-  volumetric integration.
-- **Cost:** one 3D draw (plus one or two existing canopy draws). Economy
-  caps at 60 × 12 × 10 × 2 = 14,400 source triangles in unusually wide
-  custom views, detail 90 planes. Normal views use far fewer: the reference
-  economy flight pose submits 3514 source triangles after rejection versus
-  3374 before the change. Near planes use a 6×5 grid. Projection may split
-  some triangles at the viewport/scene far plane. Cached ray lengths avoid
-  repeated sqrt calls; only referenced vertices are projected.
-  The canopy and volume share one state-block capture/restore per pass.
-  Finer near sampling may increase fill; coarser distance sampling offsets it.
-  Two RGBA volume textures occupy 4 MiB (16 MiB at detail 1); total
-  with mipmapped canopy ~6.67 MiB / ~26.67 MiB, excluding driver overhead.
-  CPU keeps the 4/16 MiB volume pixels and 2/8 MiB canopy source pixels
-  for device restore, plus a tiny occupancy grid and bounded mesh buffers.
-  No recurring texture uploads for weather or lighting.
-  GPU fill rate, particularly inside a thick overcast, matters more than
-  triangle counts. Performance on old/integrated hardware is not measured.
+  headroom for SA’s post-processing colour filter. This is approximate
+  baked relief, not dynamic directional shadowing.
+- **Rendering:** hardware-filtered RGBA volume textures (128×128×32
+  each, clear/overcast endpoints) sampled on concentric shells centred
+  at the current camera position. A static cube-sphere tessellation
+  uses world-axis directions, not the view basis; camera yaw, pitch,
+  FOV and far clip cannot change the world sample locations for a
+  common ray. Translation still changes the integration samples
+  continuously, so finite-sampling aliasing remains possible. Near
+  shells use 16m steps, 6×6 quads per cube face; farther shells
+  use 32/64/90m steps and 12×12 quads (detail: 12/24/48/72m).
+  All distances are fixed, independent of configured range.
+  Frustum rejection is performed once on the angular topology,
+  triangles are clipped to the physical cloud height slab, and the
+  conservative 16×16×8 occupancy grid rejects empty space.
+  Back-to-front radial ordering never changes for a fixed eye.
+  The indexed volume is one fixed-function draw with existing depth
+  testing, no depth writes, no screen render targets, no shaders.
+- **Range:** CloudDrawDistance now controls actual volume geometry.
+  The previous 1400m radius and tile-size-dependent limit are removed.
+  With billboards off, shells extend to the configured range (with
+  squared distance opacity taper beginning at 75%). With far billboards
+  on, the first transition distance is max(5000m, 0.8 × CloudDrawDistance)
+  by default; the transition ends 10% of the draw distance later
+  (at least 350m, not beyond draw distance). At 8000m, that means full
+  3D up to 6400m, blended 3D/cards to 7200m, cards beyond. At 4200m,
+  there are no billboards. The two geometric representations crossfade
+  over distance, not camera height or heading.
+- **Far LOD:** the exact clear/wet volume is projected front-to-back
+  into two small 512² atlases, 16 overlapping periodic world cells ×
+  8 azimuths. Smooth partition-of-unity cell weights reduce seams;
+  the optical integration supplies real volume silhouette and shading,
+  not stock cloud sprites. Upright cards face the *camera position*
+  (not direction), with adjacent azimuth images alpha-crossfaded and
+  radially sorted. The transition is deferred at extreme flight height
+  rather than drawing edge-on upright cards from above. All cards share
+  a single batch. Guards prevent atlas
+  bleeding; no atlas mip chain is allocated. Far LOD is optional, and
+  volume remains active over the full range if the atlas cannot be
+  prepared/uploaded or if unusually tiny cells would require too many
+  cards. Directional blending and slab projection are approximations.
+- **Canopy:** canopy-only mode is unchanged. In full-volume mode the
+  sheet is now a faint distant underlay, gently fading in beyond 58%
+  of the configured range, rather than cutting out a near hole around
+  the 1400m cap and turning off at aircraft height. Its sag is much
+  smaller in hybrid mode. The actual 3D field or volume-derived
+  far cards provide the visible cloud bank. This removes the old
+  hard near-volume / flat-sheet boundary, but finite range and slab
+  thickness can still be noticeable on grazing views.
+- **Cost:** one 3D draw, one far billboard batch only when needed, and
+  one or two canopy draws. Source geometry is guarded below 44k
+  vertices for unusual view/configurations. In the reference economy
+  flight pose, the 4200m setting submits about 5200 triangles and
+  extends to ~4005m; default 8000m submits ~7643 triangles plus 76
+  distant cards. Earlier 1400m-limited version drew 3514 triangles.
+  A 2×2 reduction in near shell tessellation saves geometry where
+  the volume texture supplies detail. At 8000m, only a narrow area
+  of the distant sky is covered by the extra shells. GPU fill rate
+  can still increase significantly, notably inside overcast banks;
+  no old-GPU benchmark is claimed.
+  Economy GPU texture memory: 4 MiB volume + ~2.67 MiB canopy +
+  2 MiB optional far atlas = ~8.67 MiB (detail ~28.67 MiB),
+  excluding driver overhead. CPU source textures retained for reset.
+  No per-frame texture generation, uploads, or full-screen overlay.
 - **Compatibility:** the direct D3D9 draw carries actual three-component
   texture coordinates, not a RenderWare 2D atlas. SA's normal pure-device
   mode is accepted. The SA 1.0 US device pointer and camera matrices are
   read directly (verified against the IDB); the SDK's device getter
   invalidates RW's matrix cache and is deliberately avoided. Pipeline
   state is captured/restored via D3DSBT_ALL, with no prohibited pure-device
-  state getters. RW's pending states are flushed first. Both canopy and
-  banks use native D3D9 textures/vertices in a shared state scope. Volume textures
+  state getters. RW's pending states are flushed first. Canopy, banks and far billboards use native D3D9 textures/vertices in a shared state scope. Volume textures
   are uploaded through system-memory staging into the default pool; a
   managed-pool attempt and smaller power-of-two textures are tried on
   failure. Lower-capability hardware can use point sampling and, only
   if two-volume blending is unavailable, the nearest weather endpoint.
   No volume support or failed draws retain the canopy. Upload failures
   log the precise operation and HRESULT, and a successful first draw
-  logs submitted slice/triangle counts. A one-shot optional asynchronous
+  logs submitted shell/triangle counts. A one-shot optional asynchronous
   GPU occlusion query records depth-passing samples without waiting.
   Device loss/reset and RW shutdown release owned resources.
 - **Initialization:** the original map and volume are generated once on
@@ -258,7 +281,8 @@ output. The expanded tests check cloud-only vertex fog and foreground
 occlusion outside the scene far plane, fog state restoration through a
 subsequent native draw, native mipmapped canopy upload/draw, and the actual
 perspective volume mesh with a 450m scene far clip at positions from the
-flight recording.
+flight recording. The new far-atlas regression draws the actual
+volume-derived cards behind a 450m scene far clip.
 A machine without a volume-capable D3D9 device reports **skipped**,
 not passed. This does not test the GTA camera or integration.
 
@@ -276,8 +300,9 @@ send the new log lines including HRESULT, not only the canopy screenshot.
 | ![Above](docs/previews/banks_above.jpg) | ![Rain](docs/previews/banks_rainflight.jpg) |
 | ![Night](docs/previews/banks_night.jpg) | ![Entry](docs/previews/banks_entry.jpg) |
 | ![Dawn, starting position](docs/previews/banks_dawn.jpg) | ![Dawn, after travel](docs/previews/banks_dawnmove.jpg) |
+| ![1.8 km range](docs/previews/banks_short.jpg) | ![12 km range](docs/previews/banks_long.jpg) |
 
-Actual C++ density textures and slice triangles, software-rendered with
+Actual C++ density textures, radial shell triangles and distant cards, software-rendered with
 trilinear filtering, synthetic sky, not GTA screenshots. They do not
 verify that the game successfully initialized or drew the volume. The last
 user-provided build log does confirm actual in-game 3D output on a pure D3D9

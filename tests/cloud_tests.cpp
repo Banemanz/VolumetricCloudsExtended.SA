@@ -23,6 +23,7 @@ int main() {
     std::ostringstream ini; write(ini,cfg);
     Settings roundtrip; std::istringstream input(ini.str()); load(input,roundtrip);
     CHECK(roundtrip.targetProcClouds==cfg.targetProcClouds && roundtrip.textureNames==cfg.textureNames);
+    CHECK(!roundtrip.useAdditionalTextures && roundtrip.farBillboards && roundtrip.billboardStartDistance==5000.f && roundtrip.billboardStartRatio==.8f);
 
     // Stock cloud vertices use neutral sky luminance, not low-cloud/underside RGB.
     // An old generated INI must not silently restore the overly dark/tinted look.
@@ -58,7 +59,7 @@ int main() {
     CHECK(close(distanceAlpha(r,(r.begin+r.end)*.5f),.5f));
     CHECK(range(cfg,300,2000).end<300);
     const auto independent=cloudRange(cfg);
-    CHECK(independent.end==4200.f && independent.end>view.farClip);
+    CHECK(independent.end==8000.f && independent.end>view.farClip);
     CHECK(cloudFogFactor(cfg,0)==1 && cloudFogFactor(cfg,cfg.cloudFogStart)==1);
     CHECK(close(cloudFogFactor(cfg,(cfg.cloudFogStart+cfg.cloudFogEnd)*.5f),.5f));
     CHECK(cloudFogFactor(cfg,cfg.cloudDrawDistance)==0);

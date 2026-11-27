@@ -1,25 +1,36 @@
 #pragma once
 #include "Canopy.hpp"
 
-// Continuous, world-space density. Small periodic volume texture; no impostors,
-// meshes of individual puffs, view atlas or per-frame procedural noise.
+// Continuous world-space density sampled by camera-position-centred,
+// world-axis tessellated shells. No view-dependent sampling orientation.
 namespace vc::banks {
 constexpr int Width=128, Height=128, Depth=32;
 constexpr int DetailWidth=256,DetailDepth=32;
-// Constant world-distance sampling. Never stretch the sample interval to
-// fit the current frustum: that causes the field to swim during flight.
-// Nested sampling lattice: fine near the player, standard in the middle,
-// coarse at distance. Contributions crossfade without changing positions.
-constexpr float EconomyStep=20.f,DetailStep=14.f;
-constexpr int MaxSlices=60,DetailSlices=90,GridX=12,GridY=10;
+// Sample at fixed radial distances, independent of look direction, FOV,
+// scene far plane, and configured cloud range. For a fixed eye and world ray,
+// the tessellated surface and every sampled XYZ remain identical under a turn.
+constexpr int MaxSlices=156,DetailSlices=200,ShellGrid=12;
 constexpr int OccupancyXY=16,OccupancyZ=8;
 constexpr float ReferenceStep=90.f; // opacity baked for this path length
 struct Vertex {Vec pos;float u{},v{},w{},alpha{},fog{1.f};};
 struct Mesh {std::vector<Vertex> vertices;std::vector<std::uint16_t> indices;int slices{};};
-static_assert(DetailSlices*(GridX+1)*(GridY+1)<65536);
-inline float radius(const Settings& s,const Range& r) {
-    return std::min({canopy::tileWorldSize(s)*.62f,r.end*.90f,1400.f});
+struct Lod {
+    float start{},end{};
+    float billboard(float d) const {return end>start?smooth((d-start)/(end-start)):0.f;}
+    float volume(float d) const {return 1.f-billboard(d);}
+};
+inline Lod lod(const Settings& s,const Range& r,bool available=true,float altitudeOffset=0.f) {
+    if(!s.farBillboards||!available)return {r.end,r.end};
+    // Upright impostors are progressively deferred when viewed steeply
+    // from high altitude; preserve volume for those grazing the top.
+    const float start=std::max({s.billboardStartDistance,r.end*s.billboardStartRatio,std::abs(altitudeOffset)*3.f});
+    if(start>=r.end-1.f)return {r.end,r.end};
+    return {start,std::min(r.end,start+std::max(350.f,r.end*.10f))};
 }
+inline float radius(const Settings& s,const Range& r) {return lod(s,r).end;}
+// Long optical paths accumulate many surfaces; a squared edge taper makes
+// the distant bank gradually dissolve instead of terminating in a bright ring.
+inline float rangeWeight(const Range& r,float d) {const float f=distanceAlpha(r,d);return f*f;}
 inline float random3(int x,int y,int z,int n,int nz,std::uint32_t seed) {
     return float(canopy::hash(canopy::wrap(x,n),canopy::wrap(y,n),seed^
         (std::uint32_t(canopy::wrap(z,nz))*0x9e3779b9u))>>8)*(1.f/16777216.f);
@@ -72,7 +83,7 @@ struct Volume {
             const float topTaper=.065f*smooth((h-base+.01f)/.27f);
             // Erode weak edges with a billow-shaped detail octave instead
             // of coating the whole formation in uniform high-frequency fuzz.
-            const float edgeDetail=(n3-.5f)*(.07f+.045f*(1.f-tower));
+            const float edgeDetail=(n3-.5f)*(.095f+.055f*(1.f-tower));
             const float f=broad+.29f*(n1-.5f)+.165f*(n2-.5f)+edgeDetail-topTaper;
             const auto i=index(x,y,z);
             coverage[i]=f;
@@ -111,12 +122,13 @@ struct Volume {
                     // remain shaded, but the sun-facing crown retains a
                     // broad, pale highlight rather than a grey flat mass.
                     const float trans=std::exp(-.43f*topDepth-.64f*sideDepth);
-                    const float ambient=.22f*std::exp(-.16f*(topDepth+sideDepth))+.78f*trans;
+                    const float ambient=.31f*std::exp(-.13f*(topDepth+sideDepth))+.69f*trans;
                     const float slope=clamp((at(lateralStep,0,0)-at(-lateralStep,0,0)
                         +at(0,lateralStep,0)-at(0,-lateralStep,0))*.5f,-1.f,1.f);
                     const float localRelief=clamp(d-(at(1,0,0)+at(-1,0,0)+at(0,1,0)+at(0,-1,0))*.25f,-.35f,.35f);
                     const float litRim=(1.f-d)*trans;
-                    const float shade=clamp(.995f-s.cumulusContrast*(.64f*(1.f-ambient)+.18f*d+.19f*slope+.22f*localRelief)
+                    const float crownGlow=.055f*trans*smooth((float(z)/depth-base+.09f)/.28f);
+                    const float shade=clamp(.995f+crownGlow-s.cumulusContrast*(.64f*(1.f-ambient)+.15f*d+.23f*slope+.27f*localRelief)
                         +s.cumulusRimStrength*.065f*litRim,.50f,1.f);
                     // Reference alpha for 90m of cloud; individual slices
                     // scale this by their actual path length.
@@ -179,131 +191,155 @@ inline RGB bankLight(const canopy::Light& l,const weather::State& w) {
     const float gain=1.f-l.day*.10f-lowSun*.18f;
     return scaleRGB(l.bright,gain);
 }
-// A world-locked sampling normal with a small angular dead zone. Tilt
-// the lattice only when necessary, about the eye rather than world origin.
-// This removes phase jumps from small changes of pitch/yaw at large XYZ.
-struct SamplingFrame {
-    Vec normal{},lastPos{};
-    double phase{},lastWindX{},lastWindY{};
-    bool ready=false;
-    float lastStep{};
-    void update(const View& view,const canopy::Drift& drift,float step,float baseZ) {
-        const double period=4.0*step;
-        if(!ready||lastStep!=step||length(view.pos-lastPos)>600.f) {
-            normal=view.forward;
-            phase=double(normal.x)*(double(view.pos.x)-drift.worldX)
-                +double(normal.y)*(double(view.pos.y)-drift.worldY)
-                +double(normal.z)*(double(view.pos.z)-baseZ);
-            ready=true;
-        } else {
-            const float angle=std::acos(clamp(dot(normal,view.forward),-1.f,1.f));
-            constexpr float deadZone=8.f*Pi/180.f;
-            if(angle>deadZone) {
-                // Exact slerp to the edge of the dead zone; avoid a slow
-                // catch-up or a zero normal after a large camera cut.
-                const float sinAngle=std::sin(angle);
-                normal=std::abs(sinAngle)<.001f?view.forward:
-                    unit(normal*(std::sin(deadZone)/sinAngle)+view.forward*(std::sin(angle-deadZone)/sinAngle));
+// One immutable cube-sphere triangulation. At fixed eye position the
+// triangles, world-space UVW, alpha and fog are identical during rotation.
+// Frustum culling merely decides which triangles need drawing.
+struct ShellTopology {
+    std::vector<Vec> directions;
+    struct Triangle {std::array<std::uint16_t,3> i;float z0,z1;};
+    std::vector<Triangle> triangles;
+    explicit ShellTopology(int grid) {
+        for(int face=0;face<6;++face) {
+            const auto base=std::uint16_t(directions.size());
+            for(int y=0;y<=grid;++y)for(int x=0;x<=grid;++x) {
+                const float u=2.f*x/grid-1.f,v=2.f*y/grid-1.f;
+                const float sign=face%2?1.f:-1.f;
+                Vec d=face<2?Vec{sign,u,v}:face<4?Vec{u,sign,v}:Vec{u,v,sign};
+                directions.push_back(unit(d));
             }
-            // The transfer phase is insensitive to rotating in place.
-            phase+=double(normal.x)*(double(view.pos.x-lastPos.x)-(drift.worldX-lastWindX))
-                +double(normal.y)*(double(view.pos.y-lastPos.y)-(drift.worldY-lastWindY))
-                +double(normal.z)*double(view.pos.z-lastPos.z);
+            const auto tri=[&](std::uint16_t a,std::uint16_t b,std::uint16_t c) {
+                const float x=directions[a].z,y=directions[b].z,z=directions[c].z;
+                triangles.push_back({{a,b,c},std::min({x,y,z}),std::max({x,y,z})});
+            };
+            for(int y=0;y<grid;++y)for(int x=0;x<grid;++x) {
+                const auto a=std::uint16_t(base+y*(grid+1)+x);
+                const auto b=std::uint16_t(a+1),c=std::uint16_t(a+grid+1),d=std::uint16_t(c+1);
+                tri(a,b,c);tri(b,d,c);
+            }
         }
-        phase-=period*std::floor(phase/period);
-        lastPos=view.pos;lastWindX=drift.worldX;lastWindY=drift.worldY;lastStep=step;
     }
 };
-// Weights are in metres of optical path along the lattice normal. Sum
-// across every four consecutive lattice positions is always 4*step at
-// any fixed blend value. Near 20m, mid 40m, far 80m (detail 14/28/56).
-inline float sampleWeight(int k,float d,float step) {
-    const float fine=1.f-smooth((d-160.f)/200.f);
-    const float coarse=smooth((d-650.f)/350.f);
-    const int parity=((k%4)+4)%4;
-    const float mid=parity%2==0?2.f*(1.f+(parity==0?coarse:-coarse)):0.f;
-    return step*(fine+(1.f-fine)*mid);
+inline const ShellTopology& topology(bool coarse) {static const ShellTopology fine(ShellGrid),nearShell(6);return coarse?nearShell:fine;}
+struct RadialSample {float distance,weight;};
+inline const std::vector<RadialSample>& samples(bool detail) {
+    static const auto make=[](bool high) {
+        std::vector<RadialSample> result;
+        for(float edge=0.f;edge<12000.f;) {
+            const float step=edge<160.f?(high?12.f:16.f):edge<520.f?(high?24.f:32.f):
+                edge<1400.f?(high?48.f:64.f):(high?72.f:90.f);
+            result.push_back({edge+step*.5f,step});edge+=step;
+        }
+        return result;
+    };
+    static const auto low=make(false),high=make(true);
+    return detail?high:low;
+}
+inline Vertex interpolate(const Vertex& a,const Vertex& b,float t) {
+    return {a.pos+(b.pos-a.pos)*t,mix(a.u,b.u,t),mix(a.v,b.v,t),mix(a.w,b.w,t),
+        mix(a.alpha,b.alpha,t),mix(a.fog,b.fog,t)};
+}
+inline unsigned directionMask(Vec d,const View& view,float wx,float wy) {
+    const float z=dot(d,view.forward),x=dot(d,view.right),y=dot(d,view.up);
+    const float e=.0001f;
+    return (z<0.f?1u:0u)|(x < -wx*z-e?2u:0u)|(x> wx*z+e?4u:0u)|
+        (y < -wy*z-e?8u:0u)|(y> wy*z+e?16u:0u);
 }
 inline void buildMesh(Mesh& m,const Settings& s,const View& view,const Range& r,
-                      const canopy::Drift& drift,float wx,float wy,const Volume* volume=nullptr,float weather=0.f,
-                      SamplingFrame* persisted=nullptr) {
+                      const canopy::Drift& drift,float wx,float wy,const Volume* volume=nullptr,
+                      float weather=0.f,bool billboardAvailable=true) {
     m.vertices.clear();m.indices.clear();m.slices=0;
-    const float rad=radius(s,r),band=s.maxSpawnZ-s.minSpawnZ;
-    if(!s.hybridClouds||!s.targetProcClouds||rad<5.f||band<1.f||
-        !std::isfinite(wx)||!std::isfinite(wy)||wx<=0||wy<=0||wx>10.f||wy>10.f||
-        view.pos.z<s.minSpawnZ-r.end||view.pos.z>s.maxSpawnZ+r.end)return;
-    const float step=s.cumulusDetail?DetailStep:EconomyStep;
-    const int cap=s.cumulusDetail?DetailSlices:MaxSlices;
-    SamplingFrame local;
-    auto& grid=persisted?*persisted:local;
-    grid.update(view,drift,step,s.minSpawnZ);
-    // Extremely wide custom FOVs may cross the locked plane's tangent.
-    // In that case use the actual view normal, preserving the phase.
-    constexpr int per=(GridX+1)*(GridY+1);
-    std::array<Vec,per> rays{};
-    std::array<float,per> rayLen{},horizontal{};
-    float minCos=1e9f;
-    auto prepare=[&] {
-        minCos=1e9f;
-        for(int y=0;y<=GridY;++y)for(int x=0;x<=GridX;++x) {
-            const int i=y*(GridX+1)+x;
-            const Vec ray=view.forward+view.right*((2.f*x/GridX-1.f)*wx)+view.up*((1.f-2.f*y/GridY)*wy);
-            const float cosine=dot(ray,grid.normal);
-            minCos=std::min(minCos,cosine);
-            rays[i]=ray/std::max(.01f,cosine);
-            rayLen[i]=length(rays[i]);horizontal[i]=std::sqrt(horizontalSq(rays[i]));
-        }
+    const float band=s.maxSpawnZ-s.minSpawnZ;
+    if(!s.hybridClouds||!s.targetProcClouds||r.end<5.f||band<1.f||
+       !std::isfinite(wx)||!std::isfinite(wy)||wx<=0||wy<=0||wx>10.f||wy>10.f)return;
+    const auto levels=lod(s,r,billboardAvailable,view.pos.z-(s.minSpawnZ+s.maxSpawnZ)*.5f);
+    if(view.pos.z<s.minSpawnZ-levels.end||view.pos.z>s.maxSpawnZ+levels.end)return;
+    constexpr int n=6*(ShellGrid+1)*(ShellGrid+1);
+    const auto visibleFor=[&](const ShellTopology& shell) {
+        std::array<unsigned,n> masks{};
+        for(std::size_t i=0;i<shell.directions.size();++i)masks[i]=directionMask(shell.directions[i],view,wx,wy);
+        std::vector<const ShellTopology::Triangle*> result;
+        result.reserve(shell.triangles.size()/3);
+        for(const auto& tri:shell.triangles)
+            if(!(masks[tri.i[0]]&masks[tri.i[1]]&masks[tri.i[2]]))result.push_back(&tri);
+        return result;
     };
-    prepare();
-    if(minCos<.35f){grid.normal=view.forward;prepare();}
-    const float z0=s.minSpawnZ-view.pos.z,z1=s.maxSpawnZ-view.pos.z;
-    const float lateral=rad*std::sqrt(horizontalSq(grid.normal));
-    // Bounding prism and radial range, independent of game far clip.
-    const float first=std::max(std::max(view.nearClip,8.f)*minCos,std::min(z0*grid.normal.z,z1*grid.normal.z)-lateral);
-    const float last=std::min({r.end,std::max(z0*grid.normal.z,z1*grid.normal.z)+lateral,rad+band});
-    if(last-first<1.f)return;
-    const int firstPlane=int(std::ceil((first+grid.phase)/step));
-    int lastPlane=int(std::floor((last+grid.phase)/step));
-    int candidates=0;
-    for(int k=firstPlane;k<=lastPlane;++k)if(sampleWeight(k,float(k*step-grid.phase),step)>=.1f)
-        if(++candidates>cap){lastPlane=k-1;break;}
+    const auto nearTris=visibleFor(topology(true)),farTris=visibleFor(topology(false));
     const float tile=canopy::tileWorldSize(s);
-    const double uu=double(view.pos.x)/tile-drift.x,vv=double(view.pos.y)/tile-drift.y;
-    const float u0=float(uu-std::floor(uu)),v0=float(vv-std::floor(vv));
-    const float fade=smooth((rad-5.f)/120.f);
-    m.vertices.reserve(std::size_t(cap)*per);m.indices.reserve(std::size_t(cap)*GridX*GridY*6);
-    // Fixed normal distance is used for LOD, not direction-dependent
-    // screen depth. It stays invariant while the camera pans in the dead zone.
-    for(int k=lastPlane;k>=firstPlane;--k) {
-        const float d=float(k*step-grid.phase);
-        // The narrow near slices do not require a high-resolution mesh:
-        // density itself is sampled per pixel. Keep the shared 12x10 ray
-        // table but use 6x5 triangles near the eye, where alpha is smooth.
-        const int stride=d<180.f?2:1;
-        const float weight=sampleWeight(k,d,step);
-        if(weight<.1f)continue;
-        const int start=int(m.vertices.size());
-        for(int i=0;i<per;++i) {
-            const Vec delta=rays[i]*d,pos=view.pos+delta;
-            const float dist=rayLen[i]*d;
-            const float edge=smooth((rad-horizontal[i]*d)/(rad*.34f));
-            const float w=(pos.z-s.minSpawnZ)/band;
-            const float nearWeight=smooth((dist-8.f)/24.f)*mix(smooth((dist-view.nearClip)/std::max(80.f,s.nearFadeDistance)),1.f,s.interiorHaze*.22f);
-            const float a=sat(weight*rayLen[i]/ReferenceStep)*edge*distanceAlpha(r,dist)*nearWeight*fade;
-            m.vertices.push_back({pos,u0+delta.x/tile,v0+delta.y/tile,w,a,cloudFogFactor(s,dist)});
-        }
+    const float u0=float(double(view.pos.x)/tile-drift.x-std::floor(double(view.pos.x)/tile-drift.x));
+    const float v0=float(double(view.pos.y)/tile-drift.y-std::floor(double(view.pos.y)/tile-drift.y));
+    const auto& radial=samples(s.cumulusDetail!=0);
+    std::array<Vertex,n> cache{};
+    std::array<int,n> mapped{};
+    std::array<bool,n> ready{};
+    // The shell intersects the cloud slab in narrow arcs at long distance.
+    // Reject those outside it before making vertices; clip boundary triangles
+    // exactly to the slab, so distant shells do not repeatedly shade empty sky.
+    for(const auto& sample:radial) {
+        const float d=sample.distance;
+        if(d>=levels.end||d<view.nearClip)continue;
+        const float nearWeight=smooth((d-8.f)/24.f)*mix(smooth((d-view.nearClip)/std::max(80.f,s.nearFadeDistance)),1.f,s.interiorHaze*.22f);
+        const float a=sat(sample.weight/ReferenceStep)*rangeWeight(r,d)*levels.volume(d)*nearWeight;
+        if(a<=1.f/255.f)continue;
+        const bool coarse=d<240.f;
+        const auto& shell=topology(coarse);const auto& visible=coarse?nearTris:farTris;
+        const float fog=cloudFogFactor(s,d);
+        mapped.fill(-1);ready.fill(false);
         const auto before=m.indices.size();
-        for(int y=0;y<GridY;y+=stride)for(int x=0;x<GridX;x+=stride) {
-            const auto a=std::uint16_t(start+y*(GridX+1)+x),b=std::uint16_t(a+stride),c=std::uint16_t(a+stride*(GridX+1)),e=std::uint16_t(c+stride);
-            const auto& A=m.vertices[a];const auto& B=m.vertices[b];const auto& C=m.vertices[c];const auto& E=m.vertices[e];
-            if(std::max({A.alpha,B.alpha,C.alpha,E.alpha})<=1.f/255.f ||
-               std::max({A.w,B.w,C.w,E.w})<0.f||std::min({A.w,B.w,C.w,E.w})>1.f)continue;
-            if(volume&&!volume->potentiallyOccupied(
-                 std::min({A.u,B.u,C.u,E.u}),std::min({A.v,B.v,C.v,E.v}),std::min({A.w,B.w,C.w,E.w}),
-                 std::max({A.u,B.u,C.u,E.u}),std::max({A.v,B.v,C.v,E.v}),std::max({A.w,B.w,C.w,E.w}),weather))continue;
-            for(auto i:{a,c,b,b,c,e})m.indices.push_back(i);
+        const float low=(s.minSpawnZ-view.pos.z)/d,high=(s.maxSpawnZ-view.pos.z)/d;
+        for(const auto* tri:visible) {
+            if(tri->z1<low||tri->z0>high)continue;
+            std::array<Vertex,5> poly{},tmp{};
+            for(int q=0;q<3;++q) {
+                const auto i=tri->i[q];
+                if(!ready[i]) {
+                    const Vec delta=shell.directions[i]*d,pos=view.pos+delta;
+                    cache[i]={pos,u0+delta.x/tile,v0+delta.y/tile,(pos.z-s.minSpawnZ)/band,a,fog};
+                    ready[i]=true;
+                }
+                poly[q]=cache[i];
+            }
+            const bool unclipped=tri->z0>=low&&tri->z1<=high;
+            int count=3;
+            if(!unclipped)for(int side=0;side<2&&count>=3;++side) {
+                int out=0;
+                for(int j=0;j<count;++j) {
+                    const auto& p=poly[j];const auto& q=poly[(j+1)%count];
+                    const float dp=side?1.f-p.w:p.w,dq=side?1.f-q.w:q.w;
+                    if(dp>=0.f)tmp[out++]=p;
+                    if((dp<0)!=(dq<0))tmp[out++]=interpolate(p,q,dp/(dp-dq));
+                }
+                poly=tmp;count=out;
+            }
+            if(count<3)continue;
+            if(volume) {
+                float uMin=1e9f,vMin=1e9f,wMin=1e9f,uMax=-1e9f,vMax=-1e9f,wMax=-1e9f;
+                for(int j=0;j<count;++j) {
+                    const auto& p=poly[j];
+                    uMin=std::min(uMin,p.u);uMax=std::max(uMax,p.u);
+                    vMin=std::min(vMin,p.v);vMax=std::max(vMax,p.v);
+                    wMin=std::min(wMin,p.w);wMax=std::max(wMax,p.w);
+                }
+                if(!volume->potentiallyOccupied(uMin,vMin,wMin,uMax,vMax,wMax,weather))continue;
+            }
+            // Leave room for the D3D9 near/far/frustum clipper. Wide custom
+            // view windows are bounded by this guard rather than index wrap.
+            if(m.vertices.size()+std::size_t(count)>44000)break;
+            if(unclipped) {
+                for(auto i:tri->i) {
+                    if(mapped[i]<0){mapped[i]=int(m.vertices.size());m.vertices.push_back(cache[i]);}
+                    m.indices.push_back(std::uint16_t(mapped[i]));
+                }
+            } else {
+                const auto base=std::uint16_t(m.vertices.size());
+                for(int j=0;j<count;++j)m.vertices.push_back(poly[j]);
+                for(int j=1;j+1<count;++j)m.indices.insert(m.indices.end(),{base,std::uint16_t(base+j),std::uint16_t(base+j+1)});
+            }
         }
-        if(m.indices.size()==before)m.vertices.resize(start);else ++m.slices;
+        if(m.indices.size()!=before)++m.slices;
     }
+    // Generate near first so the guarded vertex budget preserves nearby
+    // density in extreme custom configurations; draw far first. Reversing
+    // triangle winding is harmless (the cloud pass disables culling).
+    std::reverse(m.indices.begin(),m.indices.end());
 }
 } // namespace vc::banks

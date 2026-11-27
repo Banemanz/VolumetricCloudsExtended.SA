@@ -13,7 +13,7 @@ if(BUILD_ASI)
     if(NOT EXISTS "${PLUGIN_SDK_LIB}")
         message(FATAL_ERROR "Build Plugin-SDK Release first: ${PLUGIN_SDK_LIB}")
     endif()
-    add_library(VolumetricCloudsExtended SHARED main.cpp CloudCore.hpp CloudWeather.hpp Canopy.hpp CloudBanks.hpp CloudD3D9.hpp)
+    add_library(VolumetricCloudsExtended SHARED main.cpp CloudCore.hpp CloudWeather.hpp Canopy.hpp CloudBanks.hpp CloudBillboards.hpp CloudD3D9.hpp)
     target_compile_features(VolumetricCloudsExtended PRIVATE cxx_std_23)
     target_compile_definitions(VolumetricCloudsExtended PRIVATE
         GTASA RW PLUGIN_SGV_10US NOMINMAX

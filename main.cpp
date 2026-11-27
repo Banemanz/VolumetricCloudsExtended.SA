@@ -12,6 +12,7 @@
 #include "CTxdStore.h"
 #include "CScene.h"
 #include "CloudD3D9.hpp"
+#include "CloudBillboards.hpp"
 #include <cstdio>
 #include <new>
 
@@ -35,7 +36,12 @@ int canopySize=0;
 std::array<bool,2> canopyHasPixels{};
 vc::d3d9::Options canopyOptions;
 vc::d3d9::ProjectedMesh canopyProjected,bankProjected;
-vc::banks::SamplingFrame bankSampling;
+vc::billboards::Atlas billboardAtlas;
+vc::banks::Mesh billboardMesh;
+vc::d3d9::ProjectedMesh billboardProjected;
+std::array<IDirect3DTexture9*,2> billboardTextures{};
+vc::d3d9::Options billboardOptions;
+bool billboardPrepared=false,billboardFailed=false;
 bool canopyReady=false;
 vc::canopy::Drift canopyDrift;
 bool canopyAttempted=false,canopyUploadFailed=false;
@@ -61,11 +67,14 @@ void ReleaseBankTextures() {
         if(texture)texture->Release();
         texture=nullptr;
     }
+    for(auto& texture:billboardTextures){if(texture)texture->Release();texture=nullptr;}
+    billboardFailed=false;
     bankDevice=nullptr;bankFailed=false;bankDrawLogged=false;bankEmptyLogged=false;
 }
 void ReleaseBanks() {
     ReleaseBankTextures();
-    bankVolume={};bankMesh={};bankSampling={};bankProjected={};bankPrepared=false;
+    bankVolume={};bankMesh={};bankProjected={};bankPrepared=false;
+    billboardAtlas={};billboardMesh={};billboardProjected={};billboardPrepared=false;
 }
 
 std::filesystem::path ModulePath() {
@@ -124,7 +133,12 @@ bool EnsureCanopy() {
                 vc::canopy::Map map;map.build(size,std::uint32_t(settings.seed));
                 map.shadeWeatherLayers(settings);
                 if(settings.hybridClouds) {
-                    try {bankVolume.build(settings,map);bankPrepared=true;}
+                    try {bankVolume.build(settings,map);bankPrepared=true;
+                        if(vc::billboards::eligible(settings,vc::cloudRange(settings))) {
+                            try {billboardAtlas.build(settings,bankVolume);billboardPrepared=true;}
+                            catch(const std::bad_alloc&) {billboardAtlas={};Log("Far billboard bake allocation failed; retaining full volume.");}
+                        }
+                    }
                     catch(const std::bad_alloc&) {ReleaseBanks();bankFailed=true;Log("3D density allocation failed; using canopy.");}
                 }
                 canopyPixels[0]=std::move(map.pixels);canopyPixels[1]=std::move(map.extraPixels);
@@ -233,10 +247,33 @@ bool EnsureBanks() {
     return fail();
 }
 
+bool EnsureBillboards() {
+    if(!billboardPrepared||billboardFailed||!bankDevice)return false;
+    if(billboardTextures[0]&&billboardTextures[1])return true;
+    billboardOptions=canopyOptions;
+    billboardOptions.dual=bankOptions.dual;
+    billboardOptions.blendOp=bankOptions.blendOp;
+    // Atlas gutter keeps bilinear taps in each image; don't use deep
+    // atlas mips which could blend unrelated neighboring cells.
+    billboardOptions.mip=false;
+    try {
+        for(int i=0;i<2;++i) {
+            auto result=vc::d3d9::uploadCanopy(bankDevice,billboardAtlas.pixels[i],vc::billboards::AtlasSize,&billboardTextures[i],false,false);
+            if(!result)result=vc::d3d9::uploadCanopy(bankDevice,billboardAtlas.pixels[i],vc::billboards::AtlasSize,&billboardTextures[i],true,false);
+            if(!result) {LogD3DFailure("far billboard upload",result);throw std::bad_alloc();}
+        }
+        const auto lod=vc::banks::lod(settings,vc::cloudRange(settings));
+        char msg[160];std::snprintf(msg,sizeof(msg),"Far cloud LOD ready: volume-projected billboards, transition %.0f-%.0f.",lod.start,lod.end);Log(msg);
+        return true;
+    } catch(const std::bad_alloc&) {
+        for(auto& t:billboardTextures){if(t)t->Release();t=nullptr;}
+        billboardFailed=true;Log("Far cloud LOD unavailable; retaining full 3D distance.");return false;
+    }
+}
+
 void ResetField() {
     field.reset(settings);
     canopyDrift={};
-    bankSampling={};
     haveFrame=false;
 }
 
@@ -381,6 +418,25 @@ bool DrawCanopy(const vc::View& view,const vc::Range& range,float hybridFade,
     }
     return true;
 }
+
+bool DrawBillboards(const vc::View& view,const vc::Range& range,const vc::weather::State& climate,
+                    const vc::canopy::Light& light,const D3DMATRIX& transform,
+                    const D3DVIEWPORT9& viewport,vc::RGB fog,float wx,float wy) {
+    const float visibility=vc::weather::visibility(climate)*vc::weather::clearOpacity(climate);
+    if(visibility<=1.f/255.f)return true;
+    vc::billboards::buildMesh(billboardMesh,settings,view,range,canopyDrift,billboardAtlas,wx,wy,
+        billboardOptions.dual?climate.coverage:(climate.coverage>=.5f?1.f:0.f));
+    if(billboardMesh.indices.empty())return true;
+    billboardProjected.clip.clear();billboardProjected.clip.reserve(billboardMesh.vertices.size());
+    for(const auto& v:billboardMesh.vertices)billboardProjected.clip.push_back(vc::d3d9::clipVertex(
+        v.pos,v.u,v.v,v.w,v.alpha*(billboardOptions.vertexFog?1.f:v.fog),v.fog,transform));
+    vc::d3d9::projectMesh(billboardProjected,viewport,vc::banks::bankLight(light,climate),visibility,
+        billboardMesh.indices.data(),billboardMesh.indices.size());
+    const auto result=vc::d3d9::drawProjected(bankDevice,{billboardTextures[0],billboardTextures[1]},billboardOptions,
+        billboardProjected,climate.coverage,false,fog,true,false);
+    if(!result){LogD3DFailure("far billboard draw",result);billboardFailed=true;return false;}
+    return true;
+}
 bool DrawBanks(RwCamera* camera,const vc::View& view,const vc::Range& range,
                const vc::weather::State& climate,const vc::canopy::Light& light,
                const D3DMATRIX& transform,const D3DVIEWPORT9& viewport,vc::RGB fog) {
@@ -390,7 +446,12 @@ bool DrawBanks(RwCamera* camera,const vc::View& view,const vc::Range& range,
     const auto* offset=RwCameraGetViewOffset(camera);
     const float wx=window->x+(offset?std::abs(offset->x):0.f),
                 wy=window->y+(offset?std::abs(offset->y):0.f);
-    try {vc::banks::buildMesh(bankMesh,settings,view,range,canopyDrift,wx,wy,bankDownsampled?nullptr:&bankVolume,bankOptions.dual?climate.coverage:(climate.coverage>=.5f?1.f:0.f),&bankSampling);}
+    bool farReady=EnsureBillboards();
+    try {
+        if(farReady)farReady=DrawBillboards(view,range,climate,light,transform,viewport,fog,wx,wy);
+        vc::banks::buildMesh(bankMesh,settings,view,range,canopyDrift,wx,wy,bankDownsampled?nullptr:&bankVolume,
+            bankOptions.dual?climate.coverage:(climate.coverage>=.5f?1.f:0.f),farReady);
+    }
     catch(const std::bad_alloc&) {bankFailed=true;Log("3D cloud slice allocation failed.");return false;}
     if(bankMesh.indices.empty()) {
         if(!bankEmptyLogged&&!bankDrawLogged){Log("3D cloud bank ready; no occupied slices in current camera frustum yet.");bankEmptyLogged=true;}
@@ -423,7 +484,7 @@ bool DrawBanks(RwCamera* camera,const vc::View& view,const vc::Range& range,
     if(!result){LogD3DFailure("draw",result);return false;}
     if(!bankDrawLogged) {
         char info[256];
-        std::snprintf(info,sizeof(info),"3D cloud draw submitted: %d adaptive planes, %lu triangles, camera Z=%.1f, coverage=%.2f.",
+        std::snprintf(info,sizeof(info),"3D cloud draw submitted: %d radial shells, %lu triangles, camera Z=%.1f, coverage=%.2f.",
             bankMesh.slices,static_cast<unsigned long>(bankProjected.indices.size()/3),view.pos.z,climate.coverage);
         Log(info);bankDrawLogged=true;
     }
@@ -616,7 +677,7 @@ public:
         plugin::Events::d3dLostEvent += ReleaseCanopyTextures;
         plugin::Events::d3dResetEvent += ReleaseBankTextures;
         plugin::Events::d3dResetEvent += ReleaseCanopyTextures;
-        Log(settings.renderMode==2 ? "Procedural volumetric cloud renderer installed (SA 1.0 US, adaptive D3D9 volume banks, independent cloud atmosphere, pure-device compatible)." : settings.lightingMode==0
+        Log(settings.renderMode==2 ? "Procedural volumetric cloud renderer installed (SA 1.0 US, radial D3D9 volume banks, far cloud LOD, independent cloud atmosphere, pure-device compatible)." : settings.lightingMode==0
             ? "Procedural volumetric cloud renderer installed (SA 1.0 US, native lighting)."
             : "Procedural volumetric cloud renderer installed (SA 1.0 US, custom lighting).");
     }

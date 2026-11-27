@@ -64,11 +64,11 @@ inline Result upload(IDirect3DDevice9* device,const banks::Volume& volume,int la
 // Build the distant 2D layer with ordinary RGBA mipmaps, without relying on
 // private RenderWare raster structures. Alpha-weighted colour avoids halos.
 inline Result uploadCanopy(IDirect3DDevice9* device,const std::vector<canopy::Pixel>& pixels,
-                          UINT size,IDirect3DTexture9** out,bool managed=false) {
+                          UINT size,IDirect3DTexture9** out,bool managed=false,bool mipmaps=true) {
     *out=nullptr;
     std::vector<canopy::Pixel> mip=pixels;
     IDirect3DTexture9* stage=nullptr;
-    HRESULT hr=device->CreateTexture(size,size,0,0,D3DFMT_A8R8G8B8,
+    HRESULT hr=device->CreateTexture(size,size,mipmaps?0:1,0,D3DFMT_A8R8G8B8,
         managed?D3DPOOL_MANAGED:D3DPOOL_SYSTEMMEM,&stage,nullptr);
     if(FAILED(hr))return failed(hr,"CreateTexture(canopy)");
     UINT n=size;
@@ -84,7 +84,7 @@ inline Result uploadCanopy(IDirect3DDevice9* device,const std::vector<canopy::Pi
             std::memcpy(static_cast<char*>(lock.pBits)+std::size_t(y)*lock.Pitch+x*sizeof(DWORD),&argb,sizeof(argb));
         }
         if(FAILED(hr=stage->UnlockRect(level))){stage->Release();return failed(hr,"UnlockRect(canopy)");}
-        if(n==1)break;
+        if(n==1||level+1==stage->GetLevelCount())break;
         // In-place 2x2 downsample: each source quartet is read before
         // overwriting an earlier destination. All channels are greyscale.
         const UINT next=n/2;
@@ -100,7 +100,7 @@ inline Result uploadCanopy(IDirect3DDevice9* device,const std::vector<canopy::Pi
         n=next;
     }
     if(managed){*out=stage;return {};}
-    hr=device->CreateTexture(size,size,0,0,D3DFMT_A8R8G8B8,D3DPOOL_DEFAULT,out,nullptr);
+    hr=device->CreateTexture(size,size,mipmaps?0:1,0,D3DFMT_A8R8G8B8,D3DPOOL_DEFAULT,out,nullptr);
     if(FAILED(hr)){stage->Release();return failed(hr,"CreateTexture(DEFAULT canopy)");}
     hr=device->UpdateTexture(stage,*out);stage->Release();
     if(FAILED(hr)){(*out)->Release();*out=nullptr;return failed(hr,"UpdateTexture(canopy)");}

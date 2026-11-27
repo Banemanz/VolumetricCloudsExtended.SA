@@ -222,7 +222,7 @@ inline Mesh mesh(const Settings& s,const View& v,const Range& r,const Drift& dri
     const float base=altitude(s),radius=r.end*.96f;
     // A very shallow sag at the horizon, zero camera tilt. Recenter XY only;
     // UVs are derived from world XY and thus never rotate or slide with the view.
-    const float sag=std::min((s.maxSpawnZ-s.minSpawnZ)*.55f,radius*.14f);
+    const float sag=std::min((s.maxSpawnZ-s.minSpawnZ)*.55f,radius*.14f)*(connected?mix(1.f,.12f,hybridFade):1.f);
     const float tile=tileWorldSize(s);
     const double u=double(v.pos.x)/tile-drift.x,vv=double(v.pos.y)/tile-drift.y;
     const float originU=float(u-std::floor(u)),originV=float(vv-std::floor(vv));
@@ -232,12 +232,14 @@ inline Mesh mesh(const Settings& s,const View& v,const Range& r,const Drift& dri
         const Vec p{v.pos.x+delta.x,v.pos.y+delta.y,base-sag*f*f};
         const float dist=length(p-v.pos);
         const float a=smooth(dist/fade)*smooth((1.f-f)/.18f)*distanceAlpha(r,dist);
-        const float blend=hybridRadius>0.f?1.f-(connected?1.f:.83f)*hybridFade*
-            smooth((hybridRadius-length(delta))/(hybridRadius*(connected?.32f:.38f))):1.f;
-        // At aircraft altitude a flat horizon ring is especially obvious.
-        // The original canopy-only fallback remains unchanged.
-        const float above=smooth((v.pos.z-base)/180.f);
-        return Vertex{p,originU+delta.x/tile,originV+delta.y/tile,a*strength*blend*(1.f-above*hybridFade*(connected?.95f:1.f))};
+        // Full-volume mode no longer carves a hard near hole in a separate
+        // flat cloud plane, or kills the entire sheet at flight altitude.
+        // The faint distant underlay follows the radial range; the actual
+        // density field (or its volume-projected billboards) supplies shape.
+        const float blend=connected&&hybridFade>0.f
+            ?mix(1.f,.22f*smooth((dist-r.end*.58f)/(r.end*.29f)),hybridFade)
+            :hybridRadius>0.f?1.f-.83f*hybridFade*smooth((hybridRadius-length(delta))/(hybridRadius*.38f)):1.f;
+        return Vertex{p,originU+delta.x/tile,originV+delta.y/tile,a*strength*blend};
     };
     m.vertices[0]=vertex({},0);
     for(int ring=1;ring<=Rings;++ring) {

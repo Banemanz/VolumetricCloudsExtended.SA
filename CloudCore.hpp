@@ -40,7 +40,9 @@ struct Settings {
     float minSpawnZ = 200.f, maxSpawnZ = 650.f;
     float spawnRadiusMin = 300.f, spawnRadiusMax = 2200.f;
     float renderMaxDist = 2200.f, respawnMaxDist = 2800.f; // legacy cards only
-    float cloudDrawDistance = 4200.f, cloudFogStart = 800.f, cloudFogEnd = 2800.f; // mode 2 independent atmosphere
+    float cloudDrawDistance = 8000.f, cloudFogStart = 1600.f, cloudFogEnd = 8000.f; // mode 2 independent atmosphere
+    bool farBillboards = true; // distant volume-projected impostors
+    float billboardStartDistance = 5000.f, billboardStartRatio = .80f;
     float windMoveScale = .9f, minSpacing2D = 45.f, spawnFadeInSpeed = .02f;
     float quadFacingMin = .2f, farClipFadeRange = 450.f, farClipFadeMargin = 80.f;
     float timecycFarClipScale = 1.8f;
@@ -48,7 +50,7 @@ struct Settings {
     bool useTimecycTint = true;
     float timecycTintStrength = .20f, fluffyCloudBottomBlend = 0.f;
     int colorBrightnessBoost = 64;
-    bool useAdditionalTextures = true, includeOriginalTextureInRandom = true;
+    bool useAdditionalTextures = false, includeOriginalTextureInRandom = true;
     std::vector<std::string> textureNames{"cloud2", "cloud3", "cloud4"};
     int renderMode = 2, puffsPerCloud = 5; // 0: crossed, 1: clustered, 2: connected 3D cloud bank + canopy
     float cumulusDensity = .95f, cumulusContrast = .65f, cumulusRimStrength = .85f;
@@ -87,6 +89,7 @@ inline bool boolean(const std::string& s, bool& v) {
     X(MinSpawnZ,minSpawnZ,-500.f,5000.f) X(MaxSpawnZ,maxSpawnZ,-500.f,6000.f) \
     X(SpawnRadiusMin,spawnRadiusMin,0.f,20000.f) X(SpawnRadiusMax,spawnRadiusMax,50.f,20000.f) \
     X(CloudDrawDistance,cloudDrawDistance,300.f,12000.f) X(CloudFogStart,cloudFogStart,0.f,12000.f) X(CloudFogEnd,cloudFogEnd,0.f,12000.f) \
+    X(BillboardStartDistance,billboardStartDistance,5000.f,12000.f) X(BillboardStartRatio,billboardStartRatio,.5f,.95f) \
     X(RenderMaxDist,renderMaxDist,100.f,20000.f) X(RespawnMaxDist,respawnMaxDist,150.f,25000.f) \
     X(WindMoveScale,windMoveScale,0.f,50.f) X(MinSpacing2D,minSpacing2D,0.f,2000.f) \
     X(SpawnFadeInSpeed,spawnFadeInSpeed,.001f,1.f) X(QuadFacingMin,quadFacingMin,0.f,1.f) \
@@ -102,7 +105,7 @@ inline bool boolean(const std::string& s, bool& v) {
     X(PuffsPerCloud,puffsPerCloud,1,MaxPuffs) X(Seed,seed,1,16777215)
 #define VC_BOOLS(X) X(UseTimecycTint,useTimecycTint) X(UseAdditionalTextures,useAdditionalTextures) \
     X(IncludeOriginalTextureInRandom,includeOriginalTextureInRandom) X(UseGameFog,useGameFog) \
-    X(HybridClouds,hybridClouds)
+    X(HybridClouds,hybridClouds) X(FarBillboards,farBillboards)
 
 inline void load(std::istream& in, Settings& c) {
     std::string line;
@@ -165,14 +168,17 @@ inline void write(std::ostream& out, const Settings& c) {
     FIELD(Opacity,opacity,"Overall cloud thickness (0 = invisible, 1 = normal, 2 = thicker).")
     FIELD(Seed,seed,"Change this number for a different repeatable cloud pattern.")
     out << "\n[Atmosphere]\n";
-    FIELD(CloudDrawDistance,cloudDrawDistance,"Mode 2: cloud-only visibility distance, independent of the world's draw distance.")
+    FIELD(CloudDrawDistance,cloudDrawDistance,"Mode 2: visibility of 3D clouds and distant layers, independent of the world.")
+    FIELD(FarBillboards,farBillboards,"Mode 2: replace very distant 3D clouds with baked cloud images (1 = recommended; 0 = full volume).")
+    FIELD(BillboardStartDistance,billboardStartDistance,"Minimum distance before the far billboard transition may start (at least 5000).")
+    FIELD(BillboardStartRatio,billboardStartRatio,"Also start no sooner than this fraction of CloudDrawDistance (0.8 = 80%).")
     FIELD(CloudFogStart,cloudFogStart,"Mode 2: distance where clouds begin to blend into the sky.")
     FIELD(CloudFogEnd,cloudFogEnd,"Mode 2: distance where cloud colour fully blends into the sky. Set equal to CloudFogStart to disable colour fog.")
     FIELD(CumulusContrast,cumulusContrast,"Mode 2: cloud shading strength (0 = flat, 1 = stronger shadows).")
     FIELD(CumulusNightLight,cumulusNightLight,"Mode 2: cloud brightness at night (0 = black, 1 = normal, 2 = brighter).")
     out << "\n[ClassicModes]\n; Only used with RenderMode=0 or 1 (or if procedural textures cannot load).\n";
     FIELD(PuffsPerCloud,puffsPerCloud,"Mode 1: number of overlapping puffs per group (1-8).")
-    FIELD(UseAdditionalTextures,useAdditionalTextures,"Use extra textures from particle.txd if present.")
+    FIELD(UseAdditionalTextures,useAdditionalTextures,"Opt in to extra textures from particle.txd; configure the names below first.")
 #undef FIELD
     out << "; Comma-separated extra texture names; missing ones are ignored.\nCloudTextureNames=";
     for (std::size_t i=0;i<c.textureNames.size();++i) out << (i?",":"") << c.textureNames[i];
