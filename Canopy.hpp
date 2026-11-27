@@ -153,9 +153,11 @@ struct Refresh {
 };
 struct Drift {
     double x=0.,y=0.; // wrapped world displacement in tile units
+    double worldX=0.,worldY=0.; // unwrapped displacement for fixed world cells
     void update(const Settings& s,Vec wind,float dt) {
         if(!finite(wind) || !std::isfinite(dt)) return;
         const double k=double(clamp(dt,0.f,5.f))*s.windMoveScale/tileWorldSize(s);
+        worldX+=wind.x*k*tileWorldSize(s);worldY+=wind.y*k*tileWorldSize(s);
         x+=wind.x*k;y+=wind.y*k;x-=std::floor(x);y-=std::floor(y);
     }
 };
@@ -179,7 +181,7 @@ inline float flightWeight(const Settings& s,const View& v) {
     const float fade=std::max(70.f,s.nearFadeDistance+55.f);
     return 1.f-smooth(std::abs(v.pos.z-altitude(s))/fade);
 }
-inline Mesh mesh(const Settings& s,const View& v,const Range& r,const Drift& drift) {
+inline Mesh mesh(const Settings& s,const View& v,const Range& r,const Drift& drift,float hybridRadius=0.f,float hybridFade=0.f) {
     Mesh m;
     const float base=altitude(s),radius=r.end*.96f;
     // A very shallow sag at the horizon, zero camera tilt. Recenter XY only;
@@ -194,7 +196,11 @@ inline Mesh mesh(const Settings& s,const View& v,const Range& r,const Drift& dri
         const Vec p{v.pos.x+delta.x,v.pos.y+delta.y,base-sag*f*f};
         const float dist=length(p-v.pos);
         const float a=smooth(dist/fade)*smooth((1.f-f)/.18f)*distanceAlpha(r,dist);
-        return Vertex{p,originU+delta.x/tile,originV+delta.y/tile,a*strength};
+        const float blend=hybridRadius>0.f?1.f-.83f*hybridFade*smooth((hybridRadius-length(delta))/(hybridRadius*.38f)):1.f;
+        // At aircraft altitude a flat horizon ring is especially obvious.
+        // The original canopy-only fallback remains unchanged.
+        const float above=smooth((v.pos.z-base)/180.f);
+        return Vertex{p,originU+delta.x/tile,originV+delta.y/tile,a*strength*blend*(1.f-above*hybridFade)};
     };
     m.vertices[0]=vertex({},0);
     for(int ring=1;ring<=Rings;++ring) {

@@ -49,11 +49,12 @@ struct Settings {
     int colorBrightnessBoost = 64;
     bool useAdditionalTextures = true, includeOriginalTextureInRandom = true;
     std::vector<std::string> textureNames{"cloud2", "cloud3", "cloud4"};
-    int renderMode = 2, puffsPerCloud = 5; // 0: crossed, 1: clustered, 2: canopy
+    int renderMode = 2, puffsPerCloud = 5; // 0: crossed, 1: clustered, 2: hybrid density + canopy
     float cumulusDensity = .95f, cumulusContrast = .65f, cumulusRimStrength = .85f;
+    bool hybridClouds = true; // mode 2: original density-baked cloud formations
     bool cumulusImpostors = true; // legacy INI compatibility; mode 2 is always world-fixed
     float cumulusNightLight = 1.f;
-    int cumulusDetail = 0; // 0: 512x512, 1: 1024x1024
+    int cumulusDetail = 0; // 0: economy, 1: higher texture detail
     int canopyFlightClouds = 0; // optional native crossed groups in the layer
     float sizeScale = 1.f, opacity = 1.f, nearFadeDistance = 25.f;
     float bottomShade = 1.f, hazeStrength = 0.f;
@@ -100,7 +101,7 @@ inline bool boolean(const std::string& s, bool& v) {
     X(PuffsPerCloud,puffsPerCloud,1,MaxPuffs) X(CanopyFlightClouds,canopyFlightClouds,0,24) X(Seed,seed,1,16777215)
 #define VC_BOOLS(X) X(UseTimecycTint,useTimecycTint) X(UseAdditionalTextures,useAdditionalTextures) \
     X(IncludeOriginalTextureInRandom,includeOriginalTextureInRandom) X(UseGameFog,useGameFog) \
-    X(CumulusImpostors,cumulusImpostors)
+    X(CumulusImpostors,cumulusImpostors) X(HybridClouds,hybridClouds)
 
 inline void load(std::istream& in, Settings& c) {
     std::string line;

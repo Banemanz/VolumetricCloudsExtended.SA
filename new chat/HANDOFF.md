@@ -363,3 +363,120 @@ Fresh INIs (and INIs without RenderMode) default to 2. No external assets.
   Check log for successful texture initialization, compare visual and
   performance with modes 0/1 and optional detail 1. Profile on actual weak
   GPU before claiming measured minimum hardware.
+
+## Follow-up: original 3D density-baked hybrid (mode 2), 2026-11-27
+
+User supplied a GTA V executable and `New folder (2).zip` containing
+cloud-related resources as reference, explicitly wanted original clouds
+rather than an asset conversion, and asked to continue improving PR #1.
+Prior mode 2 was a flat canopy. Keep the same SA 1.0 US hook, exact SDK
+pin 624a6a49265fd7a6fc63bda1611013ceabeacb8a, native weather/camera
+constraints, and modes 0/1. Mode 2 with HybridClouds=0 is the previous
+canopy-only fallback. No proprietary assets or extracted code included.
+
+### Reference investigation
+
+- Supplied GTA V executable metadata: x64 version 1.0.3889.0; RSDS debug
+  directory references game_win64_master.pdb (GUID
+  b41a0c8a-a6aa-4ff0-b955-f47cb30f481c, age 1), not the PDB itself.
+  Strings and the XML identify sky and cloud-hat systems; this does not
+  reveal a complete renderer or shader implementation.
+- Archive: 83 files; clouds.xml describes 20 named presets including
+  Puffs, Wispy, Cloudy, Nimbus, cirrus and storm/rain. Layers contain
+  altitude triggers/fade ranges, cost factors, UV animation and transition
+  settings. Puffs has three principal drawables, a horizon ring and two
+  altitude layers. cloudkeyframes.xml has 14 clock times and controls for
+  ambient, bounce, sun, density, normal strength, thickness and scattering.
+- RSC7 headers and zlib payloads decoded in memory; inspected only geometry
+  metadata using offsets checked against CodeWalker Drawable.cs
+  (DrawableBase, DrawableModelsBlock, DrawableModel, DrawableGeometry).
+  Resource system pointer base 0x50000000; graphics base 0x60000000.
+  Model list pointer at drawable +0x50, list count at +8,
+  model geometry list ptr +8/count +16; geometry index/triangle counts
+  +0x58/+0x5c, vertex count +0x60, vertex stride +0x70.
+  Verified original vertex/triangle counts:
+
+  | Reference | Vertices | Triangles |
+  |---|---:|---:|
+  | cloudhat_cloudy_a | 67 | 53 |
+  | cloudhat_puff_a | 437 | 704 |
+  | cloudhat_puff_b | 337 | 467 |
+  | cloudhat_puff_c | 325 | 468 |
+  | cloudhat_wispy_a | 1053 | 1920 |
+  | cloudhat_stormy01_a (2 geometries total) | 328 | 480 |
+  | horizonring | 455 | 768 |
+
+  All inspected geometries have 52-byte vertex stride. Puffs A/B/C
+  bounding heights: approx 0–1.2, 0.9–2.3, 1.4–2.4 resource units, with
+  much wider horizontal extent. This demonstrates stacked mesh layers,
+  not that the full GTA V volumetric/cloud shading algorithm is known.
+  No vertex buffers, pictures, model geometry or shader bytes were
+  exported or committed. This motivates multi-layer geometry, distinct
+  far canopy and near forms, and time-dependent lighting.
+- Reviewed primary GitHub references: CodeWalker Drawable.cs, Texture.cs,
+  ResourceFile.cs, YdrFile.cs; prior Quake III, OpenMW, SimGear sources.
+  Additional research context: Harris/Lastra real-time cloud impostors,
+  directional precomputed scattering as a period-appropriate technique.
+  Original implementation rather than copied code.
+
+### Implementation
+
+- CloudVolumes.hpp is portable, deterministic, RW-independent. Three
+  64³ generated fields with 25 smoothly joined eroded lobes each, radial
+  guard fade to prevent rectangular clipping, six cardinal extinction
+  coefficient fields. 26 world-space capture directions per form:
+  8 azimuths × 3 elevations (−60, 0, +60) plus poles. True CPU optical
+  integration of coherent density and light basis, depth weighted by
+  front-to-back alpha. 78 captures total.
+- Economy 96-pixel slots in 1024² RGBA raster, detail 128 in 2048×1024,
+  transparent 2-pixel gutters and empty atlas slots. No mipmap bleeding.
+  Atlas output has no game assets. Coefficients store 8 bytes/texel
+  (alpha, 6 directional response channels, signed depth), separately
+  shaded to ordinary RGBA. Dynamic sun response samples cardinal bases
+  rather than tracing again; approximation, not exact light ray solution.
+  Night follows native sky palette and does not retain bright sunlight
+  floor. Day ambient bounce and edges restrained, no additive halo.
+- 5×5 world-fixed grids (32 tris) per capture; depth proxy uses locally
+  alpha-weighted average integrated depth. Angular triangle interpolation
+  blends up to 3 neighboring fixed capture meshes, suppresses glancing
+  views; weights depend on eye-to-center position, not camera orientation.
+  Fixed order within groups; alpha optical split approximate. Compare
+  same-cloud orbit montage; still not genuine 3D correspondence at
+  arbitrary close angles. Fade into interior; future local 3D density
+  haze is a possible separate iteration.
+- Stateless jittered world cells at 440m default, actual world displacement
+  shared with canopy wrapped UV drift. Absolute altitude and random
+  archetype/size fixed per cell. Weather threshold from macro canopy
+  density, soft radial/range/inside fades. Radius min(1480*SizeScale,
+  .84*range.end). Maximum 48 groups; test position 25 clear/32 rainy.
+  Geometry worst-case 5088 triangles incl. canopy, before frustum cull;
+  480-vertex/1920-index bounded batches using standard RW Im3D and saved
+  render states. Atlas and canopy use separate ordinary rasters. No
+  shader, per-frame raymarch, new DLL dependencies, GPU render target,
+  GPU 3D texture or screen readback.
+- Atlas generated in bounded work units, soft 2ms per frame (not a hard
+  deadline for single unit, allocations or raster uploads). Canopy remains
+  visible while building; initial shading 32 rows/frame, atlas hybrid
+  fade-in over approximately two simulated seconds. Relight 16 rows/frame
+  after 75 native timestep units and meaningful light change. Previous
+  texture remains visible until all rows complete. RW lifetime owns
+  atlas/raster/staging; failure retains canopy and logs, no repeated retries.
+  Canopy-only failure chain unchanged. All legacy setting keys remain
+  recognized, new HybridClouds=1 defaults on. CumulusDetail changes both
+  texture resolutions, geometry count stays fixed.
+- Tests: volume_tests.cpp (portable near/far macro coverage) registered in
+  CMake, verifies weight sum and continuity across sphere including poles,
+  exact capture directions, deterministic atlas, alpha gutters, sufficient
+  shape coverage, day/night and opposite sun, incremental refresh, fixed
+  positions/geometry under camera axes and translation, shared wind and
+  fallback. Existing core + canopy tests retained. Linux synthetic-sky
+  preview uses actual C++ atlas and mesh with perspective-correct sampling,
+  near clipping; no GTA captures, no GPU performance measurement.
+- In-game verification still needed: low draw distance, sunsets, rainy
+  weather, night contrast, yaw/roll at fixed position, ascent/orbit/flight
+  through cloud, crossfades at different FOV, RW shutdown/restart and
+  device reset. The sheet and nearby meshes remain separate alpha passes
+  so their intersections and close-view ghosting may be visible. Render
+  mode 2 is a pseudo-volumetric approximation, not full GTA V cloud
+  scattering. Compare HybridClouds=0 if GPU fill-rate limited; use
+  CumulusDetail=0 by default. Do not claim measured minimum hardware.

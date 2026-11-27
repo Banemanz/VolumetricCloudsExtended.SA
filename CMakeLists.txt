@@ -13,7 +13,7 @@ if(BUILD_ASI)
     if(NOT EXISTS "${PLUGIN_SDK_LIB}")
         message(FATAL_ERROR "Build Plugin-SDK Release first: ${PLUGIN_SDK_LIB}")
     endif()
-    add_library(VolumetricCloudsExtended SHARED main.cpp CloudCore.hpp Canopy.hpp)
+    add_library(VolumetricCloudsExtended SHARED main.cpp CloudCore.hpp Canopy.hpp CloudVolumes.hpp)
     target_compile_features(VolumetricCloudsExtended PRIVATE cxx_std_23)
     target_compile_definitions(VolumetricCloudsExtended PRIVATE
         GTASA RW PLUGIN_SGV_10US NOMINMAX
@@ -43,4 +43,8 @@ if(BUILD_TESTING)
     # those names in portable tests to catch collisions before the ASI build.
     target_compile_definitions(canopy_tests PRIVATE near= far=)
     add_test(NAME cloud_canopy COMMAND canopy_tests)
+    add_executable(volume_tests tests/volume_tests.cpp)
+    target_compile_features(volume_tests PRIVATE cxx_std_17)
+    target_compile_definitions(volume_tests PRIVATE near= far=)
+    add_test(NAME cloud_volume COMMAND volume_tests)
 endif()

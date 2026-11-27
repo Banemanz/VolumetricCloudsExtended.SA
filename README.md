@@ -1,7 +1,9 @@
 # VolumetricCloudsExtended.SA
 
 A procedural replacement for GTA San Andreas' stock intersecting-card volumetric clouds.
-This is a fixed-function procedural sky/cloud renderer, not a raymarched atmospheric volume. It only
+The default renderer bakes original 3D cloud density into ordinary textured meshes and combines
+them with a distant procedural canopy. It is fixed-function at runtime, not a per-frame
+raymarched atmospheric volume. It only
 replaces the volumetric cloud call in the original 3D effects pass. The sky background,
 low clouds, moving fog, rain and other effects remain native.
 
@@ -30,16 +32,18 @@ pipeline may still need compatibility testing.
   depth-sorted and angle-weighted. No camera-facing billboards. Increasing
   the puff count does not simply multiply opacity.
 - Crossed cards (mode 0) preserve the native world-axis geometry.
-- **Procedural canopy (default, mode 2):** one curved, world-XY cloud layer
-  with a seamless CPU-generated density/lighting map. Clouds are coherent
-  weather formations instead of intersecting billboards. No camera yaw,
-  pitch, roll or altitude controls texture orientation.
-  Optional sparse native cards at flight altitude are disabled by default.
+- **Hybrid density-baked clouds (default, mode 2):** original ray-integrated
+  3D cloud density, multiple fixed capture directions, coarse depth-reprojected
+  meshes and a distant curved world-XY canopy. No camera yaw, pitch or roll
+  rotates cloud geometry. View weights change with the actual eye-to-cloud
+  position; cloud centers, shapes and capture planes remain world-fixed.
+  `HybridClouds=0` restores the previous inexpensive canopy-only renderer.
+  Optional native flight cards remain disabled by default.
 - Frustum rejection, actual camera far-plane limit, smooth range and near fades,
   back-to-front view-depth ordering and bounded RenderWare batches.
 - Additional textures are borrowed directly from the loaded particle TXD. Missing
   names are ignored; the native cloudhigh texture is the fallback. No global game
-  RNG consumption or native cloud-table reset. Only mode 2 owns a small ordinary RW texture raster.
+  RNG consumption or native cloud-table reset. Only mode 2 owns generated ordinary RW texture rasters.
 
 ## INI controls
 
@@ -51,7 +55,7 @@ text retains the default. Inline comments are supported.
 |---|---:|---|
 | TargetProcClouds | 160 | Group count in modes 0/1; coverage control in mode 2 (0 disables) |
 | BadWeatherDensityMultiplier | 1.4 | Cloudy/rainy density relative to clear (0–3) |
-| MinSpawnZ | 200 | Lower absolute altitude (canopy uses the band midpoint and curvature) |
+| MinSpawnZ | 200 | Lower absolute altitude (hybrid formations stay within the band) |
 | MaxSpawnZ | 650 | Upper absolute altitude |
 | SpawnRadiusMin | 300 | Inner radius relative to camera; scaled if far clip is shorter |
 | SpawnRadiusMax | 2200 | Outer radius; scaled to effective render distance |
@@ -72,13 +76,14 @@ text retains the default. Inline comments are supported.
 | UseAdditionalTextures | 1 | Look for listed textures in particle.txd |
 | IncludeOriginalTextureInRandom | 1 | Include native cloudhigh among variants |
 | CloudTextureNames | cloud2,cloud3,cloud4 | Comma-separated names; up to 15 |
-| RenderMode | 2 | 0 = crossed cards; 1 = clustered fixed world-space cards; 2 = procedural canopy (default) |
+| RenderMode | 2 | 0 = crossed cards; 1 = clustered fixed world-space cards; 2 = hybrid density-baked clouds (default) |
 | CumulusDensity | 0.95 | Mode 2: opacity of the cloud texture (0–1) |
-| CumulusImpostors | 1 | Legacy key, accepted but ignored; mode 2 always uses fixed geometry |
+| CumulusImpostors | 1 | Legacy key, accepted but ignored |
+| HybridClouds | 1 | Mode 2: 3D-density-baked formations plus distant canopy; 0 = canopy only |
 | CumulusNightLight | 1 | Mode 2: night illumination multiplier (0–2); smooth transition to daylight |
 | CumulusContrast | 0.65 | Mode 2: directional relief and occlusion contrast (0–1) |
 | CumulusRimStrength | 0.85 | Mode 2: subtle thin-edge illumination (0–1), no additive halo |
-| CumulusDetail | 0 | Mode 2: 0 = 512² texture; 1 = 1024² texture, same geometry |
+| CumulusDetail | 0 | Mode 2: 0 = 512² canopy + 96² captures; 1 = 1024² canopy + 128² captures, same geometry |
 | CanopyFlightClouds | 0 | Optional native crossed wisps near the canopy height (0–24); off for lowest cost |
 | PuffsPerCloud | 5 | Mode 1: number of puffs (1–8); core uses three fixed planes, each satellite one |
 | SizeScale | 1 | Group dimensions multiplier, or mode 2 world texture scale |
@@ -104,13 +109,14 @@ For the stock appearance with the procedural field, use `RenderMode=0`,
 configuration try `PuffsPerCloud=3`. The new renderer deliberately does not
 extend the world/camera clip plane or change the game's native height-switch global.
 
-## Procedural canopy (mode 2, default; no custom shaders)
+## Hybrid procedural clouds (mode 2, default; no custom shaders)
 
 Existing INIs are never overwritten. Explicit RenderMode=0 or 1 remains
 unchanged. To switch an existing installation, edit and restart:
 
 ```ini
 RenderMode=2
+HybridClouds=1
 CumulusDetail=0
 CumulusDensity=0.95
 CumulusContrast=0.65
@@ -120,7 +126,90 @@ CanopyFlightClouds=0
 Opacity=1
 ```
 
-### The cheap trick
+### Original 3D density, cheap 2D GPU sampling
+
+The previous canopy solved rotation and cost but was too flat at aircraft
+altitude. Mode 2 now has a second representation for nearer formations:
+
+- **Three coherent 64³ density fields** (broad cumulus, rising cumulus and
+  flattened banks). Smooth unions of ellipsoids and multi-scale erosion
+  produce a continuous cloud body; no independently composited texture puffs.
+- **26 captures per form:** eight azimuths at −60°, 0°, +60°, and both poles.
+  CPU front-to-back integration uses Beer–Lambert extinction and six
+  cardinal optical-depth bases for self-shadowing. Capture alpha and
+  integrated depth come from the same field. Daylight remains neutral,
+  with bounced ambient and modest edge scattering; night uses the actual
+  sky palette. The atlas stores density/light coefficients, so changing
+  the sun or timecycle does not rerun the ray integration.
+- **World-locked proxies:** each capture has a fixed 5×5 depth mesh (32
+  triangles). At most three neighboring captures blend using continuous
+  angular weights, with glancing directions suppressed. No screen-aligned
+  billboards, no camera-facing UV rotation, no elevation-driven orientation
+  switches. Approximate normalized optical alpha reduces multiple-blend
+  opacity buildup. This is still an impostor; oblique/close silhouettes can
+  ghost during transitions and real in-cloud scattering is not simulated.
+- **World placement:** deterministic jittered 440 m cells at default
+  SizeScale, with positions advected by the same wind as the canopy.
+  Coverage follows the same periodic macro density field and weather threshold.
+  Cloud sizes and heights are stable while traveling. Clouds fade with range
+  and when the camera approaches the interior. The far canopy fades into
+  these formations and is suppressed above the layer to hide the flat ring.
+- **Budget:** up to 48 groups, three proxies per group, 32 triangles per proxy
+  plus 480 canopy triangles = 5,088 triangle conservative pre-culling upper
+  bound. Actual visible count is frustum-culled; default diagnostic position
+  yielded 25 clear and 32 rainy eligible groups before frustum culling.
+  Proxies share one atlas and are grouped into bounded indexed Im3D batches
+  without changing depth order. Default atlas 1024² RGBA (4 MiB GPU base),
+  high detail 2048×1024 (8 MiB). No atlas mipmaps (prevent tile bleeding);
+  transparent tile gutters with alpha fading before each image's edges.
+  Default canopy adds ~1.33 MiB with mipmaps. CPU coefficients are 8 MiB
+  default / 16 MiB detail plus RGBA and RW staging. No screen render
+  targets, 3D GPU texture, custom shaders or per-frame ray tracing.
+- **Initialization:** slices of density, optical-depth planes and capture
+  rows are generated on the game thread with a soft ~2 ms work budget per
+  frame. Allocation, a single work unit and final RW upload are not hard
+  time-bounded. The canopy is visible during generation; the hybrid fades
+  in over ~2 simulated seconds after the atlas is uploaded. The initial
+  light bake uses 32 rows/frame; relighting uses 16 rows/frame after at least
+  75 native timestep units and a meaningful light change, then one full
+  texture upload. On allocation/upload failure the canopy remains active.
+  For the absolute minimum cost set HybridClouds=0.
+- **Known limits:** approximated lighting and optical-depth interpolation,
+  only three density archetypes, no genuine participating medium when the
+  camera enters a formation. The formation and distant sheet are not
+  mutually depth-sorted across the two passes. A real game test is needed
+  for fill rate, all-angle alpha artifacts and low-end hardware.
+
+References: [Harris and Lastra, Real-Time Cloud Rendering (2001)](https://www.cs.unc.edu/Research/ProjectSummaries/RealTimeCloudRendering/),
+[FlightGear SimGear](https://github.com/FlightGear/simgear/tree/next/simgear/scene/sky),
+and [CodeWalker drawable resource definitions](https://github.com/dexyfex/CodeWalker/blob/master/CodeWalker.Core/GameFiles/Resources/Drawable.cs).
+The supplied GTA V cloud XML and RSC7 files were inspected strictly as design
+reference; no extracted model, texture, game code or shader is included.
+See the handoff for metadata observations.
+
+### Linux software diagnostics — hybrid
+
+| Clear day | Above the layer |
+|---|---|
+| ![Hybrid clear](docs/previews/hybrid_day.jpg) | ![Hybrid above](docs/previews/hybrid_flight.jpg) |
+| ![Hybrid sunrise](docs/previews/hybrid_sunrise.jpg) | ![Hybrid night](docs/previews/hybrid_night.jpg) |
+| ![Hybrid overhead](docs/previews/hybrid_zenith.jpg) | ![Hybrid rain](docs/previews/hybrid_rain.jpg) |
+
+![Same coherent cloud at six nearby eye positions](docs/previews/hybrid_orbit.jpg)
+
+Actual generated RGBA atlases and C++ geometry rendered in a Linux
+software diagnostic against a synthetic sky, not GTA screenshots.
+The orbital sequence uses the same cloud at six positions with
+fixed lighting. It illustrates changing perspective, not a physical
+rotation of the cloud. To regenerate:
+
+```sh
+g++ -std=c++17 -O2 tests/hybrid_preview.cpp -o hybrid_preview
+python tests/hybrid_preview.py ./hybrid_preview docs/previews
+```
+
+### The distant canopy (also available standalone with HybridClouds=0)
+
 
 A curved, textured sky layer has been practical since the fixed-function
 console era. References: [Quake III tr_sky.c](https://github.com/id-Software/Quake-III-Arena/blob/master/code/renderer/tr_sky.c)
@@ -150,7 +239,7 @@ not a copy of any game's assets, code or shaders.
   facing sprite, texture rotation, or per-cloud sort in the default path.
   Near the surface the alpha fades locally to avoid a hard sheet crossing
   the camera. The two-sided mesh is depth-tested against world geometry.
-- **Cost:** one fixed-function texture+alpha blend submission in default
+- **Cost:** one fixed-function texture+alpha blend submission in canopy-only
   mode, no per-frame cloud raymarch, custom vertex/pixel shader, screen copy,
   3D GPU texture or render target. Economy uses a 512² RGBA texture (1 MiB
   base, ~1.33 MiB with mipmaps); detail 1 uses 1024² (4 MiB base, ~5.33 MiB
@@ -166,9 +255,9 @@ not a copy of any game's assets, code or shaders.
   For additional local parallax use CanopyFlightClouds=12 (max 24); these
   native crossed wisps appear only near the center altitude, with
   altitude/range fading. They are optional because they add alpha overdraw
-  and can reveal card geometry. The default purposely omits them.
+  and can reveal card geometry. The default purposely omits these optional native cards.
 
-Mode 2 uses CumulusDetail, CumulusDensity, CumulusContrast, CumulusRimStrength,
+Mode 2 uses HybridClouds, CumulusDetail, CumulusDensity, CumulusContrast, CumulusRimStrength,
 CumulusNightLight, TargetProcClouds, BadWeatherDensityMultiplier, SizeScale,
 Opacity, Seed, WindMoveScale, the altitude and range/fade controls, and
 UseGameFog. ColorBrightnessBoost sets the native luminance reference for
@@ -177,7 +266,7 @@ CumulusImpostors is accepted as a legacy no-op. PuffsPerCloud affects only
 mode 1. Texture names, spacing, and group spawn radius controls apply to
 native cards (including optional flight wisps), not the procedural sheet.
 
-### Linux software previews
+### Previous canopy-only Linux software previews
 
 | Day | Overhead |
 |---|---|
@@ -216,6 +305,8 @@ g++ -std=c++17 -O2 -Wall -Wextra -Werror tests/cloud_tests.cpp -o cloud_tests
 ./cloud_tests
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -Dnear= -Dfar= tests/canopy_tests.cpp -o canopy_tests
 ./canopy_tests
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -Dnear= -Dfar= tests/volume_tests.cpp -o volume_tests
+./volume_tests
 ```
 
 ## Engine reference

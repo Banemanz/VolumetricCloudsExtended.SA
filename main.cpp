@@ -11,7 +11,7 @@
 #include "CTimer.h"
 #include "CTxdStore.h"
 #include "CScene.h"
-#include "Canopy.hpp"
+#include "CloudVolumes.hpp"
 #include <new>
 
 #include <array>
@@ -34,6 +34,21 @@ vc::canopy::Refresh canopyRefresh;
 vc::canopy::Drift canopyDrift;
 bool canopyAttempted=false,canopyMipmaps=false,flightFieldActive=false;
 unsigned int lastFrame = 0;
+RwRaster* volumeRaster=nullptr;
+RwImage* volumeImage=nullptr;
+vc::volume::Atlas volumeAtlas;
+vc::volume::Refresh volumeRefresh;
+bool volumeFailed=false;
+float volumeFade=0.f;
+int volumeInitialRow=0;
+vc::canopy::Light volumeInitialLight{};
+void ReleaseVolumes() {
+    if(volumeRaster) RwRasterDestroy(volumeRaster);
+    if(volumeImage) RwImageDestroy(volumeImage);
+    volumeRaster=nullptr;volumeImage=nullptr;
+    volumeAtlas={};volumeFailed=false;volumeFade=0.f;volumeInitialRow=0;
+}
+
 
 std::filesystem::path ModulePath() {
     HMODULE module = nullptr;
@@ -135,6 +150,58 @@ bool EnsureCanopy(const vc::canopy::Light& light) {
     Log(canopyRaster?"Canopy: procedural cloud sheet generated."
                     :"Canopy: texture creation failed; using crossed native textures.");
     return canopyRaster!=nullptr;
+}
+
+// Only the portable CPU bake is incremental; all RW objects stay on the game thread.
+bool UploadVolumes() {
+    const int w=volumeAtlas.width(),h=volumeAtlas.height();
+    for(int y=0;y<h;++y)
+        std::memcpy(RwImageGetPixels(volumeImage)+y*RwImageGetStride(volumeImage),
+                    volumeAtlas.pixels.data()+std::size_t(y)*w,w*sizeof(vc::canopy::Pixel));
+    return RwRasterSetFromImage(volumeRaster,volumeImage)!=nullptr;
+}
+void FailVolumes() {
+    ReleaseVolumes();volumeFailed=true;
+    Log("Hybrid cloud atlas unavailable; retaining procedural canopy.");
+}
+void UpdateVolumes(const vc::canopy::Light& light,float dt) {
+    if(!settings.hybridClouds || volumeFailed) return;
+    try {
+        if(!volumeAtlas.tileSize()) {
+            volumeAtlas.start(settings.cumulusDetail?128:96,std::uint32_t(settings.seed));
+        }
+        if(!volumeAtlas.ready()) {
+            volumeAtlas.advance(2);
+            if(!volumeAtlas.ready()) return;
+        }
+        if(!volumeRaster) {
+            const int w=volumeAtlas.width(),h=volumeAtlas.height();
+            if(!volumeInitialRow) volumeInitialLight=light;
+            const int last=std::min(h,volumeInitialRow+32);
+            volumeAtlas.shade(volumeInitialLight,volumeInitialRow,last);
+            volumeInitialRow=last;
+            if(last!=h) return;
+            volumeImage=RwImageCreate(w,h,32);
+            if(!volumeImage || !RwImageAllocatePixels(volumeImage) ||
+                !RwImageGetPixels(volumeImage) || RwImageGetStride(volumeImage)<w*4) {FailVolumes();return;}
+            for(int y=0;y<h;++y)
+                std::memcpy(RwImageGetPixels(volumeImage)+y*RwImageGetStride(volumeImage),
+                            volumeAtlas.pixels.data()+std::size_t(y)*w,w*sizeof(vc::canopy::Pixel));
+            RwInt32 rw=0,rh=0,depth=0,format=0;
+            if(!RwImageFindRasterFormat(volumeImage,rwRASTERTYPETEXTURE,&rw,&rh,&depth,&format) || rw!=w || rh!=h) {
+                FailVolumes();return;
+            }
+            // No atlas mip bleeding; all slots have transparent gutters.
+            volumeRaster=RwRasterCreate(w,h,depth,(format&~(rwRASTERFORMATMIPMAP|rwRASTERFORMATAUTOMIPMAP))|rwRASTERTYPETEXTURE);
+            if(!volumeRaster || !UploadVolumes()) {FailVolumes();return;}
+            volumeRefresh.reset(volumeInitialLight);
+            Log("Hybrid clouds: original density atlas ready (78 captures).");
+        }
+        if(volumeRaster && volumeRefresh.advance(volumeAtlas,light,dt) && !UploadVolumes()) {
+            FailVolumes();return;
+        }
+        if(volumeRaster) volumeFade=vc::sat(volumeFade+vc::clamp(dt,0.f,5.f)/100.f);
+    } catch(const std::bad_alloc&) {FailVolumes();}
 }
 
 void ResetField() {
@@ -253,11 +320,11 @@ std::array<RwIm3DVertex,BatchVertices> vertices;
 constexpr int BatchIndices=BatchVertices*4;
 std::array<RwImVertexIndex,BatchIndices> modernIndices;
 static_assert(sizeof(RwImVertexIndex)==sizeof(std::uint16_t));
-void DrawCanopy(const vc::View& view,const vc::Range& range) {
+void DrawCanopy(const vc::View& view,const vc::Range& range,float hybridFade) {
     if (settings.opacity<=0.f || settings.cumulusDensity<=0.f || !settings.targetProcClouds) return;
     RenderStates states;
     if (!states.begin()) return;
-    const auto mesh=vc::canopy::mesh(settings,view,range,canopyDrift);
+    const auto mesh=vc::canopy::mesh(settings,view,range,canopyDrift,vc::volume::radius(settings,range),hybridFade);
     static_assert(vc::canopy::VertexCount<=BatchVertices && vc::canopy::IndexCount<=BatchIndices);
     bool visible=false;
     for(int i=0;i<vc::canopy::VertexCount;++i) {
@@ -281,6 +348,44 @@ void DrawCanopy(const vc::View& view,const vc::Range& range) {
         RwIm3DRenderIndexedPrimitive(rwPRIMTYPETRILIST,modernIndices.data(),vc::canopy::IndexCount);
         RwIm3DEnd();
     }
+}
+void DrawVolumes(RwCamera* camera,const vc::View& view,const vc::volume::Groups& groups) {
+    if(!volumeRaster || !groups.count) return;
+    RenderStates states;
+    if(!states.begin()) return;
+    RwRenderStateSet(rwRENDERSTATETEXTURERASTER,volumeRaster);
+    int nv=0,ni=0;
+    const auto flush=[&] {
+        if(!nv) return;
+        if(RwIm3DTransform(vertices.data(),nv,nullptr,rwIM3D_VERTEXXYZ|rwIM3D_VERTEXUV|rwIM3D_VERTEXRGBA)) {
+            RwIm3DRenderIndexedPrimitive(rwPRIMTYPETRILIST,modernIndices.data(),ni);
+            RwIm3DEnd();
+        }
+        nv=ni=0;
+    };
+    for(int i=0;i<groups.count;++i) {
+        const auto& group=groups.items[i];
+        if(!Visible(camera,group.center,group.scale*1.8f)) continue;
+        auto weights=vc::volume::weights(view.pos-group.center);
+        // Fixed order: crossing equal view weights must not flip blend order.
+        std::sort(weights.begin(),weights.end(),[](const auto& a,const auto& b) {return a.view<b.view;});
+        for(const auto w:weights) {
+            if(w.amount<.004f) continue;
+            const auto m=vc::volume::mesh(volumeAtlas,group,w);
+            if(nv+vc::volume::MeshVertices>BatchVertices || ni+vc::volume::MeshIndices>BatchIndices) flush();
+            for(int j=0;j<vc::volume::MeshVertices;++j) {
+                const auto& p=m.vertices[j];
+                auto& v=vertices[nv+j];
+                RwIm3DVertexSetPos(&v,p.pos.x,p.pos.y,p.pos.z);
+                RwIm3DVertexSetNormal(&v,0.f,0.f,1.f);
+                RwIm3DVertexSetU(&v,p.u);RwIm3DVertexSetV(&v,p.v);
+                RwIm3DVertexSetRGBA(&v,255,255,255,Byte(p.alpha*255.f));
+            }
+            for(const auto index:m.indices) modernIndices[ni++]=RwImVertexIndex(nv+index);
+            nv+=vc::volume::MeshVertices;
+        }
+    }
+    flush();
 }
 void Flush(int& count,RwRaster* raster) {
     if (!count) return;
@@ -361,9 +466,12 @@ void __cdecl RenderClouds() {
             }
         }
         if (modern) {
-            DrawCanopy(view,range);
-            // Default mode is single-pass. Optional sparse fixed cards are
-            // localized to flight altitude; never fill the horizon with sprites.
+            if(newFrame && settings.hybridClouds) UpdateVolumes(light,dt);
+            const auto groups=vc::volume::groups(settings,view,range,canopyDrift,weather,volumeFade);
+            DrawCanopy(view,range,vc::volume::canopyBlend(groups,volumeFade));
+            DrawVolumes(camera,view,groups);
+            // Optional legacy fixed cards are localized to flight altitude;
+            // the volume proxies do not depend on these native textures.
             flightAlpha=vc::canopy::flightWeight(settings,view)*.65f;
             desired=std::min(settings.canopyFlightClouds,desired);
             if (!desired || flightAlpha<=1.f/255.f) {
@@ -454,7 +562,8 @@ public:
         plugin::Events::reInitGameEvent += ResetField;
         plugin::Events::shutdownRwEvent += ResetField;
         plugin::Events::shutdownRwEvent += ReleaseCanopy;
-        Log(settings.renderMode==2 ? "Procedural volumetric cloud renderer installed (SA 1.0 US, shader-free canopy)." : settings.lightingMode==0
+        plugin::Events::shutdownRwEvent += ReleaseVolumes;
+        Log(settings.renderMode==2 ? "Procedural volumetric cloud renderer installed (SA 1.0 US, shader-free hybrid)." : settings.lightingMode==0
             ? "Procedural volumetric cloud renderer installed (SA 1.0 US, native lighting)."
             : "Procedural volumetric cloud renderer installed (SA 1.0 US, custom lighting).");
     }
