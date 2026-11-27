@@ -229,8 +229,8 @@ and [pure-device GetViewport documentation](https://learn.microsoft.com/en-us/wi
   compiler or external DLL is needed (FXC runs at build time).
   Source geometry is bounded below 44k vertices. At the reference pose
   roughly 7850 triangles and 76 distant cards are preserved. A same-host
-  480-pose Linux mesh-only benchmark: previous mesh 1.23ms, optimized
-  CPU mesh 1.18ms, GPU-input mesh 0.45ms, all ~7275 triangles average
+  480-pose Linux mesh-only benchmark: previous mesh 1.18ms, optimized
+  CPU mesh 1.14ms, GPU-input mesh 0.43ms, all ~7276 triangles average
   (excludes legacy CPU projection and hardware draw). These are not GTA
   FPS or Intel HD measurements. The GPU still bears the fill-rate cost
   of translucent clouds. The fixed-index/stream buffer uses <1.4 MiB.

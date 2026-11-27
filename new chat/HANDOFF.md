@@ -933,7 +933,8 @@ remained a credible source of the swimming seen in flight.
   No pixel shader, screen copy, extra sample per pixel, or new RT.
   Hardware creation/draw failure uses proven CPU projection path.
 - Local measurements (not target device): 480 moving poses, previous mesh
-  1.23ms, optimized CPU 1.18ms, GPU input 0.45ms; same average 7275 triangles.
+  1.18ms, optimized CPU 1.14ms, GPU input 0.43ms; 7275/7276 mean triangles.
+  Shared conservative endpoint culling avoids compiler rounding mismatch.
   Default cache 8,432,196 bytes, 919ms bake / 29ms warm reopen on Linux.
   Regression tests verify exact cache data and invalidation and same CPU/GPU
   world-lattice geometry at 12 altitude/weather combinations. Windows test
@@ -947,3 +948,10 @@ remained a credible source of the swimming seen in flight.
   Mark Harris GDC 2002 (amortize cloud rendering via impostors);
   OGRE SkyX geometry-block reference; D3D9 SDK buffer, fog and viewport docs.
   See README for sources. No copied game assets/code.
+
+- Initial Win32 CI (commit c3a657c) passed all six tests on an actual D3D9
+  pure device. Hardware-vs-CPU framebuffer mean error on the three flight
+  scenes was 0.032, 0.042 and 0.070 RGB levels out of 255, including clear,
+  interpolated and overcast masks, with foreground depth preserved. FXC
+  compiled the shader successfully. Follow-up uses one conservative
+  candidate classifier for both backends to satisfy GCC 15 as well.

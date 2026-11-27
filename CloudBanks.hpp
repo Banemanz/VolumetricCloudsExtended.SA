@@ -384,25 +384,17 @@ inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range
                     if(q&1)setComponent(p,j,component(hi,j));
                     if(q&2)setComponent(p,k,component(hi,k));
                     const Vec delta=p-view.pos;
+                    // Shared conservative culling: retain a patch if any
+                    // corner could contribute. A tiny guard around the
+                    // mathematical fade endpoints avoids CPU/compiler/GPU
+                    // rounding disagreements; zero-alpha corners cost no
+                    // blend and the visible source lattice stays identical.
+                    const float axisDistance=std::abs(component(delta,a));
+                    const float maxDistance=std::max({std::abs(delta.x),std::abs(delta.y),std::abs(delta.z),.001f});
+                    const float d2=dot(delta,delta);
+                    const float limit=(i%4==0?levels.end:i%2==0?std::min(levels.end,1300.f):std::min(levels.end,440.f))+.01f;
+                    any|=axisDistance>=.799999f*maxDistance&&d2<=limit*limit&&d2>63.98f;
                     if constexpr(gpu) {
-                        // Reject exactly-zero contributions without computing
-                        // square roots, cubic fades, path lengths or UVs.
-                        const float axisDistance=std::abs(component(delta,a));
-                        const float maxDistance=std::max({std::abs(delta.x),std::abs(delta.y),std::abs(delta.z),.001f});
-                        const float d2=dot(delta,delta);
-                        const float limit=i%4==0?levels.end:i%2==0?std::min(levels.end,1300.f):std::min(levels.end,440.f);
-                        if(axisDistance>.80f*maxDistance&&d2<limit*limit&&d2>64.f) {
-                            // Smoothstep rounds to exactly one just before the
-                            // mathematical endpoint. Preserve the CPU path's
-                            // exact zero classification at those boundaries.
-                            if(d2>=limit*limit*.998f||axisDistance<.80001f*maxDistance||
-                               (s.interiorHaze==0.f&&d2<=view.nearClip*view.nearClip)) {
-                                const float d=length(delta);
-                                any|=component(axisWeights(delta),a)>0.f&&planeWeight(i,component(step,a),d)>0.f&&
-                                    rangeWeight(r,d)>0.f&&levels.volume(d)>0.f&&
-                                    smooth((d-8.f)/24.f)*mix(smooth((d-view.nearClip)/std::max(80.f,s.nearFadeDistance)),1.f,s.interiorHaze*.22f)>0.f;
-                            } else any=true;
-                        }
                         patch.vertices[q]={p,float(a),component(step,a),i%2==0?1.f:0.f,i%4==0?1.f:0.f};
                     } else {
                         const float d=length(delta),w=component(axisWeights(delta),a);
@@ -411,7 +403,6 @@ inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range
                         const float nearWeight=smooth((d-8.f)/24.f)*mix(smooth((d-view.nearClip)/std::max(80.f,s.nearFadeDistance)),1.f,s.interiorHaze*.22f);
                         const float alpha=sat(path*w/ReferenceStep)*rangeWeight(r,d)*levels.volume(d)*nearWeight;
                         patch.vertices[q]={p,p.x/tile-uOffset,p.y/tile-vOffset,(p.z-origin.z)/band,alpha,cloudFogFactor(s,d)};
-                        any|=alpha>0.f;
                     }
                 }
                 if(any){order.push_back(patches.size());patches.push_back(patch);}

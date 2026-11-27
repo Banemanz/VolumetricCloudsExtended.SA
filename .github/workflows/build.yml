@@ -50,6 +50,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build build --config Release --parallel
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (!(Test-Path build/generated/CloudBankVS.hpp)) { throw "Hardware cloud vertex bytecode was not built" }
           ctest --test-dir build -C Release --verbose
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Package Win32 plugin
