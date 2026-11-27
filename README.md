@@ -1,9 +1,9 @@
 # VolumetricCloudsExtended.SA
 
 A procedural replacement for GTA San Andreas' stock intersecting-card volumetric clouds.
-The default renderer bakes original 3D cloud density into ordinary textured meshes and combines
-them with a distant procedural canopy. It is fixed-function at runtime, not a per-frame
-raymarched atmospheric volume. It only
+The default renderer combines a world-space continuous 3D density layer with the
+distant procedural canopy. It uses hardware-filtered volume texture slices and
+fixed-function blending, not a per-pixel raymarch shader. It only
 replaces the volumetric cloud call in the original 3D effects pass. The sky background,
 low clouds, moving fog, rain and other effects remain native.
 
@@ -32,18 +32,18 @@ pipeline may still need compatibility testing.
   depth-sorted and angle-weighted. No camera-facing billboards. Increasing
   the puff count does not simply multiply opacity.
 - Crossed cards (mode 0) preserve the native world-axis geometry.
-- **Hybrid density-baked clouds (default, mode 2):** original ray-integrated
-  3D cloud density, multiple fixed capture directions, coarse depth-reprojected
-  meshes and a distant curved world-XY canopy. No camera yaw, pitch or roll
-  rotates cloud geometry. View weights change with the actual eye-to-cloud
-  position; cloud centers, shapes and capture planes remain world-fixed.
-  `HybridClouds=0` selects the inexpensive canopy-only renderer.
+- **Continuous 3D cloud banks (default, mode 2):** the canopy's macro
+  coverage drives a periodic, original 3D density field with billowing
+  tops, flatter bases, and soft erosion. The nearby field is sampled by
+  bounded back-to-front view slices with absolute world XYZ texture
+  coordinates. Rotation of the camera does not rotate the density.
+  `HybridClouds=0` selects the inexpensive original canopy-only renderer.
   Optional native flight cards remain disabled by default.
 - Frustum rejection, actual camera far-plane limit, smooth range and near fades,
   back-to-front view-depth ordering and bounded RenderWare batches.
 - Additional textures are borrowed directly from the loaded particle TXD. Missing
   names are ignored; the native cloudhigh texture is the fallback. No global game
-  RNG consumption or native cloud-table reset. Only mode 2 owns generated ordinary RW texture rasters.
+  RNG consumption or native cloud-table reset. Only mode 2 owns generated canopy rasters and optional D3D9 volume textures.
 
 ## INI controls
 
@@ -76,15 +76,15 @@ text retains the default. Inline comments are supported.
 | UseAdditionalTextures | 1 | Look for listed textures in particle.txd |
 | IncludeOriginalTextureInRandom | 1 | Include native cloudhigh among variants |
 | CloudTextureNames | cloud2,cloud3,cloud4 | Comma-separated names; up to 15 |
-| RenderMode | 2 | 0 = crossed cards; 1 = clustered fixed world-space cards; 2 = hybrid density-baked clouds (default) |
+| RenderMode | 2 | 0 = crossed cards; 1 = clustered fixed world-space cards; 2 = continuous 3D banks + canopy (default) |
 | CumulusDensity | 0.95 | Mode 2: opacity of the cloud texture (0–1) |
 | CumulusImpostors | 1 | Legacy key, accepted but ignored |
-| HybridClouds | 1 | Mode 2: 3D-density-baked formations plus distant canopy; 0 = canopy only |
+| HybridClouds | 1 | Mode 2: continuous 3D cloud banks plus distant canopy; 0 = canopy only |
 | CumulusNightLight | 1 | Mode 2: night illumination multiplier (0–2); smooth transition to daylight |
 | CumulusContrast | 0.65 | Mode 2: directional relief and occlusion contrast (0–1) |
 | CumulusRimStrength | 0.85 | Mode 2: subtle thin-edge illumination (0–1), no additive halo |
-| CumulusDetail | 0 | Mode 2: 0 = two 512² canopy masks + 96² captures; 1 = two 1024² masks + 128² captures, same geometry |
-| InteriorHaze | 0.85 | Hybrid mode: local density-sampled flight haze strength (0–1; 0 disables) |
+| CumulusDetail | 0 | Mode 2: 0 = 512² canopy masks + 128×128×32 volume endpoints, at most 16 slices; 1 = 1024² masks + 256×256×32 volumes, at most 24 slices |
+| InteriorHaze | 0.85 | Mode 2: retain nearby volume opacity on cloud entry (0–1); 0 fades the closest samples |
 | CanopyFlightClouds | 0 | Optional native crossed wisps near the canopy height (0–24); off for lowest cost |
 | PuffsPerCloud | 5 | Mode 1: number of puffs (1–8); core uses three fixed planes, each satellite one |
 | SizeScale | 1 | Group dimensions multiplier, or mode 2 world texture scale |
@@ -110,7 +110,7 @@ For the stock appearance with the procedural field, use `RenderMode=0`,
 configuration try `PuffsPerCloud=3`. The new renderer deliberately does not
 extend the world/camera clip plane or change the game's native height-switch global.
 
-## Hybrid procedural clouds (mode 2, default; no custom shaders)
+## Continuous 3D cloud banks (mode 2, default)
 
 Existing INIs are never overwritten. Explicit RenderMode=0 or 1 remains
 unchanged. To switch an existing installation, edit and restart:
@@ -128,76 +128,74 @@ CanopyFlightClouds=0
 Opacity=1
 ```
 
-### Original 3D density, cheap 2D GPU sampling
+### One density field, not isolated impostors
 
-The previous canopy solved rotation and cost but was too flat at aircraft
-altitude. Mode 2 now has a second representation for nearer formations:
+The 78-view atlas, individual cumulus groups, orientation blending and
+screen-space haze from earlier revisions are removed. The far canopy
+remains unchanged when HybridClouds=0. In the default path it fades
+toward a continuous 3D field derived from the same macro weather map.
 
-- **Three coherent 64³ density fields** (broad cumulus, rising cumulus and
-  flattened banks). Smooth unions of ellipsoids and multi-scale erosion
-  produce a continuous cloud body; no independently composited texture puffs.
-- **26 captures per form:** eight azimuths at −60°, 0°, +60°, and both poles.
-  CPU front-to-back integration uses Beer–Lambert extinction and six
-  cardinal optical-depth bases for self-shadowing. Capture alpha and
-  integrated depth come from the same field. Daylight remains neutral,
-  with bounced ambient and modest edge scattering; night uses the actual
-  sky palette. The atlas stores density/light coefficients, so changing
-  the sun or timecycle does not rerun the ray integration.
-- **World-locked proxies:** each capture has a fixed 5×5 depth mesh (32
-  triangles). At most three neighboring captures blend using continuous
-  angular weights, with glancing directions suppressed. No screen-aligned
-  billboards, no camera-facing UV rotation, no elevation-driven orientation
-  switches. Approximate normalized optical alpha reduces multiple-blend
-  opacity buildup. Close views concentrate the continuous angular weights
-  to reduce double contours. This is still an impostor; oblique/close
-  silhouettes can ghost during transitions.
-- **World placement:** deterministic jittered 440 m cells at default
-  SizeScale, with positions advected by the same wind as the canopy.
-  Coverage follows the same periodic macro density field and weather threshold.
-  Cloud sizes and heights are stable while traveling. Fair weather favors
-  cumulus, overcast brings more banks, rain favors rising and bank formations. Clouds fade with range
-  and when the camera approaches the interior. The far canopy fades into
-  these formations and is suppressed above the layer to hide the flat ring.
-- **Budget:** up to 48 groups, three proxies per group, 32 triangles per proxy
-  plus up to 960 canopy triangles and 8 haze triangles = 5,576 triangle
-  conservative pre-culling upper bound. Actual visible count is frustum-culled; default diagnostic position
-  yielded 25 clear and 32 rainy eligible groups before frustum culling.
-  Proxies share one atlas and are grouped into bounded indexed Im3D batches
-  without changing depth order. Default atlas 1024² RGBA (4 MiB GPU base),
-  high detail 2048×1024 (8 MiB). No atlas mipmaps (prevent tile bleeding);
-  transparent tile gutters with alpha fading before each image's edges.
-  Default two canopy masks add ~2.67 MiB with mipmaps (total ~6.67 MiB
-  default / ~18.67 MiB high detail). CPU coefficients are 8 MiB
-  default / 16 MiB detail plus RGBA and RW staging. No screen render
-  targets, 3D GPU texture, custom shaders or per-frame ray tracing.
-- **Initialization:** slices of density, optical-depth planes and capture
-  rows are generated on the game thread with a soft ~2 ms work budget per
-  frame. Allocation, a single work unit and final RW upload are not hard
-  time-bounded. The canopy is visible during generation; the hybrid fades
-  in over ~2 simulated seconds after the atlas is uploaded. The initial
-  light bake uses 32 rows/frame; normalized directional relighting uses
-  32 rows/frame after at least 30 native timestep units and a meaningful sun
-  change, then one full texture upload. Weather and day/night RGB do not
-  wait for a relight; they are applied live in vertex colors. On allocation/upload failure the canopy remains active.
-  For the absolute minimum cost set HybridClouds=0.
-- **Flight haze:** retains three 24³ byte density grids (~40.5 KiB total)
-  downsampled from the actual capture density, not an unrelated fog sphere.
-  At most nine rays with six samples per nearby eligible group approximate
-  local extinction. An eight-triangle screen-space alpha overlay gradually
-  obscures the scenery on entry and clears on exit. No full-screen texture,
-  shader or change to native fog settings. Set InteriorHaze=0 to disable.
-- **Known limits:** approximated lighting and optical-depth interpolation,
-  only three density archetypes, and the haze has no scene-depth input
-  (it may also tint nearby visible geometry/vehicles). The formation and distant sheet are not
-  mutually depth-sorted across the two passes. A real game test is needed
-  for fill rate, all-angle alpha artifacts and low-end hardware.
+- **Shape:** original periodic multi-scale 3D noise distorts a smoothed
+  version of the canopy coverage. Height envelopes, irregular crowns,
+  erosion and a flatter base form continuous banks. XYZ density remains
+  in world space, translated by native wind, including during flight.
+- **Lighting:** static optical-depth accumulation down the cloud column
+  and two oblique neighborhood taps give bright tops, diffuse shaded
+  undersides and soft edges. Native sky/timecycle RGB and lightning are
+  applied live. This is approximate baked relief, not dynamic directional
+  shadowing or full multiple scattering.
+- **Rendering:** ordinary hardware-filtered RGBA volume textures
+  (128×128×32 each, clear/overcast endpoints). A bounded stack of
+  view-aligned sample planes carries actual world XYZ texture coordinates.
+  Spatial density does not rotate as the sample-plane orientation changes.
+  Fixed-function texture stages linearly interpolate the weather endpoints
+  and multiply live vertex RGB/alpha. The indexed triangle list is submitted
+  back-to-front in one draw, with existing scene depth testing, no depth
+  writes, no screen render targets, no 3D noise generation per frame and
+  no custom shaders. The 16×16×8 conservative occupancy map rejects
+  transparent cells including a one-texel filtering halo. The active
+  camera far clip remains the limit.
+- **Flight:** the volume exists at its actual sampled depths, including
+  in front of and behind the player/aircraft. Sampling near the eye
+  creates natural local visibility loss, replacing the depth-unaware
+  full-screen haze. InteriorHaze now controls the near-sample fade rather
+  than a separate overlay. There may be gaps between slices and banding
+  at very close range. Limited sampling does not provide true per-pixel
+  volumetric integration.
+- **Cost:** one 3D draw (plus one or two existing canopy draws). Economy
+  caps at 16 × 12 × 10 × 2 = 3,840 slice triangles before rejection,
+  plus up to 960 distant canopy triangles; detail caps at 24 × 12 × 10 × 2.
+  Two RGBA volume textures occupy 4 MiB (16 MiB at detail 1); total
+  with mipmapped canopy ~6.67 MiB / ~26.67 MiB, excluding driver overhead.
+  CPU keeps the 4/16 MiB volume pixels for device restore, plus a tiny
+  occupancy grid and bounded mesh buffers. No recurring texture uploads.
+  GPU fill rate, particularly inside a thick overcast, matters more than
+  triangle counts. Performance on old/integrated hardware is not measured.
+- **Compatibility:** the direct D3D9 draw is necessary for the third
+  texture coordinate, which is not present in RW Im3D. Requires volume
+  textures, linear volume filtering, two simultaneous textures and four
+  texture blend stages with LERP support; unsupported devices or failed
+  allocations/draws retain the original world-space canopy. All device
+  state is captured/restored, and RW's pending states are flushed first.
+  Default-pool volume textures are uploaded from temporary system-memory
+  staging and released on SDK device-loss/reset and RW shutdown; no
+  managed volume textures (which D3D9Ex disallows).
+- **Initialization:** the original map and volume are generated once on
+  the game thread. The economy volume bake measured ~0.21 s in local Linux
+  release tests (plus canopy generation/upload); high detail takes longer.
+  First-use hitch is possible, unlike the old gradual atlas bake.
 
-References: [Harris and Lastra, Real-Time Cloud Rendering (2001)](https://www.cs.unc.edu/Research/ProjectSummaries/RealTimeCloudRendering/),
-[FlightGear SimGear](https://github.com/FlightGear/simgear/tree/next/simgear/scene/sky),
-and [CodeWalker drawable resource definitions](https://github.com/dexyfex/CodeWalker/blob/master/CodeWalker.Core/GameFiles/Resources/Drawable.cs).
-The supplied GTA V cloud XML and RSC7 files were inspected strictly as design
-reference; no extracted model, texture, game code or shader is included.
-See the handoff for metadata observations.
+The target is convincing 2013-era cloud volumes at 2004-game budgets,
+not a recreation of Rockstar assets or renderer. References:
+[Rockstar's RDR2 atmospheric rendering presentation](https://advances.realtimerendering.com/s2019/),
+[GPU Gems 1, chapter 39: Volume Rendering Techniques](https://developer.nvidia.com/gpugems/gpugems/part-vi-beyond-triangles/chapter-39-volume-rendering-techniques),
+[Direct3D 9 volume textures](https://learn.microsoft.com/en-us/windows/win32/direct3d9/volume-texture-resources),
+[Unity community cloud renderer](https://github.com/jaagupku/volumetric-clouds)
+(weather mask, vertical profile, erosion), and
+[Project V Atmosphere](https://github.com/rsrodev/ProjectVAtmosphere)
+(reference for modern volume costs, not copied code or architecture).
+A future optional simple shader could combine density integration and
+lighting in fewer passes; it is not required in this iteration.
 
 ### Native weather synchronization
 
@@ -216,26 +214,24 @@ The canopy uses two correlated static masks: base coverage and extra
 coverage. Their alpha composition matches both baked endpoints at full
 geometry opacity; intermediate coverage and edge fades are approximate.
 If the density multiplier is below one, the mask weights reverse.
-Form membership stays deterministic while weather changes their opacity.
+The nearby volume interpolates two density endpoints in the same draw.
 Modes 0/1 retain their existing weather behavior.
 
-### Linux software diagnostics — live weather and flight
+### Linux software diagnostics — actual 3D density
 
-![Clear, cloudy, rain, forced clear, fog and sandstorm](docs/previews/weather_transition.jpg)
+| From the ground | At aircraft altitude |
+|---|---|
+| ![Day](docs/previews/banks_ground.jpg) | ![Flight](docs/previews/banks_flight.jpg) |
+| ![Above](docs/previews/banks_above.jpg) | ![Rain](docs/previews/banks_rainflight.jpg) |
+| ![Night](docs/previews/banks_night.jpg) | ![Entry](docs/previews/banks_entry.jpg) |
 
-![Neutral extra-sunny, night and lightning](docs/previews/weather_light.jpg)
-
-![Approach, entry and inside a cloud](docs/previews/weather_interior.jpg)
-
-Actual generated RGBA atlases, C++ geometry and density-sampled haze
-rendered in a Linux software diagnostic against synthetic skies and terrain,
-not GTA screenshots. The weather montage uses the same world position,
-sun direction and generated textures. The older hybrid and canopy images
-remain historical references. To regenerate:
+Actual C++ density textures and slice triangles, software-rendered with
+trilinear filtering, synthetic sky, not GTA screenshots. Real D3D9
+performance and state compatibility remain to be validated in-game.
 
 ```sh
-g++ -std=c++17 -O2 tests/hybrid_preview.cpp -o hybrid_preview
-python tests/hybrid_preview.py ./hybrid_preview docs/previews
+g++ -std=c++17 -O2 tests/banks_preview.cpp -o banks_preview
+python tests/banks_preview.py ./banks_preview docs/previews
 ```
 
 ### The distant canopy (also available standalone with HybridClouds=0)
@@ -282,7 +278,7 @@ not a copy of any game's assets, code or shaders.
   or upload failure falls back to mode 0 and logs it. All owned resources
   are destroyed at RW shutdown.
 - **Flight:** the canopy is a thin fake cloud surface, not a true 3D volume.
-  For additional local parallax use CanopyFlightClouds=12 (max 24); these
+  In canopy-only mode, optional supplemental wisps use CanopyFlightClouds=12 (max 24); these
   native crossed wisps appear only near the center altitude, with
   altitude/range fading. They are optional because they add alpha overdraw
   and can reveal card geometry. The default purposely omits these optional native cards.
@@ -335,10 +331,10 @@ g++ -std=c++17 -O2 -Wall -Wextra -Werror tests/cloud_tests.cpp -o cloud_tests
 ./cloud_tests
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -Dnear= -Dfar= tests/canopy_tests.cpp -o canopy_tests
 ./canopy_tests
-g++ -std=c++17 -O2 -Wall -Wextra -Werror -Dnear= -Dfar= tests/volume_tests.cpp -o volume_tests
-./volume_tests
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -Dnear= -Dfar= tests/weather_tests.cpp -o weather_tests
 ./weather_tests
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -Dnear= -Dfar= tests/banks_tests.cpp -o banks_tests
+./banks_tests
 ```
 
 ## Engine reference

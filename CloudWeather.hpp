@@ -32,12 +32,4 @@ inline State sample(const Input& input) {
 }
 inline float visibility(const State& w) {return sat((1.f-.78f*w.dust)*(1.f-.33f*w.fog));}
 inline float clearOpacity(const State& w) {return 1.f-.68f*w.extraSunny;}
-inline float formWeight(const State& w,int form) {
-    // The archetype of each world cell remains fixed. Only its opacity
-    // responds to weather, so transitions never replace or rotate a cloud.
-    const float overcast=sat(w.coverage);
-    if(form==0) return mix(mix(1.f,.83f,overcast),.32f,w.storm);
-    if(form==1) return mix(mix(.63f,.93f,overcast),1.f,w.storm);
-    return mix(mix(.30f,1.f,overcast),1.f,w.storm);
-}
 } // namespace vc::weather

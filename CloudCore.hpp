@@ -49,12 +49,12 @@ struct Settings {
     int colorBrightnessBoost = 64;
     bool useAdditionalTextures = true, includeOriginalTextureInRandom = true;
     std::vector<std::string> textureNames{"cloud2", "cloud3", "cloud4"};
-    int renderMode = 2, puffsPerCloud = 5; // 0: crossed, 1: clustered, 2: hybrid density + canopy
+    int renderMode = 2, puffsPerCloud = 5; // 0: crossed, 1: clustered, 2: connected 3D cloud bank + canopy
     float cumulusDensity = .95f, cumulusContrast = .65f, cumulusRimStrength = .85f;
-    bool hybridClouds = true; // mode 2: original density-baked cloud formations
+    bool hybridClouds = true; // mode 2: continuous 3D density layer
     bool cumulusImpostors = true; // legacy INI compatibility; mode 2 is always world-fixed
     float cumulusNightLight = 1.f;
-    float interiorHaze = .85f; // density-sampled local flight haze in hybrid mode
+    float interiorHaze = .85f; // near-cloud density visibility in mode 2
     int cumulusDetail = 0; // 0: economy, 1: higher texture detail
     int canopyFlightClouds = 0; // optional native crossed groups in the layer
     float sizeScale = 1.f, opacity = 1.f, nearFadeDistance = 25.f;

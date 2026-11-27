@@ -551,3 +551,69 @@ as defaults, preserve explicit modes 0/1 and existing INI.
   fill-rate on integrated GPU. If haze is excessive near terrain, try
   InteriorHaze=0.5 or 0, then consider depth-aware fixed-function near
   geometry rather than adding shaders. Preserve legacy fallback modes.
+
+
+## Continuous 3D cloud banks — consolidate the endpoint (2026-11-27)
+
+User's direction: keep the visually successful world-space canopy, but
+replace isolated 3D blobs. Stop adding separate experimental modes; GTA V
+visual target, cheap enough for older GPUs. New default still RenderMode=2,
+HybridClouds=1, CumulusDetail=0. Modes 0/1 and HybridClouds=0 fallback retained.
+
+- Inspected three supplied flight screenshots (airbreak at approx z=523,
+  552, 468). They show a thin sheet well below sparse/translucent nearby
+  objects. GTA V and RDR1/RDR2 screenshot search; Rockstar SIGGRAPH 2019
+  Creating the Atmospheric World of RDR2, D3D9 volume texture documentation,
+  GPU Gems 39, GitHub jaagupku/volumetric-clouds (weather mask, height,
+  erosion), rsrodev/ProjectVAtmosphere (raymarch and half-res tradeoffs).
+  Original implementation, no game asset/code transfer. Rejected an
+  experimental connected heightfield shell after Linux preview looked
+  like folded terrain.
+- CloudBanks.hpp: two original periodic 128x128x32 RGBA density/relief
+  textures (detail 256x256x32), generated from canopy macro density plus
+  3D warped multi-frequency noise, flat bases, rounded uneven crowns,
+  eroded edges. Clear/wet alpha endpoints depend on actual configured
+  density. Static overhead extinction and oblique density taps provide
+  diffuse shading; current timecycle RGB and lightning live. No atlas,
+  view-specific baked texture, random puff geometry or directional refresh.
+- Mesh: 16 view-aligned slices max (24 detail), 12x10 grid cells/slice,
+  world XYZ texture coords and fixed altitude, same wind as canopy.
+  Slice positions depend on view, but sampled density remains stationary.
+  Far-to-near list, radial/range/near fade. Conservative 16x16x8 block
+  occupancy data includes filter halos to reject empty quads. Local
+  volume fades to distant canopy; above-layer canopy more strongly faded.
+  InteriorHaze existing key now retains opacity at the closest sample
+  planes rather than triggering the removed screen-space overlay.
+- Fixed function D3D9 direct indexed-UP draw, because RW Im3D lacks 3D UVs.
+  FVF XYZ+DIFFUSE+TEX1+TEXCOORDSIZE3(0), texture wrap U/V, clamp W,
+  hardware trilinear volume sampling, LERP with TFACTOR for weather then
+  MODULATE diffuse. One draw, Z test on, Z write off, SRCALPHA/INVSRCALPHA.
+  RW pending state cache flushed before D3DSBT_ALL capture. Restore all
+  state on exit; no persistent state block. Volume textures created
+  SYSTEMMEM staging -> DEFAULT pool (D3D9Ex compatible in principle),
+  SDK d3dLostEvent/d3dResetEvent release owned textures, CPU pixels
+  retained for reupload. RW shutdown also releases all CPU/GPU resources.
+  Pure device, unsupported caps, failures fall back to full canopy.
+  Explicit device support checks; no actual D3D9 runtime here.
+- Cost: 4 MiB volume memory plus ~2.67 MiB canopy, 16x12x10x2=3840
+  conservative pre-cull slice triangles + up to 960 canopy, one volume
+  draw + 1/2 canopy draws. Alpha fill rate is the principal risk; up to
+  16 layers per pixel, actual depends on screen coverage and occupancy.
+  CPU density map generated once ~0.21s in Linux release tests; first-use
+  hitch possible (detail more expensive), no per-frame uploads. 2070
+  triangles at user's approximate flight coordinates vs 2564 unculled.
+  No measured actual game performance or minimum hardware claim.
+- Removed CloudVolumes.hpp, old volume_tests and hybrid_preview files;
+  previous designs remain in git history, not selectable modes. Updated
+  native weather test for live endpoint interpolation, added banks_tests
+  for deterministic texture, coverage, wrap, empty vertical borders,
+  occupancy rejection, fixed XYZ, depth order, bounded geometry. Preview
+  tests/banks_preview.cpp/.py render actual geometry and trilinear texture
+  in software; docs/previews/banks_*.jpg are synthetic-sky diagnostics.
+- In-game validation next: inspect shape at ground/523m/above, orbit/yaw,
+  depth against player and world, rain/clear/night/flash, alt-tab/device
+  reset with D3D9Ex and SkyGfx. On pure or unsupported volume devices
+  canopy remains. This is an approximation with finite sampling
+  artifacts, not exact GTA V/RDR2 appearance. Do not increase default
+  sampling without weak-GPU evidence. Shader path only if actual results
+  demonstrate it can improve visuals at equal or lower fill cost.

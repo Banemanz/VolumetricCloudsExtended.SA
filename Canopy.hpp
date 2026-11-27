@@ -98,21 +98,6 @@ inline Light liveLighting(const Settings& s,const Palette& p,Vec sun,const weath
     }
     return l;
 }
-// Texture relief is normalized. Weather, dawn/night and lightning are
-// applied at draw time, so no stale colour can survive a weather switch.
-inline Light relativeLight(const Light& live) {
-    Light l=live;
-    l.threshold=0;l.density=1.f;l.day=1.f;l.storm=0.f;
-    l.bright={255,255,255};l.ambient={167,167,167};
-    // At night use a stable overhead scattering direction rather than a
-    // sun shining through the underside of the cloud from below the world.
-    const float solar=smooth((live.sun.z+.18f)/.38f);
-    l.sun=unit(Vec{live.sun.x*solar,live.sun.y*solar,mix(.9f,std::max(.16f,live.sun.z),solar)});
-    return l;
-}
-inline float directionalDifference(const Light& a,const Light& b) {
-    return length(a.sun-b.sun);
-}
 struct LayerWeights {float base,extra;};
 inline LayerWeights layerWeights(const Settings& s,const weather::State& w) {
     // Both endpoint masks incorporate configured density/opacity. Clear and
@@ -129,6 +114,14 @@ class Map {
 public:
     std::vector<Pixel> pixels,extraPixels;
     int size() const { return n; }
+    float sample(float u,float v) const {
+        if(!n)return 0.f;
+        const float x=fract(u)*n-.5f,y=fract(v)*n-.5f;
+        const int ix=int(std::floor(x)),iy=int(std::floor(y));
+        return mix(mix(get(ix,iy),get(ix+1,iy),x-ix),
+                   mix(get(ix,iy+1),get(ix+1,iy+1),x-ix),y-iy);
+    }
+
     void build(int size,std::uint32_t seed) {
         assert(size==EconomySize || size==DetailSize);
         n=size;
@@ -221,7 +214,7 @@ inline float flightWeight(const Settings& s,const View& v) {
     const float fade=std::max(70.f,s.nearFadeDistance+55.f);
     return 1.f-smooth(std::abs(v.pos.z-altitude(s))/fade);
 }
-inline Mesh mesh(const Settings& s,const View& v,const Range& r,const Drift& drift,float hybridRadius=0.f,float hybridFade=0.f) {
+inline Mesh mesh(const Settings& s,const View& v,const Range& r,const Drift& drift,float hybridRadius=0.f,float hybridFade=0.f,bool connected=false) {
     Mesh m;
     const float base=altitude(s),radius=r.end*.96f;
     // A very shallow sag at the horizon, zero camera tilt. Recenter XY only;
@@ -236,11 +229,12 @@ inline Mesh mesh(const Settings& s,const View& v,const Range& r,const Drift& dri
         const Vec p{v.pos.x+delta.x,v.pos.y+delta.y,base-sag*f*f};
         const float dist=length(p-v.pos);
         const float a=smooth(dist/fade)*smooth((1.f-f)/.18f)*distanceAlpha(r,dist);
-        const float blend=hybridRadius>0.f?1.f-.83f*hybridFade*smooth((hybridRadius-length(delta))/(hybridRadius*.38f)):1.f;
+        const float blend=hybridRadius>0.f?1.f-(connected?1.f:.83f)*hybridFade*
+            smooth((hybridRadius-length(delta))/(hybridRadius*(connected?.32f:.38f))):1.f;
         // At aircraft altitude a flat horizon ring is especially obvious.
         // The original canopy-only fallback remains unchanged.
         const float above=smooth((v.pos.z-base)/180.f);
-        return Vertex{p,originU+delta.x/tile,originV+delta.y/tile,a*strength*blend*(1.f-above*hybridFade)};
+        return Vertex{p,originU+delta.x/tile,originV+delta.y/tile,a*strength*blend*(1.f-above*hybridFade*(connected?.95f:1.f))};
     };
     m.vertices[0]=vertex({},0);
     for(int ring=1;ring<=Rings;++ring) {

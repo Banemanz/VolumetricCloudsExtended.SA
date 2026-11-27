@@ -11,7 +11,8 @@
 #include "CTimer.h"
 #include "CTxdStore.h"
 #include "CScene.h"
-#include "CloudVolumes.hpp"
+#include "CloudBanks.hpp"
+#include <d3d9.h>
 #include <new>
 
 #include <array>
@@ -33,21 +34,22 @@ bool canopyReady=false;
 vc::canopy::Drift canopyDrift;
 bool canopyAttempted=false,flightFieldActive=false;
 unsigned int lastFrame = 0;
-RwRaster* volumeRaster=nullptr;
-RwImage* volumeImage=nullptr;
-vc::volume::Atlas volumeAtlas;
-vc::volume::Refresh volumeRefresh;
-bool volumeFailed=false;
-float volumeFade=0.f;
-int volumeInitialRow=0;
-vc::canopy::Light volumeInitialLight{};
-void ReleaseVolumes() {
-    if(volumeRaster) RwRasterDestroy(volumeRaster);
-    if(volumeImage) RwImageDestroy(volumeImage);
-    volumeRaster=nullptr;volumeImage=nullptr;
-    volumeAtlas={};volumeFailed=false;volumeFade=0.f;volumeInitialRow=0;
+vc::banks::Volume bankVolume;
+vc::banks::Mesh bankMesh;
+std::array<IDirect3DVolumeTexture9*,2> bankTextures{};
+IDirect3DDevice9* bankDevice=nullptr; // borrowed
+bool bankFailed=false,bankPrepared=false;
+void ReleaseBankTextures() {
+    for(auto& texture:bankTextures) {
+        if(texture)texture->Release();
+        texture=nullptr;
+    }
+    bankDevice=nullptr;bankFailed=false;
 }
-
+void ReleaseBanks() {
+    ReleaseBankTextures();
+    bankVolume={};bankMesh={};bankPrepared=false;
+}
 
 std::filesystem::path ModulePath() {
     HMODULE module = nullptr;
@@ -88,6 +90,7 @@ void FreeCanopyResources() {
         raster=nullptr;
     }
     canopyMipmaps={};canopyHasPixels={};canopyReady=false;
+    ReleaseBanks();
 }
 void ReleaseCanopy() {
     FreeCanopyResources();
@@ -126,6 +129,10 @@ bool EnsureCanopy() {
                 }
                 if(!canopyRasters[layer]) {FreeCanopyResources();return false;}
             }
+            if(settings.hybridClouds) {
+                try {bankVolume.build(settings,map);bankPrepared=true;}
+                catch(const std::bad_alloc&) {ReleaseBanks();bankFailed=true;Log("3D density allocation failed; using canopy.");}
+            }
             return true;
         } catch(const std::bad_alloc&) {
             FreeCanopyResources();Log("Canopy: CPU allocation failed.");return false;
@@ -143,59 +150,43 @@ bool EnsureCanopy() {
     return ok;
 }
 
-// Only the portable CPU bake is incremental; all RW objects stay on the game thread.
-bool UploadVolumes() {
-    const int w=volumeAtlas.width(),h=volumeAtlas.height();
-    for(int y=0;y<h;++y)
-        std::memcpy(RwImageGetPixels(volumeImage)+y*RwImageGetStride(volumeImage),
-                    volumeAtlas.pixels.data()+std::size_t(y)*w,w*sizeof(vc::canopy::Pixel));
-    return RwRasterSetFromImage(volumeRaster,volumeImage)!=nullptr;
-}
-void FailVolumes() {
-    ReleaseVolumes();volumeFailed=true;
-    Log("Hybrid cloud atlas unavailable; retaining procedural canopy.");
-}
-void UpdateVolumes(const vc::canopy::Light& light,float dt) {
-    if(!settings.hybridClouds || volumeFailed) return;
-    try {
-        if(!volumeAtlas.tileSize()) {
-            volumeAtlas.start(settings.cumulusDetail?128:96,std::uint32_t(settings.seed));
+// Managed D3D9 textures are not legal on D3D9Ex. Use system-memory
+// staging and default-pool textures; the SDK's device-loss event releases
+// them before reset. The density remains in CPU memory for re-upload.
+bool EnsureBanks() {
+    if(!settings.hybridClouds||!bankPrepared||bankFailed)return false;
+    auto* device=static_cast<IDirect3DDevice9*>(RwD3D9GetCurrentD3DDevice());
+    if(!device)return false;
+    if(device!=bankDevice)ReleaseBankTextures();
+    if(bankTextures[0]&&bankTextures[1])return true;
+    bankDevice=device;
+    const auto fail=[](){ReleaseBankTextures();bankFailed=true;Log("3D cloud bank unavailable; retaining canopy.");return false;};
+    D3DCAPS9 caps{};
+    D3DDEVICE_CREATION_PARAMETERS creation{};
+    if(FAILED(device->GetDeviceCaps(&caps))||FAILED(device->GetCreationParameters(&creation))||
+        (creation.BehaviorFlags&D3DCREATE_PUREDEVICE)||
+        !(caps.TextureCaps&D3DPTEXTURECAPS_VOLUMEMAP)||
+        (caps.VolumeTextureFilterCaps&(D3DPTFILTERCAPS_MINFLINEAR|D3DPTFILTERCAPS_MAGFLINEAR))!=(D3DPTFILTERCAPS_MINFLINEAR|D3DPTFILTERCAPS_MAGFLINEAR)||
+        caps.MaxVolumeExtent<static_cast<DWORD>(bankVolume.width)||caps.MaxSimultaneousTextures<2||
+        caps.MaxTextureBlendStages<4||!(caps.TextureOpCaps&D3DTEXOPCAPS_LERP))return fail();
+    for(int layer=0;layer<2;++layer) {
+        IDirect3DVolumeTexture9* staging=nullptr;
+        const auto w=UINT(bankVolume.width),d=UINT(bankVolume.depth);
+        if(FAILED(device->CreateVolumeTexture(w,w,d,1,0,D3DFMT_A8R8G8B8,D3DPOOL_SYSTEMMEM,&staging,nullptr)))return fail();
+        struct Release {IDirect3DVolumeTexture9* p;~Release(){p->Release();}} release{staging};
+        D3DLOCKED_BOX lock{};
+        if(FAILED(staging->LockBox(0,&lock,nullptr,0)))return fail();
+        for(UINT z=0;z<d;++z)for(UINT y=0;y<w;++y) {
+            auto* dst=reinterpret_cast<DWORD*>(static_cast<char*>(lock.pBits)+z*lock.SlicePitch+y*lock.RowPitch);
+            const auto* src=bankVolume.pixels[layer].data()+(std::size_t(z)*w+y)*w;
+            for(UINT x=0;x<w;++x)dst[x]=D3DCOLOR_ARGB(src[x].a,src[x].r,src[x].g,src[x].b);
         }
-        if(!volumeAtlas.ready()) {
-            volumeAtlas.advance(2);
-            if(!volumeAtlas.ready()) return;
-        }
-        if(!volumeRaster) {
-            const int w=volumeAtlas.width(),h=volumeAtlas.height();
-            if(!volumeInitialRow) volumeInitialLight=vc::canopy::relativeLight(light);
-            const auto relative=vc::canopy::relativeLight(light);
-            if(vc::canopy::directionalDifference(volumeInitialLight,relative)>.45f) {volumeInitialLight=relative;volumeInitialRow=0;}
-            const int last=std::min(h,volumeInitialRow+32);
-            volumeAtlas.shade(volumeInitialLight,volumeInitialRow,last);
-            volumeInitialRow=last;
-            if(last!=h) return;
-            volumeImage=RwImageCreate(w,h,32);
-            if(!volumeImage || !RwImageAllocatePixels(volumeImage) ||
-                !RwImageGetPixels(volumeImage) || RwImageGetStride(volumeImage)<w*4) {FailVolumes();return;}
-            for(int y=0;y<h;++y)
-                std::memcpy(RwImageGetPixels(volumeImage)+y*RwImageGetStride(volumeImage),
-                            volumeAtlas.pixels.data()+std::size_t(y)*w,w*sizeof(vc::canopy::Pixel));
-            RwInt32 rw=0,rh=0,depth=0,format=0;
-            if(!RwImageFindRasterFormat(volumeImage,rwRASTERTYPETEXTURE,&rw,&rh,&depth,&format) || rw!=w || rh!=h) {
-                FailVolumes();return;
-            }
-            // No atlas mip bleeding; all slots have transparent gutters.
-            volumeRaster=RwRasterCreate(w,h,depth,(format&~(rwRASTERFORMATMIPMAP|rwRASTERFORMATAUTOMIPMAP))|rwRASTERTYPETEXTURE);
-            if(!volumeRaster || !RwRasterSetFromImage(volumeRaster,volumeImage)) {FailVolumes();return;}
-            volumeRefresh.reset(light);
-            volumeRefresh.shown=volumeRefresh.pending=volumeInitialLight; // what was actually baked
-            Log("Hybrid clouds: original density atlas ready (78 captures).");
-        }
-        if(volumeRaster && volumeRefresh.advance(volumeAtlas,light,dt) && !UploadVolumes()) {
-            FailVolumes();return;
-        }
-        if(volumeRaster) volumeFade=vc::sat(volumeFade+vc::clamp(dt,0.f,5.f)/100.f);
-    } catch(const std::bad_alloc&) {FailVolumes();}
+        if(FAILED(staging->UnlockBox(0))||
+           FAILED(device->CreateVolumeTexture(w,w,d,1,0,D3DFMT_A8R8G8B8,D3DPOOL_DEFAULT,&bankTextures[layer],nullptr))||
+           FAILED(device->UpdateTexture(staging,bankTextures[layer])))return fail();
+    }
+    Log("3D cloud bank: bounded fixed-function volume slices, no impostor atlas.");
+    return true;
 }
 
 void ResetField() {
@@ -319,7 +310,7 @@ void DrawCanopy(const vc::View& view,const vc::Range& range,float hybridFade,
     if(settings.opacity<=0.f || settings.cumulusDensity<=0.f || !settings.targetProcClouds) return;
     RenderStates states;
     if(!states.begin()) return;
-    const auto mesh=vc::canopy::mesh(settings,view,range,canopyDrift,vc::volume::radius(settings,range),hybridFade);
+    const auto mesh=vc::canopy::mesh(settings,view,range,canopyDrift,vc::banks::radius(settings,range),hybridFade,true);
     static_assert(vc::canopy::VertexCount<=BatchVertices && vc::canopy::IndexCount<=BatchIndices);
     const auto weights=vc::canopy::layerWeights(settings,weather);
     std::copy(mesh.indices.begin(),mesh.indices.end(),modernIndices.begin());
@@ -348,80 +339,87 @@ void DrawCanopy(const vc::View& view,const vc::Range& range,float hybridFade,
         }
     }
 }
-void DrawVolumes(RwCamera* camera,const vc::View& view,const vc::volume::Groups& groups,const vc::canopy::Light& light) {
-    if(!volumeRaster || !groups.count) return;
-    RenderStates states;
-    if(!states.begin()) return;
-    RwRenderStateSet(rwRENDERSTATETEXTURERASTER,volumeRaster);
-    int nv=0,ni=0;
-    const auto flush=[&] {
-        if(!nv) return;
-        if(RwIm3DTransform(vertices.data(),nv,nullptr,rwIM3D_VERTEXXYZ|rwIM3D_VERTEXUV|rwIM3D_VERTEXRGBA)) {
-            RwIm3DRenderIndexedPrimitive(rwPRIMTYPETRILIST,modernIndices.data(),ni);
-            RwIm3DEnd();
-        }
-        nv=ni=0;
-    };
-    for(int i=0;i<groups.count;++i) {
-        const auto& group=groups.items[i];
-        if(group.alpha<=1.f/255.f || !Visible(camera,group.center,group.scale*1.8f)) continue;
-        auto weights=vc::volume::renderWeights(view.pos-group.center,group.scale);
-        // Fixed order: crossing equal view weights must not flip blend order.
-        std::sort(weights.begin(),weights.end(),[](const auto& a,const auto& b) {return a.view<b.view;});
-        for(const auto w:weights) {
-            if(w.amount<.004f) continue;
-            const auto m=vc::volume::mesh(volumeAtlas,group,w);
-            if(nv+vc::volume::MeshVertices>BatchVertices || ni+vc::volume::MeshIndices>BatchIndices) flush();
-            for(int j=0;j<vc::volume::MeshVertices;++j) {
-                const auto& p=m.vertices[j];
-                auto& v=vertices[nv+j];
-                RwIm3DVertexSetPos(&v,p.pos.x,p.pos.y,p.pos.z);
-                RwIm3DVertexSetNormal(&v,0.f,0.f,1.f);
-                RwIm3DVertexSetU(&v,p.u);RwIm3DVertexSetV(&v,p.v);
-                RwIm3DVertexSetRGBA(&v,Byte(light.bright.r),Byte(light.bright.g),Byte(light.bright.b),Byte(p.alpha*255.f));
-            }
-            for(const auto index:m.indices) modernIndices[ni++]=RwImVertexIndex(nv+index);
-            nv+=vc::volume::MeshVertices;
-        }
+// RW uses 2D UV Im3D vertices. The sole direct-D3D draw carries the third
+// coordinate; capture/restore all state, including streams and transforms,
+// so the engine's cached state agrees with the device afterwards.
+bool DrawBanks(RwCamera* camera,const vc::View& view,const vc::Range& range,
+               const vc::weather::State& climate,const vc::canopy::Light& light) {
+    if(!EnsureBanks())return false;
+    auto* window=RwCameraGetViewWindow(camera);
+    if(!window)return false;
+    const auto* offset=RwCameraGetViewOffset(camera);
+    const float wx=window->x+(offset?std::abs(offset->x):0.f),
+                wy=window->y+(offset?std::abs(offset->y):0.f);
+    try {vc::banks::buildMesh(bankMesh,settings,view,range,canopyDrift,wx,wy,&bankVolume,climate.coverage);}
+    catch(const std::bad_alloc&) {bankFailed=true;Log("3D cloud slice allocation failed.");return false;}
+    if(bankMesh.indices.empty())return true;
+    struct D3DVertex {float x,y,z;DWORD rgba;float u,v,w;};
+    static std::vector<D3DVertex> batch;
+    try {
+        batch.resize(bankMesh.vertices.size());
+    } catch(const std::bad_alloc&) {bankFailed=true;return false;}
+    const float visibility=vc::weather::visibility(climate)*vc::weather::clearOpacity(climate);
+    for(std::size_t i=0;i<batch.size();++i) {
+        const auto& v=bankMesh.vertices[i];
+        batch[i]={v.pos.x,v.pos.y,v.pos.z,D3DCOLOR_ARGB(Byte(v.alpha*visibility*255.f),
+            Byte(light.bright.r),Byte(light.bright.g),Byte(light.bright.b)),v.u,v.v,v.w};
     }
-    flush();
-}
-void DrawInteriorHaze(RwCamera* camera,const vc::View& view,const vc::volume::Groups& groups,const vc::canopy::Light& light) {
-    if(!volumeRaster || settings.interiorHaze<=0.f || !groups.count) return;
-    const auto* window=RwCameraGetViewWindow(camera);
-    const auto* raster=RwCameraGetRaster(camera);
-    if(!window || !raster) return;
-    const float width=float(RwRasterGetWidth(raster)),height=float(RwRasterGetHeight(raster));
-    if(width<=0.f || height<=0.f) return;
-    const auto haze=vc::volume::interiorHaze(settings,volumeAtlas,groups,view,window->x,window->y);
-    if(haze.maxAlpha<=1.f/255.f) return;
-    RenderStates states;
-    if(!states.begin()) return;
-    RwRenderStateSet(rwRENDERSTATETEXTURERASTER,nullptr);
-    RwRenderStateSet(rwRENDERSTATEZTESTENABLE,reinterpret_cast<void*>(FALSE));
-    RwRenderStateSet(rwRENDERSTATEFOGENABLE,reinterpret_cast<void*>(FALSE));
-    const auto color=vc::mixRGB(light.ambient,light.bright,.57f);
-    std::array<RwIm2DVertex,vc::volume::HazeVertices> verts{};
-    constexpr int side=vc::volume::HazeSide;
-    const float z=RwIm2DGetNearScreenZ(),rhw=1.f/std::max(.001f,view.nearClip);
-    for(int y=0;y<side;++y)for(int x=0;x<side;++x) {
-        const int i=y*side+x;
-        auto& v=verts[i];
-        RwIm2DVertexSetScreenX(&v,width*x/(side-1));
-        RwIm2DVertexSetScreenY(&v,height*y/(side-1));
-        RwIm2DVertexSetScreenZ(&v,z);
-        RwIm2DVertexSetRecipCameraZ(&v,rhw);
-        RwIm2DVertexSetIntRGBA(&v,Byte(color.r),Byte(color.g),Byte(color.b),Byte(haze.alpha[i]*255.f));
+    auto* d=bankDevice;
+    _rwD3D9RenderStateFlushCache();
+    IDirect3DStateBlock9* saved=nullptr;
+    if(FAILED(d->CreateStateBlock(D3DSBT_ALL,&saved)))return false;
+    struct Restore {IDirect3DStateBlock9* p;bool captured=false;~Restore(){if(captured)p->Apply();p->Release();}} restore{saved};
+    // Explicit capture: drivers may initialize the state block lazily.
+    if(FAILED(saved->Capture()))return false;
+    restore.captured=true;
+    HRESULT hr=S_OK;
+    const auto check=[&](HRESULT result){if(FAILED(result))hr=result;};
+    const auto rs=[&](D3DRENDERSTATETYPE st,DWORD value){check(d->SetRenderState(st,value));};
+    const auto ts=[&](DWORD stage,D3DTEXTURESTAGESTATETYPE st,DWORD value){check(d->SetTextureStageState(stage,st,value));};
+    const auto ss=[&](DWORD stage,D3DSAMPLERSTATETYPE st,DWORD value){check(d->SetSamplerState(stage,st,value));};
+    D3DMATRIX identity{};identity._11=identity._22=identity._33=identity._44=1.f;
+    check(d->SetTransform(D3DTS_WORLD,&identity));
+    check(d->SetVertexShader(nullptr));check(d->SetPixelShader(nullptr));
+    check(d->SetFVF(D3DFVF_XYZ|D3DFVF_DIFFUSE|D3DFVF_TEX1|D3DFVF_TEXCOORDSIZE3(0)));
+    rs(D3DRS_LIGHTING,FALSE);rs(D3DRS_SPECULARENABLE,FALSE);rs(D3DRS_VERTEXBLEND,D3DVBF_DISABLE);rs(D3DRS_INDEXEDVERTEXBLENDENABLE,FALSE);rs(D3DRS_FOGENABLE,settings.useGameFog?TRUE:FALSE);rs(D3DRS_ZENABLE,D3DZB_TRUE);rs(D3DRS_ZWRITEENABLE,FALSE);
+    rs(D3DRS_ZFUNC,D3DCMP_LESSEQUAL);rs(D3DRS_ALPHABLENDENABLE,TRUE);rs(D3DRS_ALPHATESTENABLE,TRUE);rs(D3DRS_ALPHAFUNC,D3DCMP_GREATER);rs(D3DRS_ALPHAREF,0);
+    rs(D3DRS_SRCBLEND,D3DBLEND_SRCALPHA);rs(D3DRS_DESTBLEND,D3DBLEND_INVSRCALPHA);rs(D3DRS_BLENDOP,D3DBLENDOP_ADD);
+    rs(D3DRS_SEPARATEALPHABLENDENABLE,FALSE);rs(D3DRS_CULLMODE,D3DCULL_NONE);rs(D3DRS_SHADEMODE,D3DSHADE_GOURAUD);
+    rs(D3DRS_COLORWRITEENABLE,0xF);rs(D3DRS_SRGBWRITEENABLE,FALSE);rs(D3DRS_STENCILENABLE,FALSE);
+    rs(D3DRS_CLIPPLANEENABLE,0);rs(D3DRS_WRAP0,0);rs(D3DRS_TEXTUREFACTOR,D3DCOLOR_ARGB(Byte(climate.coverage*255.f),
+        Byte(climate.coverage*255.f),Byte(climate.coverage*255.f),Byte(climate.coverage*255.f)));
+    const bool blend=climate.coverage>.001f&&climate.coverage<.999f;
+    const DWORD first=climate.coverage>=.999f?1:0;
+    check(d->SetTexture(0,bankTextures[first]));
+    for(DWORD i=0;i<(blend?2u:1u);++i) {
+        ss(i,D3DSAMP_ADDRESSU,D3DTADDRESS_WRAP);ss(i,D3DSAMP_ADDRESSV,D3DTADDRESS_WRAP);ss(i,D3DSAMP_ADDRESSW,D3DTADDRESS_CLAMP);
+        ss(i,D3DSAMP_MINFILTER,D3DTEXF_LINEAR);ss(i,D3DSAMP_MAGFILTER,D3DTEXF_LINEAR);ss(i,D3DSAMP_MIPFILTER,D3DTEXF_NONE);
+        ss(i,D3DSAMP_SRGBTEXTURE,FALSE);
+        ts(i,D3DTSS_TEXCOORDINDEX,0);ts(i,D3DTSS_TEXTURETRANSFORMFLAGS,D3DTTFF_DISABLE);
+        ts(i,D3DTSS_RESULTARG,D3DTA_CURRENT);
     }
-    std::array<RwImVertexIndex,vc::volume::HazeIndices> indices{};
-    int n=0;
-    for(int y=0;y<side-1;++y)for(int x=0;x<side-1;++x) {
-        const auto a=RwImVertexIndex(y*side+x),b=RwImVertexIndex(a+1),c=RwImVertexIndex(a+side),d=RwImVertexIndex(c+1);
-        for(auto i:{a,c,b,b,c,d})indices[n++]=i;
+    ts(0,D3DTSS_COLOROP,blend?D3DTOP_SELECTARG1:D3DTOP_MODULATE);
+    ts(0,D3DTSS_ALPHAOP,blend?D3DTOP_SELECTARG1:D3DTOP_MODULATE);
+    ts(0,D3DTSS_COLORARG1,D3DTA_TEXTURE);ts(0,D3DTSS_ALPHAARG1,D3DTA_TEXTURE);
+    ts(0,D3DTSS_COLORARG2,D3DTA_DIFFUSE);ts(0,D3DTSS_ALPHAARG2,D3DTA_DIFFUSE);
+    if(blend) {
+        check(d->SetTexture(1,bankTextures[1]));
+        ts(1,D3DTSS_COLOROP,D3DTOP_LERP);ts(1,D3DTSS_ALPHAOP,D3DTOP_LERP);
+        ts(1,D3DTSS_COLORARG0,D3DTA_TFACTOR);ts(1,D3DTSS_ALPHAARG0,D3DTA_TFACTOR);
+        ts(1,D3DTSS_COLORARG1,D3DTA_TEXTURE);ts(1,D3DTSS_ALPHAARG1,D3DTA_TEXTURE);
+        ts(1,D3DTSS_COLORARG2,D3DTA_CURRENT);ts(1,D3DTSS_ALPHAARG2,D3DTA_CURRENT);
+        check(d->SetTexture(2,nullptr));ts(2,D3DTSS_RESULTARG,D3DTA_CURRENT);
+        ts(2,D3DTSS_TEXCOORDINDEX,0);ts(2,D3DTSS_TEXTURETRANSFORMFLAGS,D3DTTFF_DISABLE);
+        ts(2,D3DTSS_COLOROP,D3DTOP_MODULATE);ts(2,D3DTSS_ALPHAOP,D3DTOP_MODULATE);
+        ts(2,D3DTSS_COLORARG1,D3DTA_CURRENT);ts(2,D3DTSS_ALPHAARG1,D3DTA_CURRENT);
+        ts(2,D3DTSS_COLORARG2,D3DTA_DIFFUSE);ts(2,D3DTSS_ALPHAARG2,D3DTA_DIFFUSE);
     }
-    // Drawn in RenderEffects before HUD/post-effects. This is a local
-    // approximation, not depth-correct fog and not a game-weather override.
-    RwIm2DRenderIndexedPrimitive(rwPRIMTYPETRILIST,verts.data(),int(verts.size()),indices.data(),n);
+    ts(blend?3:1,D3DTSS_COLOROP,D3DTOP_DISABLE);
+    ts(blend?3:1,D3DTSS_ALPHAOP,D3DTOP_DISABLE);
+    if(FAILED(hr))return false;
+    const HRESULT draw=d->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST,0,UINT(batch.size()),UINT(bankMesh.indices.size()/3),
+        bankMesh.indices.data(),D3DFMT_INDEX16,batch.data(),sizeof(D3DVertex));
+    return SUCCEEDED(draw);
 }
 void Flush(int& count,RwRaster* raster) {
     if (!count) return;
@@ -500,13 +498,15 @@ void __cdecl RenderClouds() {
         modern=EnsureCanopy();
         if(modern && newFrame) canopyDrift.update(settings,windVector,dt);
         if (modern) {
-            if(newFrame && settings.hybridClouds) UpdateVolumes(light,dt);
-            const auto groups=vc::volume::groups(settings,view,range,canopyDrift,climate,volumeFade);
-            DrawCanopy(view,range,vc::volume::canopyBlend(groups,volumeFade),climate,light);
-            DrawVolumes(camera,view,groups,light);
-            DrawInteriorHaze(camera,view,groups,light);
+            const bool useBanks=EnsureBanks();
+            DrawCanopy(view,range,useBanks?1.f:0.f,climate,light);
+            if(useBanks && !DrawBanks(camera,view,range,climate,light)) {
+                Log("3D cloud draw failed; falling back to canopy.");
+                bankFailed=true;
+                DrawCanopy(view,range,0.f,climate,light);
+            }
             // Optional legacy fixed cards are localized to flight altitude;
-            // the volume proxies do not depend on these native textures.
+            // the 3D bank does not depend on these native textures.
             flightAlpha=vc::canopy::flightWeight(settings,view)*.65f;
             desired=std::min(settings.canopyFlightClouds,vc::target(settings,climate.coverage));
             if (!desired || flightAlpha<=1.f/255.f) {
@@ -597,8 +597,9 @@ public:
         plugin::Events::reInitGameEvent += ResetField;
         plugin::Events::shutdownRwEvent += ResetField;
         plugin::Events::shutdownRwEvent += ReleaseCanopy;
-        plugin::Events::shutdownRwEvent += ReleaseVolumes;
-        Log(settings.renderMode==2 ? "Procedural volumetric cloud renderer installed (SA 1.0 US, shader-free hybrid)." : settings.lightingMode==0
+        plugin::Events::d3dLostEvent += ReleaseBankTextures;
+        plugin::Events::d3dResetEvent += ReleaseBankTextures;
+        Log(settings.renderMode==2 ? "Procedural volumetric cloud renderer installed (SA 1.0 US, shader-free 3D cloud banks)." : settings.lightingMode==0
             ? "Procedural volumetric cloud renderer installed (SA 1.0 US, native lighting)."
             : "Procedural volumetric cloud renderer installed (SA 1.0 US, custom lighting).");
     }
