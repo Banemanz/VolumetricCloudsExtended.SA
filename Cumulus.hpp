@@ -206,15 +206,15 @@ inline int cards(const Settings& s,const Cloud& c,const View& v,float alpha,Card
         total+=weights[i];
     }
     const float angular=.55f*std::max({c.size.x,c.size.y,c.size.z})/std::max(1.f,length(eye));
-    const float near=smooth((angular-(s.cumulusDetail?.10f:.16f))/(s.cumulusDetail?.13f:.16f));
+    const float sliceWeight=smooth((angular-(s.cumulusDetail?.10f:.16f))/(s.cumulusDetail?.13f:.16f));
     const Vec right[3]={rx,ry,rx}, up[3]={rz,rz,ry}, depth[3]={ry,rx,rz}, axisDir[3]={y,x,z};
     const int variant=int(c.textureKey%Variants);
     for(int i=0;i<3;++i) {
         const float w=weights[i]/total;
         const int base=i*TilesPerAxis;
-        out[base]={c.position,right[i],up[i],stackAlpha(alpha,w*(1.f-near),false),.5f,
+        out[base]={c.position,right[i],up[i],stackAlpha(alpha,w*(1.f-sliceWeight),false),.5f,
             std::uint32_t(tileKey(variant,i,0))};
-        const float a=stackAlpha(alpha,w*near,true);
+        const float a=stackAlpha(alpha,w*sliceWeight,true);
         for(int j=0;j<Slabs;++j) {
             // Sample near the voxel slab midpoint; slightly compress spacing
             // to hide gaps between the three thick slices at oblique angles.

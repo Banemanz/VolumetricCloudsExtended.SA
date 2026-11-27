@@ -39,5 +39,8 @@ if(BUILD_TESTING)
     add_test(NAME cloud_core COMMAND cloud_tests)
     add_executable(cumulus_tests tests/cumulus_tests.cpp)
     target_compile_features(cumulus_tests PRIVATE cxx_std_17)
+    # RenderWare/Windows headers expose legacy near/far macros. Emulate
+    # those names in portable tests to catch collisions before the ASI build.
+    target_compile_definitions(cumulus_tests PRIVATE near= far=)
     add_test(NAME cloud_cumulus COMMAND cumulus_tests)
 endif()

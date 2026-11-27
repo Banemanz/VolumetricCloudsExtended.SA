@@ -295,3 +295,6 @@ lighting equation. This section supersedes the previous mode-2 representation.
   modes only; cumulus uses actual procedural atlas. Actual GTA appearance,
   alpha sorting at extreme oblique/close angles and weak GPU fill rate
   require user testing. Keep detail 0 recommended for potatoes.
+- Windows build follow-up: `near` is a legacy Win32 macro. Rename the LOD
+  variable to sliceWeight and compile portable cumulus tests with empty
+  near/far definitions so this SDK-specific macro collision is caught early.
