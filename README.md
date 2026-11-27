@@ -25,17 +25,16 @@ pipeline may still need compatibility testing.
   after a cloud leaves view. Teleports rebuild the field around the new position.
 - Smooth weather interpolation in both directions, including bad-to-bad transitions.
   Excess clouds fade out instead of remaining permanently allocated.
-- Clustered impostors (default): independently positioned soft cards form a cloud
-  group. Each card faces the camera and is depth-sorted, with stable world positions,
-  varied sizes/rolls and native lighting (optional custom shading). Increasing the card count does not
-  simply multiply opacity.
-- Crossed cards remain selectable for the native appearance.
-- Experimental shader-free cumulus mode (opt-in): airy, procedurally textured
-  clouds on three **fixed world-space planes** with separate projections of
-  a common density field, gentle sunlight and restrained night illumination.
-  Geometry, UVs and the light gradient do not rotate as the camera moves.
-  The economy setting draws at most six triangles per cloud. No external
-  texture or shader dependency.
+- Clustered native-texture clouds (default, mode 1): fixed crossed core
+  with independently placed, deterministically tilted satellite cards,
+  depth-sorted and angle-weighted. No camera-facing billboards. Increasing
+  the puff count does not simply multiply opacity.
+- Crossed cards (mode 0) preserve the native world-axis geometry.
+- Experimental shader-free cumulus (mode 2): a pre-baked three-dimensional
+  density field with self-shadowing, fixed axis-aligned texture slices for
+  depth/parallax, and inexpensive whole projections farther away.
+  All modes select their own fixed geometry automatically; yaw, pitch,
+  roll and altitude no longer rotate the cards or their texture coordinates.
 - Frustum rejection, actual camera far-plane limit, smooth range and near fades,
   back-to-front view-depth ordering and bounded RenderWare batches.
 - Additional textures are borrowed directly from the loaded particle TXD. Missing
@@ -74,14 +73,14 @@ text retains the default. Inline comments are supported.
 | UseAdditionalTextures | 1 | Look for listed textures in particle.txd |
 | IncludeOriginalTextureInRandom | 1 | Include native cloudhigh among variants |
 | CloudTextureNames | cloud2,cloud3,cloud4 | Comma-separated names; up to 15 |
-| RenderMode | 1 | 0 = crossed cards; 1 = clustered camera-facing cards; 2 = experimental shader-free cumulus |
+| RenderMode | 1 | 0 = crossed cards; 1 = clustered fixed world-space cards; 2 = experimental shader-free cumulus |
 | CumulusDensity | 0.95 | Mode 2: optical density multiplier (0–1) |
 | CumulusImpostors | 1 | Legacy key, accepted but ignored; mode 2 always uses fixed geometry |
 | CumulusNightLight | 1 | Mode 2: night illumination multiplier (0–2); smooth transition to daylight |
 | CumulusContrast | 0.65 | Mode 2: directional and underside lighting contrast (0–1) |
 | CumulusRimStrength | 0.85 | Mode 2: subtle sunward edge softening (0–1), never above native daytime luminance |
-| CumulusDetail | 0 | Mode 2: 0 = 2×2 grid (up to 6 triangles/cloud); 1 = 3×3 (up to 24 triangles/cloud) |
-| PuffsPerCloud | 5 | Number of cards per group (1–8) in clustered mode (1) only |
+| CumulusDetail | 0 | Mode 2: 0 = economy 64px tiles / 2×2 grid; 1 = 128px tiles / 3×3 grid, depth LOD farther out |
+| PuffsPerCloud | 5 | Mode 1: number of puffs (1–8); core uses three fixed planes, each satellite one |
 | SizeScale | 1 | Group dimensions multiplier |
 | Opacity | 1 | Group opacity multiplier (0–2) |
 | NearFadeDistance | 25 | Fade near the camera; 0 disables |
@@ -129,54 +128,66 @@ visibility and clipping still apply. `PuffsPerCloud` applies to mode 1 only.
 The obsolete `CumulusImpostors` key is accepted but ignored, so an older INI
 cannot accidentally restore rotating billboards.
 
-**World-fixed geometry:** inspired by SA's original three orthogonal planes
-(see engine reference below), each group has two vertical crossed planes and
-one horizontal plane. Their orientation is set by a deterministic cloud yaw
-and their sizes are the actual world-axis dimensions of the cloud. They never
-turn to face the player, including when moving vertically or through the cloud.
-The cloud's orientation, UVs and vertex lighting depend on its geometry and
-the environment only. The viewing direction changes *opacity* via squared,
-normalized direction cosines. Splitting optical depth across the planes
-smooths transitions at oblique angles; it is exact for equal full-mask samples
-but a visual approximation for real silhouettes. Edge-on planes can be culled.
-Near the center of the volume, the existing group proximity fade reduces
-cockpit intersections. There is no billboard-distance LOD or view-basis flip.
+**World-fixed geometry and level of detail:** a classic object-aligned
+texture-slicing technique, described in [SIGGRAPH 2004 Course 28, section 3.2](https://faculty.cc.gatech.edu/~jarek/lectures/V00Intro/handouts/Course28.pdf).
+Flight simulation has also used cheap cloud textures and impostors since
+at least [Flight Simulator 2004](https://niniane.org/clouds/). The implementation
+here is original and adapted to SA's own fixed-function RenderWare pipeline.
 
-**Textures:** the one-time CPU bake projects four deterministic, irregular
-3D lobe fields into three corresponding 128×128 textures each (XZ, YZ, XY).
-The twelve tiles fit a single 512×512 RGBA atlas (~1 MiB raw, as before).
-Integrated optical thickness, gentle erosion, organic density variation and
-a neutral low-contrast grayscale texture create soft fringes and avoid
-hard sphere boundaries. The coherent horizontal projection is particularly
-important when looking up from the ground. Cloud opacity is less aggressive
-than the previous nearly opaque body-plus-puff mode.
+Each archetype is a coherent 3D density field. Three perpendicular stacks
+(XZ, YZ, XY in a stable cloud-local yaw frame) each contain three integrated
+density slabs at fixed spatial offsets; there is also a single whole-cloud
+projection per axis. Close clouds use the slabs to approximate parallax and
+depth; distant clouds fade into the corresponding whole projections.
+Selection uses angular cloud size, not a hard world-distance switch, with
+detail 1 retaining the more detailed representation farther away.
+Stack opacity weights follow the projected area of each plane, suppress
+nearly edge-on stacks and blend the comparable axes. The alpha calibration
+preserves transmittance of a representative dense ray across stack/LOD
+transitions; it is approximate for other sample masks. **No camera-facing
+basis is used** in any mode; even when alpha or LOD changes, the card centers,
+orientation, UVs and vertex lighting remain fixed in world space.
 
-**Lighting:** the game's current sun vector and native neutral daytime
-luminance drive world-aligned gradients; texture RGB provides restrained
-density relief rather than exaggerated color or a white outline. Sunward
-edge softening never exceeds native daytime luminance. Night uses a small
-ambient floor and sky luminance, and a weak lunar directional gradient gated
-by an approximate midnight window and weather. `CumulusNightLight` scales
-night illumination. No brightness-equation changes to modes 0 or 1.
+**Textures:** four deterministic 3D density fields of overlapping lobes,
+turbulent erosion and irregular vertical development are baked once on CPU.
+Optical thickness is integrated over each slab and over the entire field
+(48 tiles total). Soft density taper, fractal interior structure, density
+gradient relief and a precomputed sky-light integral give the clouds more
+body than the earlier flat projections without harsh particle outlines.
+Economy detail uses a 512×512 RGBA atlas (48 64×64 tiles, 1 MiB raw).
+Optional detail 1 uses a 1024×1024 atlas (128×128 tiles, 4 MiB raw) and a
+higher-resolution bake. If it cannot be allocated, the economy atlas is
+tried; UVs work with either size. Atlas creation can take longer at detail 1,
+especially on older CPUs. No external textures are shipped.
 
-**Cost:** at detail 0 each plane uses four vertices and two triangles (up to
-12 vertices and six triangles per cloud); detail 1 uses nine vertices and
-eight triangles per plane (up to 27 vertices and 24 triangles per cloud).
-For 160 clouds this is at most 960/3840 triangles before culling, respectively.
-One fixed-function texture/blend pass, one shared atlas, same bounded
-RenderWare batches, no shaders, runtime raymarches, scene copies, extra
-targets or post-processing. Allocation failure falls back to mode 0 and is
-logged; the texture is destroyed before RenderWare shutdown. Fresh INIs
-default to detail 0. An existing INI with detail 1 stays at detail 1.
-If fill-rate is the bottleneck, reduce `TargetProcClouds`: all transparent
-renderers still incur overdraw and three intersecting planes may cover more
-pixels than one old impostor from oblique angles. This is not a measured
-performance guarantee.
+**Lighting:** pre-baked neutral self-shadowing approximates diffuse sky
+occlusion; the current game sun vector and native neutral daytime luminance
+drive world-aligned vertex gradients. Sunward edge softening never exceeds
+native daytime luminance. No excessive low-cloud tint or additive white
+halo. Night blends toward subdued sky illumination and weak approximate
+lunar lighting. `CumulusNightLight` scales night illumination. Modes 0 and
+1 retain the original neutral/custom lighting paths.
 
-The implementation and textures are original. It's still an approximation,
-not a raymarched volume. At very close range or some oblique angles flat
-intersections can become apparent; retaining this limitation is preferable
-to introducing expensive rendering passes for the target hardware.
+**Cost:** one fixed-function texture/blend pass, one shared atlas, bounded
+RenderWare batches, no shaders, 3D GPU textures, render targets, scene copies
+or per-frame raymarching. Economy detail draws two triangles per active card
+and most far clouds use only one; near clouds commonly use three. Up to
+12 candidates per group exist during simultaneous axis and distance LOD
+crossfades (24 triangles at detail 0, 96 at detail 1); zero/negligible alpha
+cards are discarded before visibility tests or submission. For a synthetic
+512-cloud diagnostic field, 912 active cards at economy detail and 1443 at
+detail 1 before frustum or distance-opacity culling (about 1.8/2.8 per group,
+not a measured game benchmark). Fresh configurations default to economy
+detail. An existing INI with detail 1 stays at detail 1. Use `CumulusDetail=0`
+for old GPUs; lower `TargetProcClouds` if transparent fill rate is limiting.
+Allocation failure of both atlas sizes falls back to mode 0 and is logged.
+The raster is released before RenderWare shutdown.
+
+This is a coarse volume approximation, not a physically accurate cloud
+renderer. Oblique and extremely close views may still reveal flat slices,
+crossfades or texture softness; transparent overdraw can vary by angle.
+The goal is a plausible period look on low-end hardware, not modern
+raymarched clouds.
 
 | Looking toward the sun | Looking away |
 |---|---|
@@ -184,6 +195,7 @@ to introducing expensive rendering passes for the target hardware.
 | ![Above clouds](docs/previews/cumulus_flight.jpg) | ![From the ground](docs/previews/cumulus_ground.jpg) |
 | ![Economy geometry](docs/previews/cumulus_low.jpg) | ![Night](docs/previews/cumulus_night.jpg) |
 | ![Looking upward](docs/previews/cumulus_zenith.jpg) | ![Within the cloud layer](docs/previews/cumulus_inside.jpg) |
+| ![Illustrative sunrise](docs/previews/cumulus_sunrise.jpg) | ![Isolated close cloud](docs/previews/cumulus_close.jpg) |
 
 | Identical world field, camera Z=30 | Camera Z=210 | Camera Z=390 |
 |---|---|---|

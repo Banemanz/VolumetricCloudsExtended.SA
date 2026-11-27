@@ -1,17 +1,20 @@
 #pragma once
 
-// Original shader-free clouds: three fixed world-space density projections.
+// Original shader-free clouds: preintegrated density slabs in fixed world space.
 // Both the one-time atlas bake and the per-vertex light are portable CPU code.
 #include "CloudCore.hpp"
 
 namespace vc::cumulus {
-constexpr int Tile=128, AtlasColumns=4, AtlasSize=Tile*AtlasColumns;
-constexpr int Variants=4, Projections=3, Tiles=Variants*Projections;
+constexpr int Tile=64, HighTile=128, AtlasColumns=8, AtlasSize=Tile*AtlasColumns;
+constexpr int Variants=4, Projections=3, Slabs=3, TilesPerAxis=Slabs+1;
+constexpr int Tiles=Variants*Projections*TilesPerAxis;
+constexpr int CardsPerCloud=Projections*TilesPerAxis;
+static_assert(CardsPerCloud<=MaxCards);
 constexpr int MaxGrid=3, MaxVertices=MaxGrid*MaxGrid, MaxIndices=(MaxGrid-1)*(MaxGrid-1)*6;
 struct Pixel { std::uint8_t r,g,b,a; };
 static_assert(sizeof(Pixel)==4);
 using Atlas=std::vector<Pixel>;
-struct Lobe { Vec center; float radius; };
+struct Lobe { Vec center; Vec radius; };
 
 inline std::uint8_t byte(float v) { return static_cast<std::uint8_t>(clamp(v,0.f,255.f)+.5f); }
 
@@ -27,61 +30,125 @@ inline float noise(float x,float y,std::uint32_t seed) {
     return mix(mix(hash(ix,iy,seed),hash(ix+1,iy,seed),u),
                mix(hash(ix,iy+1,seed),hash(ix+1,iy+1,seed),u),v);
 }
-// All three textures are projections of the same deterministic lobe field.
-// XZ, YZ, XY respectively: the vertical profiles share the world's Z axis.
-inline Vec project(Vec p,int plane) {
-    if(plane==0)return {p.x,p.z,p.y};
-    if(plane==1)return {p.y,p.z,p.x};
-    return p;
+// A small coherent 3D density field. The expensive procedural and
+// self-shadowing work runs only at atlas creation, never in the frame loop.
+inline float noise3(float x,float y,float z,std::uint32_t seed) {
+    const int iz=int(std::floor(z));
+    return mix(noise(x,y,seed+std::uint32_t(iz)*0x27d4eb2du),
+               noise(x,y,seed+std::uint32_t(iz+1)*0x27d4eb2du),smooth(z-iz));
 }
-inline Atlas bakeAtlas() {
-    Atlas pixels(AtlasSize*AtlasSize,{255,255,255,0});
+inline int tileKey(int variant,int axis,int slab) {
+    return (variant*Projections+axis)*TilesPerAxis+slab; // 0 = full projection, 1..3 = slabs
+}
+inline int atlasTile(const Settings& s) {return s.cumulusDetail?HighTile:Tile;}
+inline Atlas bakeAtlas(int tileSize=Tile) {
+    const int res=tileSize>=HighTile?HighTile:Tile;
+    const int atlasSize=res*AtlasColumns;
+    const auto coordinate=[res](int i){return 2.f*(i+.5f)/res-1.f;};
+    const auto voxel=[res](int x,int y,int z)->std::size_t{return (z*res+y)*res+x;};
+    Atlas pixels(atlasSize*atlasSize,{255,255,255,0});
+    std::vector<float> density(res*res*res),light(density.size());
+    const float extinction=9.8f/res;
     for(int variant=0;variant<Variants;++variant) {
         RNG rng{std::uint32_t(42119+variant*10739)};
-        std::array<Lobe,24> lobes{};
-        lobes[0]={{0,0,-.12f},.61f};
-        // Broad, irregular body and a few higher billows. No regular sphere
-        // outlines or baked sun-side highlight. Density tapers at the edge.
+        std::array<Lobe,19> lobes{};
+        lobes[0]={{0,0,-.22f},{.63f,.55f,.39f}};
+        // Broad base and asymmetric, vertically developed shoulders.
+        // Every archetype is one connected density field, not a pile of
+        // baked sphere silhouettes.
         for(int i=1;i<=8;++i) {
-            const float angle=(i-1+rng.sample(-.4f,.4f))*2.f*Pi/8;
-            lobes[i]={{std::cos(angle)*rng.sample(.32f,.50f),
-                       std::sin(angle)*rng.sample(.29f,.49f),
-                       rng.sample(-.30f,.10f)},rng.sample(.27f,.43f)};
+            const float angle=(i-1+rng.sample(-.5f,.5f))*2.f*Pi/8;
+            const float r=rng.sample(.24f,.41f);
+            lobes[i]={{std::cos(angle)*rng.sample(.30f,.52f),
+                       std::sin(angle)*rng.sample(.27f,.50f),
+                       rng.sample(-.32f,.06f)},{r*1.12f,r,r*.94f}};
         }
         for(int i=9;i<int(lobes.size());++i) {
-            const float angle=rng.sample(0.f,2.f*Pi),d=rng.sample(.10f,.51f);
-            lobes[i]={{std::cos(angle)*d,std::sin(angle)*d,rng.sample(.07f,.49f)},
-                      rng.sample(.15f,.30f)};
+            const float angle=rng.sample(0.f,2.f*Pi),d=rng.sample(.08f,.44f);
+            const float r=rng.sample(.20f,.39f);
+            lobes[i]={{std::cos(angle)*d,std::sin(angle)*d,rng.sample(.08f,.54f)},
+                      {r,r,r*rng.sample(.85f,1.28f)}};
         }
-        for(int plane=0;plane<Projections;++plane) {
-            const int tile=variant*Projections+plane;
-            const auto seed=std::uint32_t(7607+variant*907+plane*3391);
-            std::array<Lobe,24> projected=lobes;
-            for(auto& l:projected)l.center=project(l.center,plane);
-            for(int y=1;y<Tile-1;++y) for(int x=1;x<Tile-1;++x) {
-                const float u=2.f*(x+.5f)/Tile-1.f,v=1.f-2.f*(y+.5f)/Tile;
-                const float warpX=(noise(u*5.f,v*5.f,seed+1)-.5f)*.22f;
-                const float warpY=(noise(u*5.f,v*5.f,seed+2)-.5f)*.22f;
-                const float erosion=(noise(u*8.f,v*8.f,seed)-.5f)*.30f+
-                    (noise(u*21.f,v*21.f,seed+11)-.5f)*.13f+
-                    (noise(u*40.f,v*40.f,seed+19)-.5f)*.06f;
-                float tau=0.f;
-                for(const auto& l:projected) {
-                    const float dx=(u+warpX-l.center.x)/l.radius,dy=(v+warpY-l.center.y)/l.radius;
-                    const float w=std::max(0.f,1.f-dx*dx-dy*dy+erosion);
-                    // Integrated soft radial density; not opaque sphere sprites.
-                    tau+=1.35f*w*std::sqrt(w);
+        // Pre-invert radii to avoid three divisions per lobe per voxel.
+        for(auto& l:lobes)l.radius={1.f/l.radius.x,1.f/l.radius.y,1.f/l.radius.z};
+        const auto seed=std::uint32_t(7607+variant*907);
+        for(int z=0;z<res;++z)for(int y=0;y<res;++y)for(int x=0;x<res;++x) {
+            const Vec p{coordinate(x),coordinate(y),coordinate(z)};
+            float sum=0.f;
+            for(const auto& l:lobes) {
+                const Vec d=p-l.center;
+                const Vec q{d.x*l.radius.x,d.y*l.radius.y,d.z*l.radius.z};
+                const float w=std::max(0.f,1.f-dot(q,q));
+                sum+=w*w;
+            }
+            if(sum<=.002f){density[voxel(x,y,z)]=0;continue;}
+            const float coarse=noise3(p.x*4.8f,p.y*4.8f,p.z*4.8f,seed);
+            const float fine=noise3(p.x*12.f,p.y*12.f,p.z*12.f,seed+91);
+            const float grain=noise3(p.x*25.f,p.y*25.f,p.z*25.f,seed+173);
+            const float micro=noise3(p.x*44.f,p.y*44.f,p.z*44.f,seed+373);
+            const float n=(coarse-.5f)*.58f+(fine-.5f)*.30f+(grain-.5f)*.14f+(micro-.5f)*.045f;
+            const float edge=std::min({1.f-std::abs(p.x),1.f-std::abs(p.y),1.f-std::abs(p.z)});
+            const float base=smooth((p.z+.68f+n*.18f)/.23f);
+            // Turbulence erodes the boundary and varies the interior. Thick
+            // lobes merge smoothly; the lowest portion has a modest flat base.
+            density[voxel(x,y,z)]=smooth((std::sqrt(sum)+n-.12f)/.46f)
+                *mix(.40f,1.f,.45f*coarse+.42f*fine+.13f*grain)*smooth(edge*8.f)*base;
+        }
+        // A vertical light integral approximates diffuse self-shadowing
+        // from the sky. Dynamic world-space solar tint is still vertex-lit.
+        for(int y=0;y<res;++y)for(int x=0;x<res;++x){
+            float above=0.f;
+            for(int z=res-1;z>=0;--z) {
+                const auto i=voxel(x,y,z);
+                const float tau=density[i]*extinction;
+                const auto at=[&](int a,int b,int c) {
+                    return density[voxel(std::clamp(a,0,res-1),std::clamp(b,0,res-1),std::clamp(c,0,res-1))];
+                };
+                // Small-scale density relief supplies readable billows in
+                // addition to the large-scale diffuse sky occlusion.
+                const Vec normal=unit(Vec{at(x-1,y,z)-at(x+1,y,z),at(x,y-1,z)-at(x,y+1,z),
+                                          at(x,y,z-1)-at(x,y,z+1)});
+                const float relief=.5f+.5f*dot(normal,Vec{-.30f,.22f,.928f});
+                light[i]=clamp(.76f+.22f*std::exp(-.84f*(above+tau*.5f))+.13f*(relief-.5f),.72f,1.f);
+                above+=tau;
+            }
+        }
+        for(int axis=0;axis<Projections;++axis) {
+            std::vector<std::array<float,TilesPerAxis>> thickness(res*res), radiance(res*res);
+            for(int y=1;y<res-1;++y)for(int x=1;x<res-1;++x) {
+                std::array<float,TilesPerAxis> tau{},lit{};
+                // XZ depth +Y, YZ depth +X, XY depth +Z.
+                for(int k=0;k<res;++k) {
+                    const int v=res-1-y;
+                    const auto i=axis==0?voxel(x,k,v):axis==1?voxel(k,x,v):voxel(x,v,k);
+                    const float t=density[i]*extinction;
+                    const int slab=1+std::min(Slabs-1,k*Slabs/res);
+                    tau[0]+=t;lit[0]+=t*light[i];
+                    tau[slab]+=t;lit[slab]+=t*light[i];
                 }
-                const float broad=noise(u*5.f,v*5.f,seed+147);
-                const float fine=noise(u*17.f,v*17.f,seed+31);
-                tau*=mix(.55f,1.20f,.65f*broad+.35f*fine);
-                const float border=smooth((1.f-std::max(std::abs(u),std::abs(v)))*7.f);
-                const float alpha=(1.f-std::exp(-tau))*border;
-                // A low-contrast neutral density texture leaves illumination
-                // to the game's timecycle, with no luminous white edge band.
-                const float grey=clamp(.98f-.065f*smooth(tau*.4f)+.07f*(broad-.5f)+.035f*(fine-.5f),.88f,1.f);
-                const auto c=byte(grey*255.f);
-                pixels[(tile/AtlasColumns*Tile+y)*AtlasSize+tile%AtlasColumns*Tile+x]={c,c,c,byte(alpha*255.f)};
+                thickness[y*res+x]=tau;radiance[y*res+x]=lit;
+            }
+            for(int y=1;y<res-1;++y)for(int x=1;x<res-1;++x) {
+                const auto& tau=thickness[y*res+x];
+                const auto& lit=radiance[y*res+x];
+                for(int slab=0;slab<TilesPerAxis;++slab) {
+                    const int tile=tileKey(variant,axis,slab);
+                    const float u=coordinate(x),v=coordinate(res-1-y);
+                    // Fine texture variation, restricted to the body, not a
+                    // hard white rim. Per-projection grain does not affect alpha.
+                    const float grain=(noise(u*15.f,v*15.f,seed+axis*331)-.5f)*.07f+
+                                      (noise(u*30.f,v*30.f,seed+axis*331+71)-.5f)*.045f;
+                    const auto sample=[&](int px,int py) {
+                        return thickness[std::clamp(py,0,res-1)*res+std::clamp(px,0,res-1)][slab];
+                    };
+                    const int step=std::max(1,res/48);
+                    const float gx=sample(x-step,y)-sample(x+step,y);
+                    const float gy=sample(x,y+step)-sample(x,y-step);
+                    const float relief=.085f*clamp(-.45f*gx+.8f*gy,-1.f,1.f)*smooth(tau[slab]*1.5f);
+                    const auto c=tau[slab]>1e-5f?byte(clamp(lit[slab]/tau[slab]+grain+relief,.72f,1.f)*255.f):std::uint8_t(255);
+                    const auto a=byte((1.f-std::exp(-tau[slab]))*255.f);
+                    pixels[(tile/AtlasColumns*res+y)*atlasSize+tile%AtlasColumns*res+x]={c,c,c,a};
+                }
             }
         }
     }
@@ -91,7 +158,8 @@ inline Atlas bakeAtlas() {
 struct UV { float u,v; };
 inline UV atlasUV(std::uint32_t key,float u,float v) {
     const int tile=int(key%Tiles);
-    // Half-texel inset: bilinear filtering never reads another projection.
+    // Conservative half-texel inset for the 64px atlas; also safe for 128px tiles.
+    // UVs do not change if the higher resolution allocation falls back.
     return {(tile%AtlasColumns*Tile+.5f+sat(u)*(Tile-1))/AtlasSize,
             (tile/AtlasColumns*Tile+.5f+sat(v)*(Tile-1))/AtlasSize};
 }
@@ -102,27 +170,61 @@ inline float opticalPortion(float alpha,float weight) {
     return 1.f-std::pow(1.f-std::min(sat(alpha),.9995f),weight);
 }
 
-// Like SA's native intersecting-card renderer, NONE of the geometry follows
-// the camera. Only the three optical weights respond to observer position.
-// Each cloud has a deterministic yaw with a true horizontal underside.
-inline int cards(const Settings&,const Cloud& c,const View& v,float alpha,Card* out) {
+// Normalize alpha shares against a representative dense ray. The 2D
+// fixed-function alpha multiplier cannot exponentiate each texture sample;
+// this calibration keeps slice and whole-projection LOD close for the core.
+inline float stackAlpha(float alpha,float share,bool sliced) {
+    if(share<=0.f||alpha<=0.f)return 0.f;
+    constexpr float reference=.95f;
+    const float target=opticalPortion(sat(alpha)*reference,share);
+    if(!sliced)return target/reference;
+    const float referenceSlab=1.f-std::pow(1.f-reference,1.f/Slabs);
+    return sat((1.f-std::pow(1.f-target,1.f/Slabs))/referenceSlab);
+}
+inline int cards(const Settings& s,const Cloud& c,const View& v,float alpha,Card* out) {
     const float angle=float((c.textureKey>>8)&1023u)*(2.f*Pi/1024.f);
     const float co=std::cos(angle),si=std::sin(angle);
     const Vec x{co,si,0},y{-si,co,0},z{0,0,1};
-    const Vec rx=x*(c.size.x*.5f),ry=y*(c.size.y*.5f),rz=z*(c.size.z*.5f);
-    const auto direction=unit(v.pos-c.position);
-    const float dx=dot(x,direction),dy=dot(y,direction),dz=direction.z;
-    // Squared direction cosines sum to one. Preserve total optical depth
-    // at the common center (different silhouettes still approximate a volume).
-    const float sum=dx*dx+dy*dy+dz*dz;
-    const float wx=sum>1e-5f?dx*dx/sum:1.f/3.f;
-    const float wy=sum>1e-5f?dy*dy/sum:1.f/3.f;
-    const float wz=sum>1e-5f?dz*dz/sum:1.f/3.f;
-    const auto key=(c.textureKey%Variants)*Projections;
-    out[0]={c.position,rx,rz,opticalPortion(alpha,wy),.5f,key};
-    out[1]={c.position,ry,rz,opticalPortion(alpha,wx),.5f,key+1};
-    out[2]={c.position,rx,ry,opticalPortion(alpha,wz),.5f,key+2};
-    return Projections;
+    // Keep some stretched clouds but avoid needle-like silhouettes from
+    // the independent legacy X/Y random scales. Only affects mode 2.
+    const float broad=std::max(c.size.x,c.size.y);
+    const float sx=mix(c.size.x,broad,.20f),sy=mix(c.size.y,broad,.20f);
+    const Vec rx=x*(sx*.55f),ry=y*(sy*.55f),rz=z*(c.size.z*.66f);
+    const auto eye=v.pos-c.position;
+    const auto direction=unit(eye);
+    const std::array<float,3> facing{
+        std::abs(dot(y,direction))/std::max(sy,1.f),
+        std::abs(dot(x,direction))/std::max(sx,1.f),
+        std::abs(direction.z)/std::max(c.size.z*1.20f,1.f)};
+    const float strongest=std::max({facing[0],facing[1],facing[2]});
+    std::array<float,3> weights{};
+    float total=0.f;
+    for(int i=0;i<3;++i) {
+        // Suppress nearly edge-on stacks; smoothly crossfade comparable
+        // axes instead of switching abruptly at 45 degrees.
+        weights[i]=strongest>1e-5f?smooth((facing[i]/strongest-.70f)/.30f):1.f;
+        total+=weights[i];
+    }
+    const float angular=.55f*std::max({c.size.x,c.size.y,c.size.z})/std::max(1.f,length(eye));
+    const float near=smooth((angular-(s.cumulusDetail?.10f:.16f))/(s.cumulusDetail?.13f:.16f));
+    const Vec right[3]={rx,ry,rx}, up[3]={rz,rz,ry}, depth[3]={ry,rx,rz}, axisDir[3]={y,x,z};
+    const int variant=int(c.textureKey%Variants);
+    for(int i=0;i<3;++i) {
+        const float w=weights[i]/total;
+        const int base=i*TilesPerAxis;
+        out[base]={c.position,right[i],up[i],stackAlpha(alpha,w*(1.f-near),false),.5f,
+            std::uint32_t(tileKey(variant,i,0))};
+        const float a=stackAlpha(alpha,w*near,true);
+        for(int j=0;j<Slabs;++j) {
+            // Sample near the voxel slab midpoint; slightly compress spacing
+            // to hide gaps between the three thick slices at oblique angles.
+            // Positions and UVs never follow the eye.
+            const float p=(2.f*j+1.f)/Slabs-1.f;
+            out[base+j+1]={c.position+depth[i]*(p*.85f),right[i],up[i],a,.5f,
+                std::uint32_t(tileKey(variant,i,j+1)),axisDir[i]*p};
+        }
+    }
+    return CardsPerCloud;
 }
 
 inline float moonVisibility(int hour,int minute,float rain,float fog) {
@@ -144,18 +246,18 @@ struct Lighting {
           nightSky(mixRGB(p.skyTop,p.skyBottom,.25f)) {
         if(length(sun)<.5f) {sun={0,0,1};day=1.f;}
     }
-    struct Basis { Vec right,up; };
+    struct Basis { Vec right,up,offset; };
     // Fixed world light gradients, no camera-facing normals or rotating rim.
     Basis basis(const Card& card,const View&) const {
-        return {unit(card.right),unit(card.up)};
+        return {unit(card.right),unit(card.up),card.lightOffset};
     }
     RGB shade(const Basis& b,float x,float y) const {
-        const Vec offset=b.right*x+b.up*y;
+        const Vec offset=b.offset+b.right*x+b.up*y;
         const float height=sat(.5f+.5f*offset.z);
         const float direct=sat(.5f+.5f*dot(offset,sun));
         // Modest deep-body shadow and a sunward softening instead of an
         // additive silver outline. Even maximum rim cannot exceed neutral.
-        const float diffuse=.83f+.10f*direct+.07f*height;
+        const float diffuse=.86f+.09f*direct+.05f*height;
         const float light=mix(1.f,diffuse,contrast);
         const float edge=smooth((length(offset)-.40f)/.60f);
         const float softened=mix(light,1.f,rim*.25f*edge*direct);

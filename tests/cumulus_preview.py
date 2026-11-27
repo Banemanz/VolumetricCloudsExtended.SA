@@ -77,5 +77,5 @@ def render(scene,executable,destination):
     return im
 if __name__=="__main__":
     out=pathlib.Path(sys.argv[2]);out.mkdir(parents=True,exist_ok=True)
-    for scene in ("back","front","flight","ground","low","night","zenith","inside","height_low","height_mid","height_high"):
+    for scene in ("back","front","flight","ground","low","night","zenith","inside","height_low","height_mid","height_high","sunrise","close"):
         render(scene,sys.argv[1],out/f"cumulus_{scene}.jpg")

@@ -98,24 +98,43 @@ int main() {
     for (auto& c:f.clouds) if (c.used) CHECK(horizontalSq(c.position-view.pos)<=r.spawnMax*r.spawnMax+2.f);
 
     Cloud c=f.clouds[0];
-    Card cardsOut[MaxPuffs];
-    for (int count=1;count<=MaxPuffs;++count) {
-        cfg.puffsPerCloud=count;
-        CHECK(cards(cfg,c,view,.5f,cardsOut)==count);
-        float transmittance=1;
-        for (int i=0;i<count;++i) {
-            const auto& p=cardsOut[i];
-            CHECK(finite(p.center) && finite(p.right) && finite(p.up));
-            CHECK(close(dot(unit(p.right),unit(p.up)),0));
-            CHECK(close(dot(unit(p.right),view.forward),0));
-            CHECK(length(p.center-c.position)+cardBound(p)<=bound(c));
-            transmittance*=1-p.alpha;
+    Card cardsOut[MaxCards],moved[MaxCards];
+    const auto verifyFixed=[&](int mode,int puffs){
+        cfg.renderMode=mode;cfg.puffsPerCloud=puffs;
+        const int n=cards(cfg,c,view,.5f,cardsOut);
+        CHECK(n==(mode==0?3:puffs+2) && n<=MaxCards);
+        for(int z=-3;z<=3;++z)for(int x=-2;x<=2;++x)for(int y=-2;y<=2;++y) {
+            View changed=view;
+            changed.pos=c.position+Vec{float(x)*200,float(y)*200,float(z)*120};
+            changed.forward={0,0,1};changed.up={0,1,0};changed.right={-1,0,0};
+            CHECK(cards(cfg,c,changed,.5f,moved)==n);
+            float trans=1.f;
+            for(int i=0;i<n;++i) {
+                const auto& p=cardsOut[i];const auto& q=moved[i];
+                CHECK(finite(q.center)&&finite(q.right)&&finite(q.up));
+                CHECK(close(dot(unit(q.right),unit(q.up)),0));
+                CHECK(length(q.center-c.position)+cardBound(q)<=bound(c));
+                CHECK(length(p.center-q.center)==0 && length(p.right-q.right)==0 && length(p.up-q.up)==0);
+                CHECK(p.textureKey==q.textureKey && p.shade==q.shade);
+                CHECK(q.alpha>=0.f&&q.alpha<=1.f);
+                trans*=1.f-q.alpha;
+                // A pure camera rotation must leave even the alpha untouched.
+                View rotated=changed;rotated.right={1,0,0};rotated.up={0,0,1};rotated.forward={0,1,0};
+                Card rotatedCards[MaxCards];cards(cfg,c,rotated,.5f,rotatedCards);
+                CHECK(q.alpha==rotatedCards[i].alpha);
+            }
+            if(mode==1)CHECK(close(trans,.25f));
         }
-        CHECK(close(transmittance,.25f));
+    };
+    verifyFixed(0,1);
+    for(int count=1;count<=MaxPuffs;++count)verifyFixed(1,count);
+    for(const auto& c:g.clouds)if(c.used) {
+        cfg.renderMode=1;cfg.puffsPerCloud=MaxPuffs;
+        CHECK(cards(cfg,c,view,.5f,cardsOut)==MaxPuffs+2);
+        for(int i=0;i<MaxPuffs+2;++i)
+            CHECK(length(cardsOut[i].center-c.position)+cardBound(cardsOut[i])<=bound(c));
     }
     cfg.renderMode=0;
-    CHECK(cards(cfg,c,view,.5f,cardsOut)==3);
-    for(int i=0;i<3;++i) CHECK(cardsOut[i].alpha>=0 && cardsOut[i].alpha<=.5f);
 
     // Above the altitude band, initial/recycled clouds retain vertical variation.
     Field highField; highField.reset(cfg);

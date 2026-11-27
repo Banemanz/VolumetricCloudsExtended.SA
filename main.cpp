@@ -12,6 +12,7 @@
 #include "CTxdStore.h"
 #include "CScene.h"
 #include "Cumulus.hpp"
+#include <new>
 
 #include <array>
 #include <cstring>
@@ -75,24 +76,36 @@ bool EnsureCumulusAtlas() {
     if (atlasAttempted) return cumulusRaster!=nullptr;
     atlasAttempted=true;
     using namespace vc::cumulus;
-    RwImage* img=RwImageCreate(AtlasSize,AtlasSize,32);
-    if (img) {
-        if (RwImageAllocatePixels(img) && RwImageGetPixels(img) && RwImageGetStride(img)>=AtlasSize*4) {
-            const auto pixels=bakeAtlas();
-            for (int y=0;y<AtlasSize;++y)
-                std::memcpy(RwImageGetPixels(img)+y*RwImageGetStride(img),
-                            pixels.data()+y*AtlasSize,AtlasSize*sizeof(Pixel));
-            RwInt32 w=0,h=0,depth=0,format=0;
-            if (RwImageFindRasterFormat(img,rwRASTERTYPETEXTURE,&w,&h,&depth,&format)
-                && w==AtlasSize && h==AtlasSize) {
-                cumulusRaster=RwRasterCreate(w,h,depth,format|rwRASTERTYPETEXTURE);
-                if (cumulusRaster && !RwRasterSetFromImage(cumulusRaster,img)) {
-                    RwRasterDestroy(cumulusRaster);
-                    cumulusRaster=nullptr;
+    const int requested=atlasTile(settings);
+    const auto create=[&](int tileSize) {
+        const int size=tileSize*AtlasColumns;
+        RwImage* img=RwImageCreate(size,size,32);
+        if (!img) return;
+        if (RwImageAllocatePixels(img) && RwImageGetPixels(img) && RwImageGetStride(img)>=size*4) {
+            try {
+                const auto pixels=bakeAtlas(tileSize);
+                for (int y=0;y<size;++y)
+                    std::memcpy(RwImageGetPixels(img)+y*RwImageGetStride(img),
+                                pixels.data()+y*size,size*sizeof(Pixel));
+                RwInt32 w=0,h=0,depth=0,format=0;
+                if (RwImageFindRasterFormat(img,rwRASTERTYPETEXTURE,&w,&h,&depth,&format)
+                    && w==size && h==size) {
+                    cumulusRaster=RwRasterCreate(w,h,depth,format|rwRASTERTYPETEXTURE);
+                    if (cumulusRaster && !RwRasterSetFromImage(cumulusRaster,img)) {
+                        RwRasterDestroy(cumulusRaster);
+                        cumulusRaster=nullptr;
+                    }
                 }
+            } catch (const std::bad_alloc&) {
+                Log("Cumulus: procedural atlas CPU allocation failed.");
             }
         }
         RwImageDestroy(img);
+    };
+    create(requested);
+    if (!cumulusRaster && requested!=Tile) {
+        Log("Cumulus: detail atlas unavailable; trying economy atlas.");
+        create(Tile);
     }
     Log(cumulusRaster?"Cumulus: shader-free procedural atlas generated."
                       :"Cumulus: atlas creation failed; using crossed native textures.");
@@ -208,7 +221,7 @@ struct DrawCard {
     int order;
     RwRaster* raster;
 };
-std::array<DrawCard,vc::MaxClouds*vc::MaxPuffs> drawList;
+std::array<DrawCard,vc::MaxClouds*vc::MaxCards> drawList;
 std::array<RwIm3DVertex,BatchVertices> vertices;
 constexpr int BatchIndices=BatchVertices*4;
 std::array<RwImVertexIndex,BatchIndices> modernIndices;
@@ -316,13 +329,14 @@ void __cdecl RenderClouds() {
         if (!c.used) continue;
         const float a=vc::cloudAlpha(settings,c,view,range);
         if (a<1.f/255.f || !Visible(camera,c.position,vc::bound(c))) continue;
-        vc::Card cards[vc::MaxPuffs];
+        vc::Card cards[vc::MaxCards];
         const int count=modern?vc::cumulus::cards(settings,c,view,a,cards):vc::cards(settings,c,view,a,cards);
         for (int i=0;i<count;++i) {
             auto& card=cards[i];
+            if (card.alpha<1.f/255.f) continue;
             const float depth=vc::viewDepth(view,card.center);
             const float radius=vc::cardBound(card);
-            if (card.alpha<1.f/255.f || depth+radius<view.nearClip ||
+            if (depth+radius<view.nearClip ||
                 depth-radius>view.farClip || !Visible(camera,card.center,radius)) continue;
             drawList[drawCount]={card,depth,drawCount,modern?cumulusRaster:textures.get(card.textureKey)};
             ++drawCount;

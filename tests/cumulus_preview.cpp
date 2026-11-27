@@ -9,12 +9,12 @@ using namespace vc;
 int main(int argc,char** argv) {
     if(argc<3) return 2;
     const std::string scene=argv[1];
-    const auto atlas=cumulus::bakeAtlas();
+    Settings cfg; cfg.renderMode=2;
+    cfg.targetProcClouds=160; cfg.cumulusDetail=scene=="low"?0:1;
+    const auto atlas=cumulus::bakeAtlas(cumulus::atlasTile(cfg));
     std::ofstream rgba(argv[2],std::ios::binary);
     rgba.write(reinterpret_cast<const char*>(atlas.data()),atlas.size()*sizeof(cumulus::Pixel));
     if(!rgba) return 3;
-    Settings cfg; cfg.renderMode=2;
-    cfg.targetProcClouds=160; cfg.cumulusDetail=1;
     float height=400,pitch=.07f;
     Vec sun=unit(Vec{-.32f,.92f,.24f});
     Palette p{{75,148,215},{174,220,250},{50,50,50},{50,50,50}};
@@ -22,22 +22,31 @@ int main(int argc,char** argv) {
     if(scene=="flight"){height=680;pitch=-.15f;}
     if(scene=="inside"){height=410;pitch=.12f;cfg.spawnRadiusMin=30;}
     if(scene=="ground"){height=30;pitch=.3f;}
+    if(scene=="sunrise"){height=30;pitch=.45f;p={{143,248,250},{255,183,115},{0,0,0},{0,0,0}};
+        sun=unit(Vec{-.35f,.92f,.12f});}
+    if(scene=="close"){height=400;pitch=0;sun=unit(Vec{-.65f,-.45f,.62f});}
     if(scene=="zenith" || scene=="night"){height=30;pitch=1.10f;cfg.spawnRadiusMin=25;cfg.spawnRadiusMax=1250;cfg.targetProcClouds=100;}
     const bool heightSequence=scene=="height_low" || scene=="height_mid" || scene=="height_high";
     if(heightSequence){height=30;pitch=.6f;cfg.spawnRadiusMin=25;cfg.spawnRadiusMax=1250;cfg.targetProcClouds=100;}
-    if(scene=="low")cfg.cumulusDetail=0;
     if(scene=="night"){p={{35,48,51},{52,62,63},{0,0,0},{0,0,0}};sun=unit(Vec{.4f,.5f,-.6f});}
     View v{{0,0,height},{1,0,0},{0,-std::sin(pitch),std::cos(pitch)},
         {0,std::cos(pitch),std::sin(pitch)},2500,1};
     const auto r=range(cfg,v.farClip,2000);
     Field f; f.reset(cfg); f.update(cfg,v,r,target(cfg,0),{},1);
+    if(scene=="close"){
+        // One controlled cloud, framed at a slant, rather than a generated
+        // field; lets us inspect the actual slab texture/relief and depth.
+        f.clouds={};
+        auto& c=f.clouds[0];c.used=true;c.position={0,345,400};c.size={430,320,165};
+        c.alpha=.5f;c.fade=1.f;c.textureKey=17321;
+    }
     // Identical field and yaw for all three height shots. Only camera Z changes.
     if(heightSequence) {
         v.pos.z=scene=="height_low"?30.f:scene=="height_mid"?210.f:390.f;
     }
     std::vector<Card> items;
     for(const auto& c:f.clouds) if(c.used) {
-        Card out[MaxPuffs];
+        Card out[MaxCards];
         const float a=cloudAlpha(cfg,c,v,r);
         if(a<1.f/255.f)continue;
         const int n=cumulus::cards(cfg,c,v,a,out);

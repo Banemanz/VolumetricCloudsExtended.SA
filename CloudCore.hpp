@@ -12,7 +12,8 @@
 #include <vector>
 
 namespace vc {
-constexpr int MaxClouds = 512, MaxPuffs = 8;
+constexpr int MaxClouds = 512, MaxPuffs = 8, MaxCards = 12;
+static_assert(MaxPuffs+2<=MaxCards);
 constexpr float Pi = 3.14159265359f;
 inline float clamp(float v, float lo, float hi) { return std::clamp(v, lo, hi); }
 inline float sat(float v) { return std::isfinite(v) ? clamp(v, 0.f, 1.f) : 0.f; }
@@ -27,6 +28,7 @@ struct Vec {
     Vec operator/(float f) const { return *this*(1.f/f); }
 };
 inline float dot(Vec a, Vec b) { return a.x*b.x+a.y*b.y+a.z*b.z; }
+inline Vec cross(Vec a,Vec b) { return {a.y*b.z-a.z*b.y,a.z*b.x-a.x*b.z,a.x*b.y-a.y*b.x}; }
 inline float length(Vec a) { return std::sqrt(dot(a,a)); }
 inline float horizontalSq(Vec a) { return a.x*a.x+a.y*a.y; }
 inline Vec unit(Vec a) { const float d = length(a); return d > 1e-5f ? a/d : Vec{}; }
@@ -51,7 +53,7 @@ struct Settings {
     float cumulusDensity = .95f, cumulusContrast = .65f, cumulusRimStrength = .85f;
     bool cumulusImpostors = true; // legacy INI compatibility; mode 2 is always world-fixed
     float cumulusNightLight = 1.f;
-    int cumulusDetail = 0; // 0: 2x2 vertex lattice; 1: 3x3
+    int cumulusDetail = 0; // 0: economy atlas/2x2; 1: higher-res atlas/3x3
     float sizeScale = 1.f, opacity = 1.f, nearFadeDistance = 25.f;
     float bottomShade = 1.f, hazeStrength = 0.f;
     bool useGameFog = false;
@@ -311,7 +313,7 @@ public:
     }
 };
 
-struct Card { Vec center, right, up; float alpha, shade; std::uint32_t textureKey; };
+struct Card { Vec center, right, up; float alpha, shade; std::uint32_t textureKey; Vec lightOffset{}; };
 inline float cloudAlpha(const Settings& s,const Cloud& c,const View& v,const Range& r) {
     const float dist=length(c.position-v.pos);
     // Fade before the cloud's far edge reaches the range. Near fade reduces cockpit/aircraft intersections.
@@ -319,7 +321,7 @@ inline float cloudAlpha(const Settings& s,const Cloud& c,const View& v,const Ran
     const float nearFade=s.nearFadeDistance>0.f ? smooth(dist/(s.nearFadeDistance+bound(c)*.30f)) : 1.f;
     const float randomDensity=sat((c.alpha*255.f-36.f)/92.f);
     const float density=s.renderMode==2
-        ? s.cumulusDensity*mix(.48f,.80f,randomDensity)
+        ? s.cumulusDensity*mix(.68f,.94f,randomDensity)
         : c.alpha;
     return sat(density*s.opacity*smooth(c.fade)*distanceAlpha(r,edge)*nearFade);
 }
@@ -331,15 +333,47 @@ inline int cards(const Settings& s,const Cloud& c,const View& v,float alpha,Card
         out[2]={c.position,{0,c.size.y*.5f,0},{0,0,c.size.z*.5f},alpha*std::max(s.quadFacingMin,std::abs(direction.x)),.5f,c.textureKey};
         return 3;
     }
-    // Per-puff optical depth is normalized, so more slices do not simply multiply opacity.
-    const float opacity=1.f-std::pow(1.f-sat(alpha),2.f/s.puffsPerCloud);
-    for (int i=0;i<s.puffsPerCloud;++i) {
+    // Mode 1: retain clustered native textures without screen-facing cards.
+    // A fixed crossed core guarantees coverage even with PuffsPerCloud=1.
+    // Each extra puff is a single world-fixed, deterministically tilted card.
+    const int puffs=std::clamp(s.puffsPerCloud,1,MaxPuffs);
+    const float yaw=float((c.textureKey>>8)&1023u)*(2.f*Pi/1024.f);
+    const Vec x{std::cos(yaw),std::sin(yaw),0},y{-x.y,x.x,0},z{0,0,1};
+    const auto& core=c.puffs[0];
+    const float width=core.width*.5f,height=core.height*.5f;
+    out[0]={c.position,x*width,z*height,0,core.shade,c.textureKey};
+    out[1]={c.position,y*width,z*height,0,core.shade,c.textureKey};
+    out[2]={c.position,x*(c.size.x*.5f),y*(c.size.y*.5f),0,core.shade,c.textureKey};
+    const int count=puffs+2;
+    std::array<float,MaxCards> weights{};
+    // Use the actual eye rather than camera rotation, for visibility only.
+    const auto dir=unit(v.pos-c.position);
+    const float dx=dot(x,dir),dy=dot(y,dir),dz=dir.z;
+    const float coreSum=dx*dx+dy*dy+dz*dz;
+    weights[0]=coreSum>1e-5f?dy*dy/coreSum:1.f/3.f;
+    weights[1]=coreSum>1e-5f?dx*dx/coreSum:1.f/3.f;
+    weights[2]=coreSum>1e-5f?dz*dz/coreSum:1.f/3.f;
+    float sum=1.f;
+    for(int i=1;i<puffs;++i) {
         const auto& p=c.puffs[i];
-        const float co=std::cos(p.roll),si=std::sin(p.roll);
-        out[i]={c.position+p.offset,(v.right*co+v.up*si)*(p.width*.5f),
-            (v.up*co-v.right*si)*(p.height*.5f),opacity,p.shade,c.textureKey};
+        const float a=yaw+i*2.39996323f+p.roll;
+        const Vec right{std::cos(a),std::sin(a),0};
+        const Vec across{-right.y,right.x,0};
+        // Alternate upright and slanted textures to provide depth without
+        // exactly perpendicular quads disappearing together.
+        const float tilt=(i%3==0?0.f:(i%3==1?.69f:-.69f));
+        const Vec up=z*std::cos(tilt)+across*std::sin(tilt);
+        const Vec center=c.position+p.offset;
+        const auto normal=cross(right,up);
+        const float facing=std::abs(dot(normal,unit(v.pos-center)));
+        weights[i+2]=facing*facing;
+        sum+=weights[i+2];
+        out[i+2]={center,right*(p.width*.5f),up*(p.height*.5f),0,p.shade,c.textureKey};
     }
-    return s.puffsPerCloud;
+    // Normalize the ideal full-mask transmittance, as in the old mode 1.
+    for(int i=0;i<count;++i)
+        out[i].alpha=weights[i]>0.f?1.f-std::pow(1.f-sat(alpha),2.f*weights[i]/sum):0.f;
+    return count;
 }
 inline float cardBound(const Card& c) { return std::sqrt(dot(c.right,c.right)+dot(c.up,c.up)); }
 inline float viewDepth(const View& v,Vec p) { return dot(p-v.pos,v.forward); }

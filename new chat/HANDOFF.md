@@ -230,3 +230,68 @@ Plugin-SDK and the original call site unaffected.
   on a weak card before changing count or draw distance. Some crossed-plane
   silhouettes and overdraw remain inherent trade-offs. No actual game capture
   or measured GPU FPS from the Linux environment.
+
+## Follow-up: all modes fixed; period-style density slicing
+
+User reports mode 1 (and suspected 0) still rotates with camera; mode 2
+orientation is fine but visual appearance needs convincing 2006–2008-era
+clouds for weak GPUs. Same PR #1, pinned SDK, SA 1.0 US call site and native
+lighting equation. This section supersedes the previous mode-2 representation.
+
+- Mode 0 was already world-axis crossed cards. Mode 1 previously used
+  v.right/v.up, so fixed the actual cause: deterministic fixed crossed core
+  plus one tilted world-space card for each of the PuffsPerCloud-1 satellites.
+  Core guarantees nonzero facing weight in all directions, including with
+  PuffsPerCloud=1. Weights respond only to observer position; normalized
+  full-mask transmittance preserves the previous 2x optical opacity rule.
+  Modes now each choose their geometry automatically; no new INI switch.
+- Separate MaxCards=12 from MaxPuffs=8 to cover both modes 1/2. Draw-list
+  and all diagnostic/test arrays sized accordingly. Mode 1 uses puffs+2
+  candidates, mode 0 three, mode 2 twelve. Discard negligible alpha before
+  per-card bounds/frustum work. Native/custom lighting and texture lookup
+  still unchanged in modes 0/1.
+- For mode 2, period reference: SIGGRAPH 2004 Course 28 Real-Time Volume
+  Graphics §3.2, object-aligned 2D texture slices; source
+  https://faculty.cc.gatech.edu/~jarek/lectures/V00Intro/handouts/Course28.pdf
+  and the cloud-rendering paper/site by Microsoft Flight Simulator 2004
+  developer Niniane Wang https://niniane.org/clouds/. These are conceptual
+  references; no copyrighted code/assets from other systems are used.
+- CPU-only bake builds four deterministic 64³ or 128³ density volumes with
+  overlapping ellipsoidal lobes, noisy erosion, an irregular broad base
+  and billows. Integrate optical depth across three thick slabs per axis
+  and a matching whole projection; Beer-Lambert alpha, density-weighted
+  grayscale lighting from vertical sky occlusion, local density gradient,
+  projected thickness relief and slight procedural detail. 48 atlas tiles
+  in an 8x8 grid. Economy 512² RGBA / 1 MiB, detail 1 1024² / 4 MiB (slower
+  one-time bake; optional only). High allocation failure retries 512²,
+  both failures fallback to native crossed mode. Conservative UV inset
+  supports either atlas without remapping. High CPU allocation failure
+  caught; temporary volume buffers do not persist.
+- Three stacks of fixed planes (XZ/YZ/XY), each one whole projection at
+  center plus three depth-separated slabs. No camera-derived rotation.
+  Select dominant projected area (abs dot / perpendicular extent) with
+  smooth normalized weights; suppress near-edge-on axes. Distance LOD
+  depends on angular size: economy .16-.32 normalized radius/distance
+  blend, quality .10-.23. Both representations exist at fixed positions;
+  only alpha is blended. Calibrate stack and LOD alpha against reference
+  integrated opacity .95 and its equivalent three slabs. Exact for this
+  reference mask; approximate for general rays. Slightly compress slab
+  spacing to hide gaps. Mode-2-specific horizontal aspect softening and
+  thicker vertical extent prevent needle shapes. Density remap .68-.94
+  times CumulusDensity. No additive bright rim or strong timecycle tint.
+  Vertex lighting fixed in world axes and includes slab offset.
+- Economy two triangles/active card; typical distant cloud one card, near
+  three. 12 candidates maximum during simultaneous crossfades, 24 triangles
+  economy / 96 quality worst case. Synthetic 512-cloud diagnostic: 912
+  economy, 1443 detail active cards before distance/opacity/frustum culls.
+  No frame-time or hardware claims; GPU overdraw still depends on views.
+- Tests cover all modes across 175 positions and rotated eye axes, mode 2 at
+  both details (350 positions); verify alpha unchanged for pure camera
+  rotations, geometry/UV/vertex colors stable with translations, projection
+  and slab alpha consistency, both atlas resolutions, edge padding,
+  bounded buffers, finite colors, reference optical LOD and triangle budgets.
+  Software previews include ground, zenith, fixed field altitude sequence,
+  close-up, sunrise and night. These use synthetic sky/texture for legacy
+  modes only; cumulus uses actual procedural atlas. Actual GTA appearance,
+  alpha sorting at extreme oblique/close angles and weak GPU fill rate
+  require user testing. Keep detail 0 recommended for potatoes.

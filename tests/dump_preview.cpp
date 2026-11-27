@@ -32,11 +32,11 @@ int main(int argc,char** argv) {
     std::vector<Card> items;
     for (auto& c:f.clouds) {
         if(!c.used) continue;
-        Card out[MaxPuffs];
+        Card out[MaxCards];
         const auto a=cloudAlpha(cfg,c,v,r);
         if(a<.004f) continue;
         const int count=cards(cfg,c,v,a,out);
-        for(int i=0;i<count;++i) items.push_back(out[i]);
+        for(int i=0;i<count;++i)if(out[i].alpha>=1.f/255.f)items.push_back(out[i]);
     }
     std::stable_sort(items.begin(),items.end(),[&](auto& a,auto& b){return viewDepth(v,a.center)>viewDepth(v,b.center);});
     // Output projected corners and alpha/shading. Cards crossing the near plane
