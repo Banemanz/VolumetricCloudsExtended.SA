@@ -28,11 +28,17 @@ constexpr int BatchVertices = 480; // multiple of 6; comfortably below the RW Im
 vc::Settings settings;
 vc::Field field;
 bool haveFrame = false;
-std::array<RwRaster*,2> canopyRasters{}; // owned during RW lifetime
-std::array<bool,2> canopyMipmaps{},canopyHasPixels{};
+std::array<IDirect3DTexture9*,2> canopyTextures{};
+std::array<std::vector<vc::canopy::Pixel>,2> canopyPixels;
+IDirect3DDevice9* canopyDevice=nullptr; // borrowed
+int canopySize=0;
+std::array<bool,2> canopyHasPixels{};
+vc::d3d9::Options canopyOptions;
+vc::d3d9::ProjectedMesh canopyProjected,bankProjected;
+vc::banks::SamplingFrame bankSampling;
 bool canopyReady=false;
 vc::canopy::Drift canopyDrift;
-bool canopyAttempted=false,flightFieldActive=false;
+bool canopyAttempted=false,canopyUploadFailed=false;
 unsigned int lastFrame = 0;
 vc::banks::Volume bankVolume;
 vc::banks::Mesh bankMesh;
@@ -59,7 +65,7 @@ void ReleaseBankTextures() {
 }
 void ReleaseBanks() {
     ReleaseBankTextures();
-    bankVolume={};bankMesh={};bankPrepared=false;
+    bankVolume={};bankMesh={};bankSampling={};bankProjected={};bankPrepared=false;
 }
 
 std::filesystem::path ModulePath() {
@@ -95,70 +101,62 @@ void LoadIni() {
     }
 }
 
-void FreeCanopyResources() {
-    for(auto& raster:canopyRasters) {
-        if(raster) RwRasterDestroy(raster);
-        raster=nullptr;
-    }
-    canopyMipmaps={};canopyHasPixels={};canopyReady=false;
-    ReleaseBanks();
+void ReleaseCanopyTextures() {
+    for(auto& texture:canopyTextures){if(texture)texture->Release();texture=nullptr;}
+    canopyDevice=nullptr;canopyUploadFailed=false;
 }
 void ReleaseCanopy() {
-    FreeCanopyResources();
-    canopyAttempted=false;
+    ReleaseCanopyTextures();
+    canopyPixels={};canopyProjected={};canopySize=0;
+    canopyReady=false;canopyAttempted=false;
+    ReleaseBanks();
 }
 bool EnsureCanopy() {
-    if(canopyAttempted) return canopyReady;
-    canopyAttempted=true;
-    const auto create=[&](int size) {
-        try {
-            vc::canopy::Map map;
-            map.build(size,std::uint32_t(settings.seed));
-            map.shadeWeatherLayers(settings);
-            auto* image=RwImageCreate(size,size,32);
-            if(!image) return false;
-            struct FreeImage {RwImage* p;~FreeImage(){RwImageDestroy(p);}} freeImage{image};
-            if(!RwImageAllocatePixels(image) || !RwImageGetPixels(image) || RwImageGetStride(image)<size*4) return false;
-            const int mipFlags=rwRASTERFORMATMIPMAP|rwRASTERFORMATAUTOMIPMAP;
-            for(int layer=0;layer<2;++layer) {
-                const auto& pixels=layer?map.extraPixels:map.pixels;
-                canopyHasPixels[layer]=std::any_of(pixels.begin(),pixels.end(),[](const auto& p){return p.a!=0;});
-                if(!canopyHasPixels[layer]) continue;
-                for(int y=0;y<size;++y)
-                    std::memcpy(RwImageGetPixels(image)+y*RwImageGetStride(image),
-                        pixels.data()+std::size_t(y)*size,size*sizeof(vc::canopy::Pixel));
-                RwInt32 w=0,h=0,depth=0,format=0;
-                if(RwImageFindRasterFormat(image,rwRASTERTYPETEXTURE,&w,&h,&depth,&format) && w==size && h==size) {
-                    for(int flags:{mipFlags,0}) {
-                        auto* raster=RwRasterCreate(w,h,depth,(format&~mipFlags)|rwRASTERTYPETEXTURE|flags);
-                        if(raster && RwRasterSetFromImage(raster,image)) {
-                            canopyRasters[layer]=raster;canopyMipmaps[layer]=RwRasterGetNumLevels(raster)>1;
-                            break;
-                        }
-                        if(raster) RwRasterDestroy(raster);
-                    }
+    auto* device=CurrentD3DDevice();
+    if(!device)return false;
+    if(device!=canopyDevice)ReleaseCanopyTextures();
+    if(canopyUploadFailed)return false;
+    if(canopyTextures[0]&&canopyTextures[1])return true;
+    if(!canopyAttempted) {
+        canopyAttempted=true;
+        const auto build=[&](int size) {
+            try {
+                vc::canopy::Map map;map.build(size,std::uint32_t(settings.seed));
+                map.shadeWeatherLayers(settings);
+                if(settings.hybridClouds) {
+                    try {bankVolume.build(settings,map);bankPrepared=true;}
+                    catch(const std::bad_alloc&) {ReleaseBanks();bankFailed=true;Log("3D density allocation failed; using canopy.");}
                 }
-                if(!canopyRasters[layer]) {FreeCanopyResources();return false;}
-            }
-            if(settings.hybridClouds) {
-                try {bankVolume.build(settings,map);bankPrepared=true;}
-                catch(const std::bad_alloc&) {ReleaseBanks();bankFailed=true;Log("3D density allocation failed; using canopy.");}
-            }
-            return true;
-        } catch(const std::bad_alloc&) {
-            FreeCanopyResources();Log("Canopy: CPU allocation failed.");return false;
-        }
-    };
-    const int requested=vc::canopy::textureSize(settings);
-    bool ok=create(requested);
-    if(!ok && requested!=vc::canopy::EconomySize) {
-        Log("Canopy: detail textures unavailable; trying economy.");
-        ok=create(vc::canopy::EconomySize);
+                canopyPixels[0]=std::move(map.pixels);canopyPixels[1]=std::move(map.extraPixels);
+                canopySize=size;
+                for(int i=0;i<2;++i)canopyHasPixels[i]=std::any_of(canopyPixels[i].begin(),canopyPixels[i].end(),[](const auto& p){return p.a!=0;});
+                return true;
+            } catch(const std::bad_alloc&) {canopyPixels={};return false;}
+        };
+        const int requested=vc::canopy::textureSize(settings);
+        canopyReady=build(requested);
+        if(!canopyReady&&requested!=vc::canopy::EconomySize)canopyReady=build(vc::canopy::EconomySize);
+        if(canopyReady)Log("Canopy: static weather masks generated (live coverage).");
     }
-    canopyReady=ok;
-    Log(ok?"Canopy: static weather masks generated (live coverage)."
-          :"Canopy: texture creation failed; using crossed native textures.");
-    return ok;
+    if(!canopyReady)return false;
+    D3DCAPS9 caps{};
+    if(FAILED(device->GetDeviceCaps(&caps)))return false;
+    canopyOptions=vc::d3d9::options(caps);canopyOptions.dual=false;
+    const DWORD linear=D3DPTFILTERCAPS_MINFLINEAR|D3DPTFILTERCAPS_MAGFLINEAR;
+    canopyOptions.filter=(caps.TextureFilterCaps&linear)==linear?D3DTEXF_LINEAR:D3DTEXF_POINT;
+    canopyOptions.mip=(caps.TextureFilterCaps&D3DPTFILTERCAPS_MIPFLINEAR)!=0;
+    canopyDevice=device;
+    try {
+        bool success=true;
+        for(int i=0;i<2;++i) {
+            auto result=vc::d3d9::uploadCanopy(device,canopyPixels[i],UINT(canopySize),&canopyTextures[i]);
+            if(!result)result=vc::d3d9::uploadCanopy(device,canopyPixels[i],UINT(canopySize),&canopyTextures[i],true);
+            if(!result){success=false;break;}
+        }
+        if(success)return true;
+    } catch(const std::bad_alloc&) {}
+    ReleaseCanopyTextures();canopyDevice=device;canopyUploadFailed=true;
+    Log("Canopy: native 2D texture upload failed; using classic clouds.");return false;
 }
 
 void LogD3DFailure(const char* phase,vc::d3d9::Result result) {
@@ -238,7 +236,7 @@ bool EnsureBanks() {
 void ResetField() {
     field.reset(settings);
     canopyDrift={};
-    flightFieldActive=false;
+    bankSampling={};
     haveFrame=false;
 }
 
@@ -348,77 +346,66 @@ struct DrawCard {
 };
 std::array<DrawCard,vc::MaxClouds*vc::MaxCards> drawList;
 std::array<RwIm3DVertex,BatchVertices> vertices;
-constexpr int BatchIndices=BatchVertices*4;
-std::array<RwImVertexIndex,BatchIndices> modernIndices;
 static_assert(sizeof(RwImVertexIndex)==sizeof(std::uint16_t));
-void DrawCanopy(const vc::View& view,const vc::Range& range,float hybridFade,
-                const vc::weather::State& weather,const vc::canopy::Light& light) {
-    if(settings.opacity<=0.f || settings.cumulusDensity<=0.f || !settings.targetProcClouds) return;
-    RenderStates states;
-    if(!states.begin()) return;
+// Direct projected vertices preserve the game's exact screen projection and
+// depth for nearby geometry; only distant Z is clamped. Fog is independent.
+bool DrawCanopy(const vc::View& view,const vc::Range& range,float hybridFade,
+                const vc::weather::State& weather,const vc::canopy::Light& light,
+                const D3DMATRIX& transform,const D3DVIEWPORT9& viewport,vc::RGB fog) {
+    if(settings.opacity<=0.f||settings.cumulusDensity<=0.f||!settings.targetProcClouds)return true;
     const auto mesh=vc::canopy::mesh(settings,view,range,canopyDrift,vc::banks::radius(settings,range),hybridFade,true);
-    static_assert(vc::canopy::VertexCount<=BatchVertices && vc::canopy::IndexCount<=BatchIndices);
     const auto weights=vc::canopy::layerWeights(settings,weather);
-    std::copy(mesh.indices.begin(),mesh.indices.end(),modernIndices.begin());
-    RwRenderStateSet(rwRENDERSTATETEXTUREADDRESSU,reinterpret_cast<void*>(rwTEXTUREADDRESSWRAP));
-    RwRenderStateSet(rwRENDERSTATETEXTUREADDRESSV,reinterpret_cast<void*>(rwTEXTUREADDRESSWRAP));
+    canopyProjected.clip.clear();canopyProjected.clip.reserve(mesh.vertices.size());
+    for(const auto& v:mesh.vertices)canopyProjected.clip.push_back(vc::d3d9::clipVertex(
+        v.pos,v.u,v.v,0.f,v.alpha*(canopyOptions.vertexFog?1.f:vc::cloudFogFactor(settings,vc::length(v.pos-view.pos))),
+        vc::cloudFogFactor(settings,vc::length(v.pos-view.pos)),transform));
+    // Both masks share geometry. Project once, cache vertex opacity, then
+    // modulate only alpha for each pass (no second clipping/traversal).
+    vc::d3d9::projectMesh(canopyProjected,viewport,light.bright,1.f,mesh.indices.data(),mesh.indices.size());
+    if(canopyProjected.indices.empty())return true;
+    static std::vector<unsigned char> alphaBase;
+    alphaBase.resize(canopyProjected.vertices.size());
+    for(std::size_t i=0;i<alphaBase.size();++i)alphaBase[i]=static_cast<unsigned char>(canopyProjected.vertices[i].rgba>>24);
     for(int layer=0;layer<2;++layer) {
         const float alpha=layer?weights.extra:weights.base;
-        if(!canopyHasPixels[layer] || !canopyRasters[layer] || alpha<=1.f/255.f) continue;
-        bool visible=false;
-        for(int i=0;i<vc::canopy::VertexCount;++i) {
-            auto& v=vertices[i];
-            const auto& p=mesh.vertices[i];
-            visible|=p.alpha*alpha>1.f/255.f;
-            RwIm3DVertexSetPos(&v,p.pos.x,p.pos.y,p.pos.z);
-            RwIm3DVertexSetNormal(&v,0.f,0.f,1.f);
-            RwIm3DVertexSetU(&v,p.u);RwIm3DVertexSetV(&v,p.v);
-            RwIm3DVertexSetRGBA(&v,Byte(light.bright.r),Byte(light.bright.g),Byte(light.bright.b),Byte(p.alpha*alpha*255.f));
+        if(!canopyTextures[layer]||!canopyHasPixels[layer]||alpha<=1.f/255.f)continue;
+        // Reuse the clipped geometry but recover each layer's alpha from the
+        // original packed alpha, rather than multiplying the other layer.
+        for(std::size_t i=0;i<alphaBase.size();++i) {
+            auto& v=canopyProjected.vertices[i];
+            v.rgba=(v.rgba&0x00FFFFFFu)|(DWORD(Byte(alphaBase[i]*alpha))<<24);
         }
-        if(!visible) continue;
-        RwRenderStateSet(rwRENDERSTATETEXTURERASTER,canopyRasters[layer]);
-        RwRenderStateSet(rwRENDERSTATETEXTUREFILTER,reinterpret_cast<void*>(canopyMipmaps[layer]?rwFILTERLINEARMIPLINEAR:rwFILTERLINEAR));
-        if(RwIm3DTransform(vertices.data(),vc::canopy::VertexCount,nullptr,
-                            rwIM3D_VERTEXXYZ|rwIM3D_VERTEXUV|rwIM3D_VERTEXRGBA)) {
-            RwIm3DRenderIndexedPrimitive(rwPRIMTYPETRILIST,modernIndices.data(),vc::canopy::IndexCount);
-            RwIm3DEnd();
-        }
+        const auto result=vc::d3d9::drawProjected(canopyDevice,{canopyTextures[layer],canopyTextures[layer]},
+            canopyOptions,canopyProjected,0.f,false,fog,true,false);
+        if(!result){LogD3DFailure("canopy draw",result);return false;}
     }
+    return true;
 }
-// RW uses 2D UV Im3D vertices. The sole direct-D3D draw carries the third
-// coordinate; capture/restore all state, including streams and transforms,
-// so the engine's cached state agrees with the device afterwards.
 bool DrawBanks(RwCamera* camera,const vc::View& view,const vc::Range& range,
-               const vc::weather::State& climate,const vc::canopy::Light& light) {
+               const vc::weather::State& climate,const vc::canopy::Light& light,
+               const D3DMATRIX& transform,const D3DVIEWPORT9& viewport,vc::RGB fog) {
     if(!bankDevice||!bankTextures[0]||!bankTextures[1])return false;
     auto* window=RwCameraGetViewWindow(camera);
     if(!window)return false;
     const auto* offset=RwCameraGetViewOffset(camera);
     const float wx=window->x+(offset?std::abs(offset->x):0.f),
                 wy=window->y+(offset?std::abs(offset->y):0.f);
-    try {vc::banks::buildMesh(bankMesh,settings,view,range,canopyDrift,wx,wy,bankDownsampled?nullptr:&bankVolume,bankOptions.dual?climate.coverage:(climate.coverage>=.5f?1.f:0.f));}
+    try {vc::banks::buildMesh(bankMesh,settings,view,range,canopyDrift,wx,wy,bankDownsampled?nullptr:&bankVolume,bankOptions.dual?climate.coverage:(climate.coverage>=.5f?1.f:0.f),&bankSampling);}
     catch(const std::bad_alloc&) {bankFailed=true;Log("3D cloud slice allocation failed.");return false;}
     if(bankMesh.indices.empty()) {
         if(!bankEmptyLogged&&!bankDrawLogged){Log("3D cloud bank ready; no occupied slices in current camera frustum yet.");bankEmptyLogged=true;}
         return true;
     }
-    static std::vector<vc::d3d9::Vertex> batch;
-    try {batch.resize(bankMesh.vertices.size());}
-    catch(const std::bad_alloc&) {Log("3D cloud vertex allocation failed.");return false;}
     const float visibility=vc::weather::visibility(climate)*vc::weather::clearOpacity(climate);
     if(visibility<=1.f/255.f)return true;
     const auto bankLight=vc::banks::bankLight(light,climate);
-    for(std::size_t i=0;i<batch.size();++i) {
-        const auto& v=bankMesh.vertices[i];
-        batch[i]={v.pos.x,v.pos.y,v.pos.z,D3DCOLOR_ARGB(Byte(v.alpha*visibility*255.f),
-            Byte(bankLight.r),Byte(bankLight.g),Byte(bankLight.b)),v.u,v.v,v.w};
-    }
-    // CameraBeginUpdate (7F8F20) writes these matrices before applying
-    // them to D3D. Read the active camera matrices, not device GetTransform
-    // or the RW cache (which other mods may invalidate).
-    const auto& viewMatrix=*reinterpret_cast<const D3DMATRIX*>(0xC9BC80);
-    const auto& projectionMatrix=*reinterpret_cast<const D3DMATRIX*>(0x8E2458);
-    plugin::Call<0x7FC200>(); // flush pending RW state changes before snapshot
+    try {
+        bankProjected.clip.clear();bankProjected.clip.reserve(bankMesh.vertices.size());
+        for(const auto& v:bankMesh.vertices)bankProjected.clip.push_back(vc::d3d9::clipVertex(
+            v.pos,v.u,v.v,v.w,v.alpha*(bankOptions.vertexFog?1.f:v.fog),v.fog,transform));
+        vc::d3d9::projectMesh(bankProjected,viewport,bankLight,visibility,bankMesh.indices.data(),bankMesh.indices.size());
+    } catch(const std::bad_alloc&) {Log("3D cloud projected vertex allocation failed.");return false;}
+    if(bankProjected.indices.empty())return true;
     if(!bankPixelQueryAttempted) {
         bankPixelQueryAttempted=true;
         if(SUCCEEDED(bankDevice->CreateQuery(D3DQUERYTYPE_OCCLUSION,&bankPixelQuery))) {
@@ -428,16 +415,16 @@ bool DrawBanks(RwCamera* camera,const vc::View& view,const vc::Range& range,
         }
     }
     const bool queryThisDraw=bankPixelQuery&&bankQueryFrames==0&&!bankDrawLogged;
-    const auto result=vc::d3d9::draw(bankDevice,bankTextures,bankOptions,batch.data(),UINT(batch.size()),
-        bankMesh.indices.data(),UINT(bankMesh.indices.size()/3),climate.coverage,settings.useGameFog,&viewMatrix,&projectionMatrix);
+    const auto result=vc::d3d9::drawProjected(bankDevice,{bankTextures[0],bankTextures[1]},bankOptions,
+        bankProjected,climate.coverage,true,fog,true,false);
     if(queryThisDraw && FAILED(bankPixelQuery->Issue(D3DISSUE_END))) {
         bankPixelQuery->Release();bankPixelQuery=nullptr;
     }
     if(!result){LogD3DFailure("draw",result);return false;}
     if(!bankDrawLogged) {
         char info[256];
-        std::snprintf(info,sizeof(info),"3D cloud draw submitted: %d fixed-phase planes, %lu triangles, camera Z=%.1f, coverage=%.2f.",
-            bankMesh.slices,static_cast<unsigned long>(bankMesh.indices.size()/3),view.pos.z,climate.coverage);
+        std::snprintf(info,sizeof(info),"3D cloud draw submitted: %d adaptive planes, %lu triangles, camera Z=%.1f, coverage=%.2f.",
+            bankMesh.slices,static_cast<unsigned long>(bankProjected.indices.size()/3),view.pos.z,climate.coverage);
         Log(info);bankDrawLogged=true;
     }
     return true;
@@ -488,7 +475,7 @@ void __cdecl RenderClouds() {
         return;
     const auto& cc=CTimeCycle::m_CurrentColours;
     const auto range=vc::range(settings,view.farClip,cc.m_fFarClip);
-    if (range.end<=1.f) return;
+    if (range.end<=1.f && settings.renderMode!=2) return;
     const vc::Palette palette{
         {float(cc.m_nSkyTopRed),float(cc.m_nSkyTopGreen),float(cc.m_nSkyTopBlue)},
         {float(cc.m_nSkyBottomRed),float(cc.m_nSkyBottomGreen),float(cc.m_nSkyBottomBlue)},
@@ -505,7 +492,6 @@ void __cdecl RenderClouds() {
     const auto& wind=CWeather::WindDir;
     const vc::Vec windVector=vc::Vec{wind.x,wind.y,0.f}*CWeather::Wind;
     bool modern=false;
-    float flightAlpha=1.f;
     int desired=vc::target(settings,weather);
     auto cardRange=range;
     if (requestedMode==2) {
@@ -519,34 +505,41 @@ void __cdecl RenderClouds() {
         const auto light=vc::canopy::liveLighting(settings,palette,{sun.x,sun.y,sun.z},climate);
         modern=EnsureCanopy();
         if(modern && newFrame) canopyDrift.update(settings,windVector,dt);
-        if (modern) {
+        if(modern) {
             const bool useBanks=EnsureBanks();
-            DrawCanopy(view,range,useBanks?1.f:0.f,climate,light);
-            if(useBanks && !DrawBanks(camera,view,range,climate,light)) {
-                Log("3D cloud draw failed; falling back to canopy.");
-                bankFailed=true;
-                // Restore the full canopy from the next frame; avoid double compositing this frame.
-            }
-            // Optional legacy fixed cards are localized to flight altitude;
-            // the 3D bank does not depend on these native textures.
-            flightAlpha=vc::canopy::flightWeight(settings,view)*.65f;
-            desired=std::min(settings.canopyFlightClouds,vc::target(settings,climate.coverage));
-            if (!desired || flightAlpha<=1.f/255.f) {
-                if(newFrame) {
-                    if (flightFieldActive) field.reset(settings);
-                    flightFieldActive=false;haveFrame=true;lastFrame=frameId;
+            const auto independent=vc::cloudRange(settings);
+            const auto& viewMatrix=*reinterpret_cast<const D3DMATRIX*>(0xC9BC80);
+            const auto& projection=*reinterpret_cast<const D3DMATRIX*>(0x8E2458);
+            const auto transform=vc::d3d9::multiply(viewMatrix,projection);
+            D3DVIEWPORT9 viewport{};
+            // GetViewport is explicitly legal on pure devices. Keep the
+            // game viewport and projection; do not set either.
+            auto* device=canopyDevice;
+            if(device&&SUCCEEDED(device->GetViewport(&viewport))) {
+                plugin::Call<0x7FC200>(); // flush RW pending state before snapshot
+                vc::d3d9::StateScope state;
+                const auto captured=state.capture(device);
+                if(captured) {
+                    bool drawn=false;
+                    try {
+                        const auto fog=vc::canopy::fogColour(palette);
+                        drawn=DrawCanopy(view,independent,useBanks?1.f:0.f,climate,light,transform,viewport,fog);
+                        if(drawn&&useBanks&&!DrawBanks(camera,view,independent,climate,light,transform,viewport,fog)) {
+                            bankFailed=true;Log("3D cloud draw failed; retaining full canopy from next frame.");
+                        }
+                    } catch(const std::bad_alloc&) {Log("Cloud projection allocation failed.");}
+                    const auto restored=state.restore();
+                    if(!restored){LogD3DFailure("restore",restored);return;}
+                    if(drawn) {haveFrame=true;lastFrame=frameId;return;}
                 }
-                return;
             }
-            flightFieldActive=true;
-            cardRange=vc::range(settings,std::min(view.farClip,900.f),cc.m_fFarClip);
         }
-        // Optional flight wisps and resource-failure fallback use native geometry.
+        // Resource failure uses the classic native geometry, without
+        // modifying any world fog settings.
         settings.renderMode=0;
     }
-    Textures textures;
-    if (modern) textures.add(CClouds::ms_vc.m_pTex);
-    else textures=GetTextures();
+    if(cardRange.end<=1.f)return;
+    Textures textures=GetTextures();
     if (!textures.count) return;
 
     if (newFrame) {
@@ -557,7 +550,7 @@ void __cdecl RenderClouds() {
     int drawCount=0;
     for (const auto& c:field.clouds) {
         if (!c.used) continue;
-        const float a=vc::cloudAlpha(settings,c,view,cardRange)*flightAlpha;
+        const float a=vc::cloudAlpha(settings,c,view,cardRange);
         if (a<1.f/255.f || !Visible(camera,c.position,vc::bound(c))) continue;
         vc::Card cards[vc::MaxCards];
         const int count=vc::cards(settings,c,view,a,cards);
@@ -620,8 +613,10 @@ public:
         plugin::Events::shutdownRwEvent += ResetField;
         plugin::Events::shutdownRwEvent += ReleaseCanopy;
         plugin::Events::d3dLostEvent += ReleaseBankTextures;
+        plugin::Events::d3dLostEvent += ReleaseCanopyTextures;
         plugin::Events::d3dResetEvent += ReleaseBankTextures;
-        Log(settings.renderMode==2 ? "Procedural volumetric cloud renderer installed (SA 1.0 US, world-locked D3D9 volume banks, pure-device compatible)." : settings.lightingMode==0
+        plugin::Events::d3dResetEvent += ReleaseCanopyTextures;
+        Log(settings.renderMode==2 ? "Procedural volumetric cloud renderer installed (SA 1.0 US, adaptive D3D9 volume banks, independent cloud atmosphere, pure-device compatible)." : settings.lightingMode==0
             ? "Procedural volumetric cloud renderer installed (SA 1.0 US, native lighting)."
             : "Procedural volumetric cloud renderer installed (SA 1.0 US, custom lighting).");
     }

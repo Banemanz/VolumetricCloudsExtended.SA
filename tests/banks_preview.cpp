@@ -19,10 +19,11 @@ int main(int argc,char** argv) {
     const Vec right=unit(cross(f,{0,0,1})),up=cross(right,f);
     View view{{-1639,1817,name=="above"?690.f:name=="flight"||name=="rainflight"?523.f:name=="entry"?455.f:30.f},right,up,f,2200,1};
     if(name=="ground"||name=="canopy"||name=="rain"||name=="night"||name=="zenith")view.pos={2266,-1271,30};
+    if(name=="midair"){view.pos={2532.6f,-905.3f,399.3f};}
     if(dawn)view.pos={name=="dawn"?2164.f:2255.f,name=="dawn"?-1265.f:-1341.f,673.f};
     canopy::Map map;map.build(canopy::textureSize(s),s.seed);map.shadeWeatherLayers(s);
     banks::Volume volume;volume.build(s,map);
-    const auto r=range(s,view.farClip,1600);
+    const auto r=cloudRange(s);
     const auto light=canopy::liveLighting(s,p,sun,climate);
     const auto save=[&](const auto& pixels,const char* suffix){
         std::ofstream file(path+suffix,std::ios::binary);
@@ -36,7 +37,7 @@ int main(int argc,char** argv) {
         for(const auto& v:canopyMesh.vertices) {
             const auto d=v.pos-view.pos;
             std::cout<<dot(d,view.right)<<' '<<dot(d,view.up)<<' '<<dot(d,view.forward)<<' '<<v.u<<' '<<v.v<<' '<<0.f<<' '<<v.alpha*opacity
-              <<' '<<light.bright.r/255.f<<' '<<light.bright.g/255.f<<' '<<light.bright.b/255.f<<'\n';
+              <<' '<<light.bright.r/255.f<<' '<<light.bright.g/255.f<<' '<<light.bright.b/255.f<<' '<<cloudFogFactor(s,length(d))<<'\n';
         }
         for(std::size_t i=0;i<canopyMesh.indices.size();i+=3)std::cout<<canopyMesh.indices[i]<<' '<<canopyMesh.indices[i+1]<<' '<<canopyMesh.indices[i+2]<<'\n';
     };
@@ -50,7 +51,7 @@ int main(int argc,char** argv) {
         for(const auto& v:mesh.vertices){
             const auto d=v.pos-view.pos;
             std::cout<<dot(d,view.right)<<' '<<dot(d,view.up)<<' '<<dot(d,view.forward)<<' '<<v.u<<' '<<v.v<<' '<<v.w<<' '<<v.alpha*lw.base
-              <<' '<<bankLight.r/255.f<<' '<<bankLight.g/255.f<<' '<<bankLight.b/255.f<<'\n';
+              <<' '<<bankLight.r/255.f<<' '<<bankLight.g/255.f<<' '<<bankLight.b/255.f<<' '<<v.fog<<'\n';
         }
         for(std::size_t i=0;i<mesh.indices.size();i+=3)std::cout<<mesh.indices[i]<<' '<<mesh.indices[i+1]<<' '<<mesh.indices[i+2]<<'\n';
     }

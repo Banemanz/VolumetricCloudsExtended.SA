@@ -105,6 +105,8 @@ inline LayerWeights layerWeights(const Settings& s,const weather::State& w) {
     const float vis=weather::visibility(w)*weather::clearOpacity(w);
     return {vis,vis*(s.badWeatherDensityMultiplier>=1.f?w.coverage:1.f-w.coverage)};
 }
+// This colour tracks the game's sky palette, never its fog render state.
+inline RGB fogColour(const Palette& p) {return mixRGB(p.skyBottom,p.skyTop,.20f);}
 inline std::uint8_t byte(float x) { return std::uint8_t(clamp(x,0.f,255.f)+.5f); }
 
 class Map {
@@ -175,7 +177,8 @@ public:
             // Stable overhead diffuse relief. Keep fine billows, no
             // per-weather raster upload or additional raymarch.
             const float detail=(f-.25f*(get(x-step,y)+get(x+step,y)+get(x,y-step)+get(x,y+step)))*23.f;
-            const float shade=sat(.79f+s.cumulusContrast*(detail*.21f-(f-.4f)*.29f));
+            const float broad=(get(x-4*step,y-2*step)-get(x+4*step,y+2*step))*2.8f;
+            const float shade=clamp(.83f+s.cumulusContrast*(detail*.23f+broad*.18f-(f-.4f)*.31f),.53f,1.f);
             const auto grey=byte(255.f*shade);
             const auto i=std::size_t(y)*n+x;
             pixels[i]={grey,grey,grey,byte(low*255.f)};

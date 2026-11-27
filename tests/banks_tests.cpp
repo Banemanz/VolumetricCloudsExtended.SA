@@ -43,7 +43,7 @@ int main() {
     }
     CHECK(b.sample(0,.5f,.5f,-3).a==0 && b.sample(1,.5f,.5f,6).a==0);
     const View ground{{2266,-1271,30},{1,0,0},{0,0,1},{0,1,0},2200,1};
-    const auto r=range(s,ground.farClip,1600);
+    const auto r=cloudRange(s);
     banks::Mesh raw,culled;
     for(int detail:{0,1})for(float alt:{30.f,300.f,523.f,673.f,690.f,1600.f})for(float pitch:{-.7f,0.f,.5f,1.5f})
        for(float az:{0.f,1.57f,3.14f}) {
@@ -57,7 +57,7 @@ int main() {
         const float step=detail?banks::DetailStep:banks::EconomyStep;
         CHECK(culled.vertices.size()==std::size_t(culled.slices)*(banks::GridX+1)*(banks::GridY+1));
         for(const auto& p:culled.vertices) {
-            const float phase=dot(p.pos-Vec{0,0,s.minSpawnZ},v.forward)/step-.5f;
+            const float phase=dot(p.pos-Vec{0,0,s.minSpawnZ},v.forward)/step;
             CHECK(std::abs(phase-std::round(phase))<.0001f);
         }
         float previous=1e9f;
@@ -65,7 +65,7 @@ int main() {
             const auto a=culled.indices[i],bb=culled.indices[i+1],c=culled.indices[i+2];
             CHECK(a<culled.vertices.size()&&bb<culled.vertices.size()&&c<culled.vertices.size());
             const auto& p=culled.vertices[a];const float d=viewDepth(v,p.pos);
-            CHECK(d<=previous+.002f && d>=v.nearClip && d<=v.farClip);
+            CHECK(d<=previous+.002f && d>=v.nearClip && d<=r.end+.01f);
             previous=d;
             const float u=p.pos.x/canopy::tileWorldSize(s),vv=p.pos.y/canopy::tileWorldSize(s);
             CHECK(std::abs(u-p.u-std::round(u-p.u))<.001f);
@@ -89,7 +89,7 @@ int main() {
     pose.right=unit(cross(pose.forward,{0,0,1}));pose.up=cross(pose.right,pose.forward);
     canopy::Drift wind;wind.update(s,{1.2f,-.8f,0},2.7f);
     const auto planeNumber=[&](const banks::Vertex& p) {
-        const double phase=dot(p.pos-Vec{float(wind.worldX),float(wind.worldY),s.minSpawnZ},pose.forward)/banks::EconomyStep-.5;
+        const double phase=dot(p.pos-Vec{float(wind.worldX),float(wind.worldY),s.minSpawnZ},pose.forward)/banks::EconomyStep;
         CHECK(std::abs(phase-std::round(phase))<.0002);
         return int(std::round(phase));
     };
@@ -101,13 +101,14 @@ int main() {
         }
         return result;
     };
-    banks::buildMesh(raw,s,pose,r,wind,.94f,.53f,&b,0);
+    banks::SamplingFrame sampling;
+    banks::buildMesh(raw,s,pose,r,wind,.94f,.53f,&b,0,&sampling);
     const auto original=centers(raw);
     CHECK(original.size()>5);
     for(float travel:{.5f,3.f,39.f,41.f,94.f}) {
         auto moved=pose;moved.pos=moved.pos+pose.forward*travel;
-        const auto limited=range(s,moved.farClip,1400);
-        banks::buildMesh(culled,s,moved,limited,wind,.94f,.53f,&b,0);
+        moved.farClip=450.f;const auto limited=cloudRange(s);
+        banks::buildMesh(culled,s,moved,limited,wind,.94f,.53f,&b,0,&sampling);
         int shared=0;
         for(const auto& pair:centers(culled)) {
             const auto i=original.find(pair.first);
@@ -124,11 +125,29 @@ int main() {
     // Across the exact horizontal movement in the recording, the plane
     // positions (world offset along heading) remain phase-aligned.
     auto moved=pose;moved.pos={2255,-1341,672.7f};
-    banks::buildMesh(culled,s,moved,r,wind,.94f,.53f,&b,0);
+    banks::buildMesh(culled,s,moved,r,wind,.94f,.53f,&b,0,&sampling);
     int shared=0;for(const auto& pair:centers(culled))shared+=original.count(pair.first)>0;
     CHECK(shared>=4);
     std::cout<<"PASS: fixed world-phase samples survive translation, altitude and clip changes; "<<shared<<" shared planes in video poses\n";
 
+    const auto locked=sampling.normal;
+    const auto initialPhase=sampling.phase;
+    for(float angle:{1.f,2.f,4.f,7.f,15.f,25.f,90.f,180.f}) {
+        const float rad=angle*Pi/180.f;
+        auto rotated=moved;
+        rotated.forward=unit(Vec{locked.x*std::cos(rad)-locked.y*std::sin(rad),
+            locked.x*std::sin(rad)+locked.y*std::cos(rad),locked.z});
+        rotated.right=unit(cross(rotated.forward,{0,0,1}));rotated.up=cross(rotated.right,rotated.forward);
+        banks::buildMesh(culled,s,rotated,r,wind,.94f,.53f,&b,0,&sampling);
+        CHECK(std::abs(sampling.phase-initialPhase)<.00001);
+        if(angle<=7.f)CHECK(length(sampling.normal-locked)<.00001f);
+        CHECK(dot(sampling.normal,rotated.forward)>.98f);
+        for(const auto& p:culled.vertices)CHECK(finite(p.pos)&&p.alpha>=0&&p.alpha<=1&&p.fog>=0&&p.fog<=1);
+    }
+    for(float d:{0.f,160.f,250.f,360.f,650.f,800.f,1000.f,1400.f}) {
+        float sum=0;for(int i=0;i<4;++i)sum+=banks::sampleWeight(i,d,banks::EconomyStep);
+        CHECK(std::abs(sum-4*banks::EconomyStep)<.001f);
+    }
     s.hybridClouds=false;banks::buildMesh(culled,s,flight,r,{},.94f,.53f,&b,0);
     CHECK(culled.indices.empty());
     std::cout<<"PASS: periodic deterministic 3D density, clear/rain coverage, vertical borders, trilinear occupancy, world XYZ under view changes, fixed phase, depth order and slice cap; "<<bake<<" ms CPU bake; flight "<<count<<" triangles vs "<<unculled<<" unculled\n";

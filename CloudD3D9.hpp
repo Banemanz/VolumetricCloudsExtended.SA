@@ -61,28 +61,195 @@ inline Result upload(IDirect3DDevice9* device,const banks::Volume& volume,int la
     if(FAILED(hr)){(*out)->Release();*out=nullptr;return failed(hr,"UpdateTexture");}
     return {};
 }
+// Build the distant 2D layer with ordinary RGBA mipmaps, without relying on
+// private RenderWare raster structures. Alpha-weighted colour avoids halos.
+inline Result uploadCanopy(IDirect3DDevice9* device,const std::vector<canopy::Pixel>& pixels,
+                          UINT size,IDirect3DTexture9** out,bool managed=false) {
+    *out=nullptr;
+    std::vector<canopy::Pixel> mip=pixels;
+    IDirect3DTexture9* stage=nullptr;
+    HRESULT hr=device->CreateTexture(size,size,0,0,D3DFMT_A8R8G8B8,
+        managed?D3DPOOL_MANAGED:D3DPOOL_SYSTEMMEM,&stage,nullptr);
+    if(FAILED(hr))return failed(hr,"CreateTexture(canopy)");
+    UINT n=size;
+    for(UINT level=0;level<stage->GetLevelCount();++level) {
+        D3DLOCKED_RECT lock{};
+        if(FAILED(hr=stage->LockRect(level,&lock,nullptr,0))){stage->Release();return failed(hr,"LockRect(canopy)");}
+        if(!lock.pBits||lock.Pitch<int(n*sizeof(DWORD))) {
+            stage->UnlockRect(level);stage->Release();return failed(E_FAIL,"canopy pitch");
+        }
+        for(UINT y=0;y<n;++y)for(UINT x=0;x<n;++x) {
+            const auto p=mip[std::size_t(y)*n+x];
+            const DWORD argb=D3DCOLOR_ARGB(p.a,p.r,p.g,p.b);
+            std::memcpy(static_cast<char*>(lock.pBits)+std::size_t(y)*lock.Pitch+x*sizeof(DWORD),&argb,sizeof(argb));
+        }
+        if(FAILED(hr=stage->UnlockRect(level))){stage->Release();return failed(hr,"UnlockRect(canopy)");}
+        if(n==1)break;
+        // In-place 2x2 downsample: each source quartet is read before
+        // overwriting an earlier destination. All channels are greyscale.
+        const UINT next=n/2;
+        for(UINT y=0;y<next;++y)for(UINT x=0;x<next;++x) {
+            unsigned alpha=0,r=0,g=0,b=0;
+            for(UINT dy=0;dy<2;++dy)for(UINT dx=0;dx<2;++dx) {
+                const auto p=mip[std::size_t(y*2+dy)*n+x*2+dx];
+                alpha+=p.a;r+=p.r*p.a;g+=p.g*p.a;b+=p.b*p.a;
+            }
+            mip[std::size_t(y)*next+x]={byte(alpha?float(r)/alpha:255.f),byte(alpha?float(g)/alpha:255.f),
+                byte(alpha?float(b)/alpha:255.f),std::uint8_t((alpha+2)/4)};
+        }
+        n=next;
+    }
+    if(managed){*out=stage;return {};}
+    hr=device->CreateTexture(size,size,0,0,D3DFMT_A8R8G8B8,D3DPOOL_DEFAULT,out,nullptr);
+    if(FAILED(hr)){stage->Release();return failed(hr,"CreateTexture(DEFAULT canopy)");}
+    hr=device->UpdateTexture(stage,*out);stage->Release();
+    if(FAILED(hr)){(*out)->Release();*out=nullptr;return failed(hr,"UpdateTexture(canopy)");}
+    return {};
+}
+struct ScreenVertex {float x,y,z,rhw;DWORD rgba,fog;float u,v,w;};
+static_assert(sizeof(ScreenVertex)==36);
+struct ClipVertex {
+    float x,y,z,w; // homogeneous clip coords using the unchanged game projection
+    float u,v,t,alpha,fog;
+};
+inline ClipVertex lerp(ClipVertex a,ClipVertex b,float t) {
+    return {mix(a.x,b.x,t),mix(a.y,b.y,t),mix(a.z,b.z,t),mix(a.w,b.w,t),
+        mix(a.u,b.u,t),mix(a.v,b.v,t),mix(a.t,b.t,t),mix(a.alpha,b.alpha,t),mix(a.fog,b.fog,t)};
+}
+inline D3DMATRIX multiply(const D3DMATRIX& a,const D3DMATRIX& b) {
+    D3DMATRIX c{};
+    for(int y=0;y<4;++y)for(int x=0;x<4;++x)for(int k=0;k<4;++k)c.m[y][x]+=a.m[y][k]*b.m[k][x];
+    return c;
+}
+inline ClipVertex clipVertex(Vec pos,float u,float v,float w,float alpha,float fog,const D3DMATRIX& m) {
+    return {pos.x*m._11+pos.y*m._21+pos.z*m._31+m._41,
+        pos.x*m._12+pos.y*m._22+pos.z*m._32+m._42,
+        pos.x*m._13+pos.y*m._23+pos.z*m._33+m._43,
+        pos.x*m._14+pos.y*m._24+pos.z*m._34+m._44,u,v,w,alpha,fog};
+}
+inline ScreenVertex project(const ClipVertex& v,const D3DVIEWPORT9& vp,RGB colour,float visibility) {
+    const float inv=1.f/v.w;
+    // Retain actual XY projection and reciprocal W, even outside the scene
+    // far plane. Clamp ONLY Z to the cleared far depth. Distant clouds can
+    // occupy sky pixels but not overwrite any nearer scene geometry.
+    return {float(vp.X)+(v.x*inv+1.f)*.5f*vp.Width,
+        float(vp.Y)+(1.f-v.y*inv)*.5f*vp.Height,
+        mix(vp.MinZ,vp.MaxZ,sat(v.z*inv)),inv,
+        D3DCOLOR_ARGB(byte(v.alpha*visibility*255.f),byte(colour.r),byte(colour.g),byte(colour.b)),
+        D3DCOLOR_ARGB(byte(v.fog*255.f),0,0,0),v.u,v.v,v.t};
+}
+struct ProjectedMesh {
+    std::vector<ClipVertex> clip;
+    std::vector<unsigned> masks;
+    std::vector<ScreenVertex> vertices;
+    std::vector<std::uint16_t> indices;
+};
+// For the canopy, clip the near plane AND viewport boundaries explicitly;
+// unlike hardware XYZ, XYZRHW cannot clip behind-eye points correctly.
+// For volume rays, the near-plane condition is normally already satisfied.
+// Keep ordinary indexed geometry; generate new triangles only for crossings.
+inline float planeDistance(const ClipVertex& v,int plane) {
+    switch(plane){
+        case 0:return v.z;
+        case 1:return v.w-.001f;
+        case 2:return v.x+v.w;
+        case 3:return v.w-v.x;
+        case 4:return v.y+v.w;
+        default:return v.w-v.y;
+    }
+}
+inline unsigned clipMask(const ClipVertex& v) {
+    unsigned mask=0;for(int i=0;i<6;++i)if(planeDistance(v,i)<(i<2?0.f:-.0001f*std::abs(v.w)))mask|=1u<<i;
+    return mask;
+}
+inline void projectMesh(ProjectedMesh& mesh,const D3DVIEWPORT9& vp,RGB color,float visibility,
+                        const std::uint16_t* indices,std::size_t count) {
+    mesh.vertices.resize(mesh.clip.size());mesh.indices.clear();mesh.indices.reserve(count);
+    // Unreferenced invalid vertices are never drawn.
+    constexpr unsigned unvisited=~0u;
+    auto& masks=mesh.masks;masks.assign(mesh.clip.size(),unvisited);
+    const auto visit=[&](std::uint16_t i) {
+        if(masks[i]!=unvisited)return;
+        masks[i]=clipMask(mesh.clip[i]);
+        if(!masks[i])mesh.vertices[i]=project(mesh.clip[i],vp,color,visibility);
+    };
+    for(std::size_t i=0;i+2<count;i+=3) {
+        const auto a=indices[i],b=indices[i+1],c=indices[i+2];
+        visit(a);visit(b);visit(c);
+        if(masks[a]&masks[b]&masks[c])continue;
+        const unsigned planes=masks[a]|masks[b]|masks[c];
+        const bool farA=mesh.clip[a].z>mesh.clip[a].w,farB=mesh.clip[b].z>mesh.clip[b].w,farC=mesh.clip[c].z>mesh.clip[c].w;
+        const bool crossFar=farA!=farB||farA!=farC;
+        if(!planes&&!crossFar){mesh.indices.insert(mesh.indices.end(),{a,b,c});continue;}
+        std::array<ClipVertex,12> poly{},next{};
+        poly[0]=mesh.clip[a];poly[1]=mesh.clip[b];poly[2]=mesh.clip[c];int n=3;
+        for(int p=0;p<6&&n>=3;++p)if(planes&(1u<<p)) {
+            int out=0;
+            for(int j=0;j<n;++j) {
+                const auto& start=poly[j];const auto& end=poly[(j+1)%n];
+                const float d=planeDistance(start,p),e=planeDistance(end,p);
+                if(d>=0)next[out++]=start;
+                if((d<0)!=(e<0))next[out++]=lerp(start,end,d/(d-e));
+            }
+            poly=next;n=out;
+        }
+        const auto emit=[&](const auto& polygon,int nVertices) {
+            if(nVertices<3||mesh.vertices.size()+std::size_t(nVertices)>=65536)return;
+            const auto base=std::uint16_t(mesh.vertices.size());
+            for(int j=0;j<nVertices;++j)mesh.vertices.push_back(project(polygon[j],vp,color,visibility));
+            for(int j=1;j+1<nVertices;++j)mesh.indices.insert(mesh.indices.end(),{base,std::uint16_t(base+j),std::uint16_t(base+j+1)});
+        };
+        if(!crossFar){emit(poly,n);continue;}
+        // Separately triangulate each side of the scene far plane. Otherwise
+        // interpolating a clamped depth with a near one can let a far cloud
+        // incorrectly cover a distant foreground object.
+        for(float sign:{1.f,-1.f}) {
+            int out=0;
+            for(int j=0;j<n;++j) {
+                const auto& start=poly[j];const auto& end=poly[(j+1)%n];
+                const float d=(start.w-start.z)*sign,e=(end.w-end.z)*sign;
+                if(d>=0)next[out++]=start;
+                if((d<0)!=(e<0))next[out++]=lerp(start,end,d/(d-e));
+            }
+            emit(next,out);
+        }
+    }
+}
 struct Options {
     D3DTEXTUREFILTERTYPE filter{D3DTEXF_LINEAR};
     D3DTEXTUREOP blendOp{D3DTOP_LERP};
-    bool dual{true};
+    bool dual{true},mip{true},vertexFog{true};
 };
 inline Options options(const D3DCAPS9& caps) {
     Options o;
     const DWORD linear=D3DPTFILTERCAPS_MINFLINEAR|D3DPTFILTERCAPS_MAGFLINEAR;
     o.filter=(caps.VolumeTextureFilterCaps&linear)==linear?D3DTEXF_LINEAR:D3DTEXF_POINT;
+    o.vertexFog=(caps.RasterCaps&D3DPRASTERCAPS_FOGVERTEX)!=0;
     o.blendOp=(caps.TextureOpCaps&D3DTEXOPCAPS_LERP)?D3DTOP_LERP:D3DTOP_BLENDFACTORALPHA;
     o.dual=caps.MaxSimultaneousTextures>=2&&caps.MaxTextureBlendStages>=3&&
         (caps.TextureOpCaps&(D3DTEXOPCAPS_LERP|D3DTEXOPCAPS_BLENDFACTORALPHA));
     return o;
 }
-inline Result draw(IDirect3DDevice9* d,const std::array<IDirect3DVolumeTexture9*,2>& textures,
-                   const Options& opts,const Vertex* vertices,UINT count,
+struct StateScope {
+    IDirect3DStateBlock9* block=nullptr;
+    Result capture(IDirect3DDevice9* d) {
+        return failed(d->CreateStateBlock(D3DSBT_ALL,&block),"CreateStateBlock(ALL)");
+    }
+    Result restore() {
+        if(!block)return {};
+        const auto hr=block->Apply();block->Release();block=nullptr;
+        return failed(hr,"StateBlock::Apply");
+    }
+    ~StateScope(){restore();}
+};
+inline Result drawRaw(IDirect3DDevice9* d,const std::array<IDirect3DBaseTexture9*,2>& textures,
+                   const Options& opts,const void* vertices,UINT count,UINT stride,DWORD fvf,
                    const std::uint16_t* indices,UINT triangles,float coverage,bool fog,
-                   const D3DMATRIX* view=nullptr,const D3DMATRIX* projection=nullptr) {
+                   bool projected,bool mipmaps,DWORD fogColor,
+                   const D3DMATRIX* view=nullptr,const D3DMATRIX* projection=nullptr,bool ownState=true) {
     if(!count||!triangles)return {};
-    IDirect3DStateBlock9* saved=nullptr;
-    const auto capture=d->CreateStateBlock(D3DSBT_ALL,&saved);
-    if(FAILED(capture))return failed(capture,"CreateStateBlock(ALL)");
+    StateScope scoped;
+    if(ownState){const auto capture=scoped.capture(d);if(!capture)return capture;}
     // CreateStateBlock already captures state, including on pure devices.
     // Do not use GetTransform, GetRenderState, etc., which pure devices prohibit.
     Result result;
@@ -91,15 +258,22 @@ inline Result draw(IDirect3DDevice9* d,const std::array<IDirect3DVolumeTexture9*
     const auto ts=[&](DWORD stage,D3DTEXTURESTAGESTATETYPE st,DWORD value){check(d->SetTextureStageState(stage,st,value),"SetTextureStageState");};
     const auto ss=[&](DWORD stage,D3DSAMPLERSTATETYPE st,DWORD value){check(d->SetSamplerState(stage,st,value),"SetSamplerState");};
     const auto world=identity();
-    check(d->SetTransform(D3DTS_WORLD,&world),"SetTransform(WORLD)");
+    if(!projected)check(d->SetTransform(D3DTS_WORLD,&world),"SetTransform(WORLD)");
     if(view)check(d->SetTransform(D3DTS_VIEW,view),"SetTransform(VIEW)");
     if(projection)check(d->SetTransform(D3DTS_PROJECTION,projection),"SetTransform(PROJECTION)");
     check(d->SetVertexShader(nullptr),"SetVertexShader");
     check(d->SetPixelShader(nullptr),"SetPixelShader");
-    check(d->SetFVF(D3DFVF_XYZ|D3DFVF_DIFFUSE|D3DFVF_TEX1|D3DFVF_TEXCOORDSIZE3(0)),"SetFVF(XYZ,DIFFUSE,TEX3)");
+    check(d->SetFVF(fvf),"SetFVF(clouds)");
     rs(D3DRS_LIGHTING,FALSE);rs(D3DRS_SPECULARENABLE,FALSE);
     rs(D3DRS_VERTEXBLEND,D3DVBF_DISABLE);rs(D3DRS_INDEXEDVERTEXBLENDENABLE,FALSE);
-    rs(D3DRS_FOGENABLE,fog?TRUE:FALSE);rs(D3DRS_ZENABLE,D3DZB_TRUE);rs(D3DRS_ZWRITEENABLE,FALSE);
+    rs(D3DRS_FOGENABLE,fog?TRUE:FALSE);
+    if(projected) {
+        // For transformed/lit vertices D3D9 consumes the explicitly supplied
+        // fog factor (specular alpha), not the game's table fog or fog start.
+        rs(D3DRS_FOGTABLEMODE,D3DFOG_NONE);rs(D3DRS_FOGVERTEXMODE,D3DFOG_NONE);
+        rs(D3DRS_RANGEFOGENABLE,FALSE);rs(D3DRS_FOGCOLOR,fogColor);
+    }
+    rs(D3DRS_ZENABLE,D3DZB_TRUE);rs(D3DRS_ZWRITEENABLE,FALSE);
     rs(D3DRS_ZFUNC,D3DCMP_LESSEQUAL);rs(D3DRS_ALPHABLENDENABLE,TRUE);
     rs(D3DRS_ALPHATESTENABLE,TRUE);rs(D3DRS_ALPHAFUNC,D3DCMP_GREATER);rs(D3DRS_ALPHAREF,0);
     rs(D3DRS_SRCBLEND,D3DBLEND_SRCALPHA);rs(D3DRS_DESTBLEND,D3DBLEND_INVSRCALPHA);
@@ -117,7 +291,7 @@ inline Result draw(IDirect3DDevice9* d,const std::array<IDirect3DVolumeTexture9*
         ss(i,D3DSAMP_ADDRESSU,D3DTADDRESS_WRAP);ss(i,D3DSAMP_ADDRESSV,D3DTADDRESS_WRAP);
         ss(i,D3DSAMP_ADDRESSW,D3DTADDRESS_CLAMP);
         ss(i,D3DSAMP_MINFILTER,opts.filter);ss(i,D3DSAMP_MAGFILTER,opts.filter);
-        ss(i,D3DSAMP_MIPFILTER,D3DTEXF_NONE);ss(i,D3DSAMP_SRGBTEXTURE,FALSE);
+        ss(i,D3DSAMP_MIPFILTER,mipmaps?D3DTEXF_LINEAR:D3DTEXF_NONE);ss(i,D3DSAMP_SRGBTEXTURE,FALSE);
         ts(i,D3DTSS_TEXCOORDINDEX,0);ts(i,D3DTSS_TEXTURETRANSFORMFLAGS,D3DTTFF_DISABLE);
         ts(i,D3DTSS_RESULTARG,D3DTA_CURRENT);
     }
@@ -140,11 +314,25 @@ inline Result draw(IDirect3DDevice9* d,const std::array<IDirect3DVolumeTexture9*
     ts(blend?3:1,D3DTSS_COLOROP,D3DTOP_DISABLE);
     ts(blend?3:1,D3DTSS_ALPHAOP,D3DTOP_DISABLE);
     if(result)check(d->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST,0,count,triangles,
-        indices,D3DFMT_INDEX16,vertices,sizeof(Vertex)),"DrawIndexedPrimitiveUP");
-    const auto restore=saved->Apply();
-    saved->Release();
+        indices,D3DFMT_INDEX16,vertices,stride),"DrawIndexedPrimitiveUP");
+    const auto restore=scoped.restore();
     // Restore failures are higher priority than draw failures.
-    if(FAILED(restore))return failed(restore,"StateBlock::Apply");
+    if(!restore)return restore;
     return result;
+}
+// Original XYZ entry point retained for the isolated sampler regression.
+inline Result draw(IDirect3DDevice9* d,const std::array<IDirect3DVolumeTexture9*,2>& textures,
+                   const Options& opts,const Vertex* vertices,UINT count,const std::uint16_t* indices,
+                   UINT triangles,float coverage,bool fog,const D3DMATRIX* view=nullptr,const D3DMATRIX* projection=nullptr) {
+    return drawRaw(d,{textures[0],textures[1]},opts,vertices,count,sizeof(Vertex),
+        D3DFVF_XYZ|D3DFVF_DIFFUSE|D3DFVF_TEX1|D3DFVF_TEXCOORDSIZE3(0),indices,triangles,coverage,fog,false,false,0,view,projection);
+}
+inline Result drawProjected(IDirect3DDevice9* d,const std::array<IDirect3DBaseTexture9*,2>& textures,
+                            const Options& opts,const ProjectedMesh& mesh,float coverage,bool volume,
+                            RGB fogColor,bool fog=true,bool ownState=true) {
+    return drawRaw(d,textures,opts,mesh.vertices.data(),UINT(mesh.vertices.size()),sizeof(ScreenVertex),
+        D3DFVF_XYZRHW|D3DFVF_DIFFUSE|D3DFVF_SPECULAR|D3DFVF_TEX1|D3DFVF_TEXCOORDSIZE3(0),
+        mesh.indices.data(),UINT(mesh.indices.size()/3),coverage,fog&&opts.vertexFog,true,!volume&&opts.mip,
+        D3DCOLOR_XRGB(byte(fogColor.r),byte(fogColor.g),byte(fogColor.b)),nullptr,nullptr,ownState);
 }
 } // namespace vc::d3d9

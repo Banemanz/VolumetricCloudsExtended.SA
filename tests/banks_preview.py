@@ -21,7 +21,7 @@ def sample3(tex,uv):
         return (tex[k,y%h,x%w]*(1-fx)+tex[k,y%h,(x+1)%w]*fx)*(1-fy)+(tex[k,(y+1)%h,x%w]*(1-fx)+tex[k,(y+1)%h,(x+1)%w]*fx)*fy
     return plane(z)*(1-fz)+plane(z+1)*fz
 
-def draw(canvas,tex,v,indices,layer,weather):
+def draw(canvas,tex,v,indices,layer,weather,fog):
     for tri in indices:
         poly=clip(v[tri])
         for j in range(1,len(poly)-1):
@@ -45,7 +45,8 @@ def draw(canvas,tex,v,indices,layer,weather):
                 if weather>0:rgba=rgba*(1-weather)+sample3(tex[3],attr[:,:3])*weather
             else:rgba=sample2(tex[layer],attr[:,:2])
             alpha=(rgba[:,3]*attr[:,3])[:,None]
-            canvas[y,x]=canvas[y,x]*(1-alpha)+rgba[:,:3]*attr[:,4:7]*alpha
+            color=rgba[:,:3]*attr[:,4:7]*attr[:,7:8]+fog*(1-attr[:,7:8])
+            canvas[y,x]=canvas[y,x]*(1-alpha)+color*alpha
 
 def render(scene,exe):
     with tempfile.TemporaryDirectory() as tmp:
@@ -61,7 +62,7 @@ def render(scene,exe):
         weather=float(cols[3]) if layer==2 else 0
         v=np.array([next(rows).split() for _ in range(nv)],float)
         indices=np.array([next(rows).split() for _ in range(nt)],int)
-        draw(canvas,tex,v,indices,layer,weather)
+        draw(canvas,tex,v,indices,layer,weather,(.8*p[3:6]+.2*p[:3])/255)
     im=Image.fromarray(np.uint8(np.clip(canvas,0,1)*255))
     d=ImageDraw.Draw(im);d.rectangle((0,0,W,24),fill=(15,23,35))
     d.text((8,6),f"3D DENSITY / {scene.upper()} - actual density and slice geometry / synthetic sky, not GTA",fill=(242,246,255))

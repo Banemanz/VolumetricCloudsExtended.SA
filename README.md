@@ -38,8 +38,7 @@ pipeline may still need compatibility testing.
   bounded back-to-front view slices with absolute world XYZ texture
   coordinates. Rotation of the camera does not rotate the density.
   `HybridClouds=0` selects the inexpensive original canopy-only renderer.
-  Optional native flight cards remain disabled by default.
-- Frustum rejection, actual camera far-plane limit, smooth range and near fades,
+- Frustum rejection, independent mode 2 cloud range, smooth range and near fades,
   back-to-front view-depth ordering and bounded RenderWare batches.
 - Additional textures are borrowed directly from the loaded particle TXD. Missing
   names are ignored; the native cloudhigh texture is the fallback. No global game
@@ -47,86 +46,92 @@ pipeline may still need compatibility testing.
 
 ## INI controls
 
-All earlier setting names are recognized (including the two legacy tint aliases).
-New settings take their defaults if absent. Values are finite and clamped; invalid
-text retains the default. Inline comments are supported.
+Fresh installations generate a small, commented INI (also included as
+`VolumetricCloudsExtended.defaults.ini` in the ZIP). Existing INIs are
+never rewritten. Copy the new example over only if you deliberately want
+to reset your settings; otherwise add the three new atmosphere options.
 
 | Setting | Default | Meaning |
 |---|---:|---|
-| TargetProcClouds | 160 | Group count in modes 0/1; coverage control in mode 2 (0 disables) |
-| BadWeatherDensityMultiplier | 1.4 | Cloudy/rainy density relative to clear (0–3) |
-| MinSpawnZ | 200 | Lower absolute altitude (hybrid formations stay within the band) |
-| MaxSpawnZ | 650 | Upper absolute altitude |
-| SpawnRadiusMin | 300 | Inner radius relative to camera; scaled if far clip is shorter |
-| SpawnRadiusMax | 2200 | Outer radius; scaled to effective render distance |
-| RenderMaxDist | 2200 | Hard requested distance cap, also limited by active camera |
-| RespawnMaxDist | 2800 | Maximum recycling reference; clouds are not recycled while visible |
-| WindMoveScale | 0.9 | Wind advection multiplier |
-| MinSpacing2D | 45 | Desired horizontal spacing; bounded retries avoid stalls |
-| SpawnFadeInSpeed | 0.02 | Fade speed per native time step (50 units/sec); also used for retirement |
-| QuadFacingMin | 0.2 | Crossed-card mode only: minimum plane-facing weight |
-| FarClipFadeRange | 450 | Requested distance fade width |
-| FarClipFadeMargin | 80 | Margin before the active far plane |
-| TimecycFarClipScale | 1.8 | Optional tighter timecycle-based cap, never extends projection |
-| LightingMode | 0 | 0 = native high-cloud colour; 1 = custom tint, shade and haze |
-| UseTimecycTint | 1 | Custom mode: use interpolated low-cloud/fluffy RGB |
-| TimecycTintStrength | 0.20 | Custom mode: mix native sky grayscale and cloud tint |
-| FluffyCloudBottomBlend | 0 | Custom mode: mix low-cloud and fluffy-bottom timecycle RGB |
-| ColorBrightnessBoost | 64 | Addition to native sky luminance (64 is stock) |
-| UseAdditionalTextures | 1 | Look for listed textures in particle.txd |
-| IncludeOriginalTextureInRandom | 1 | Include native cloudhigh among variants |
-| CloudTextureNames | cloud2,cloud3,cloud4 | Comma-separated names; up to 15 |
-| RenderMode | 2 | 0 = crossed cards; 1 = clustered fixed world-space cards; 2 = continuous 3D banks + canopy (default) |
-| CumulusDensity | 0.95 | Mode 2: opacity of the cloud texture (0–1) |
-| CumulusImpostors | 1 | Legacy key, accepted but ignored |
-| HybridClouds | 1 | Mode 2: continuous 3D cloud banks plus distant canopy; 0 = canopy only |
-| CumulusNightLight | 1 | Mode 2: night illumination multiplier (0–2); smooth transition to daylight |
-| CumulusContrast | 0.65 | Mode 2: directional relief and occlusion contrast (0–1) |
-| CumulusRimStrength | 0.85 | Mode 2: subtle thin-edge illumination (0–1), no additive halo |
-| CumulusDetail | 0 | Mode 2: 0 = 512² canopy masks + 128×128×32 volume endpoints, 40 m sample interval, at most 36 slices; 1 = 1024² masks + 256×256×32 volumes, 28 m interval, at most 52 slices |
-| InteriorHaze | 0.85 | Mode 2: retain nearby volume opacity on cloud entry (0–1); 0 fades the closest samples |
-| CanopyFlightClouds | 0 | Optional native crossed wisps near the canopy height (0–24); off for lowest cost |
-| PuffsPerCloud | 5 | Mode 1: number of puffs (1–8); core uses three fixed planes, each satellite one |
-| SizeScale | 1 | Group dimensions multiplier, or mode 2 world texture scale |
-| Opacity | 1 | Overall cloud opacity multiplier (0–2) |
-| NearFadeDistance | 25 | Fade near the camera; 0 disables |
-| BottomShade | 1 | Custom mode only: bottom/vertical shading (1 disables) |
-| HazeStrength | 0 | Custom mode only: blend distant cards toward sky-bottom RGB |
-| UseGameFog | 0 | Use RW scene fog rather than the plugin's manual distance haze |
-| Seed | 17321 | Deterministic local RNG seed |
+| RenderMode | 2 | 2 = continuous volume banks + distant layer; 1 = clustered classic cards; 0 = crossed classic cards |
+| HybridClouds | 1 | Mode 2: 0 uses only the inexpensive distant cloud layer |
+| CumulusDetail | 0 | Economy (recommended); 1 = larger textures and more samples |
+| TargetProcClouds | 160 | Sky coverage in mode 2; classic cloud group count otherwise; 0 disables |
+| BadWeatherDensityMultiplier | 1.4 | Cloud density in bad weather relative to clear (0–3) |
+| MinSpawnZ / MaxSpawnZ | 200 / 650 | Cloud layer height above sea level |
+| SizeScale | 1 | Size of the cloud formations |
+| WindMoveScale | 0.9 | Wind movement multiplier |
+| Opacity | 1 | Cloud thickness (0–2) |
+| Seed | 17321 | Repeatable cloud pattern |
+| CloudDrawDistance | 4200 | Independent cloud visibility distance in mode 2 (300–12000 world units) |
+| CloudFogStart / CloudFogEnd | 800 / 2800 | Cloud-only colour haze starts/ends here. Equal values disable colour fog. |
+| CumulusContrast | 0.65 | Strength of baked cloud relief (0–1) |
+| CumulusNightLight | 1 | Cloud night brightness (0–2) |
+| PuffsPerCloud | 5 | Mode 1 only: overlapping puffs per group |
+| UseAdditionalTextures | 1 | Classic modes: use extra textures from particle.txd |
+| CloudTextureNames | cloud2,cloud3,cloud4 | Classic modes: optional extra texture names |
 
-**Lighting correction:** `LightingMode=0` now uses the native high-cloud vertex
-colour from SA 1.0 US: average the six sky colour channels (integer division),
-add `ColorBrightnessBoost` (native 64) and clamp to 255. All vertices use that
-neutral brightness, with no extra puff/bottom shading or manual colour haze.
-In modes 0/1 an older INI without `LightingMode` automatically uses this corrected lighting;
-no need to delete or regenerate it. The custom lighting settings are retained,
-but take effect only with `LightingMode=1`. `UseGameFog` is independently
-configurable and defaults off, like the native pass.
+### Existing INIs and advanced compatibility controls
 
-For the stock appearance with the procedural field, use `RenderMode=0`,
-`LightingMode=0`, `UseAdditionalTextures=0`, `UseGameFog=0` and
-`ColorBrightnessBoost=64`. For a low-overhead clustered
-configuration try `PuffsPerCloud=3`. The new renderer deliberately does not
-extend the world/camera clip plane or change the game's native height-switch global.
+Older INIs remain readable. The following advanced keys are intentionally
+not emitted in a fresh INI: most are only relevant to the classic card
+renderer or duplicate useful controls above. Values are clamped and
+malformed text is ignored.
 
-## Continuous 3D cloud banks (mode 2, default)
+- `RenderMaxDist`, `SpawnRadiusMin/Max`, `RespawnMaxDist`,
+  `MinSpacing2D`, `SpawnFadeInSpeed`, `QuadFacingMin`,
+  `FarClipFadeRange`, `FarClipFadeMargin`, `TimecycFarClipScale`:
+  classic card simulation/range controls. Mode 2 does not read the game's
+  far clip or timecycle fog distance for cloud visibility.
+- `LightingMode=0`: classic neutral native brightness (average sky RGB +
+  stock 64). Explicit `LightingMode=1` enables the older tint and shading
+  options: `UseTimecycTint`, `TimecycTintStrength` (also
+  `TimecycleTintStrength`), `FluffyCloudBottomBlend` (also
+  `TimecycTintSkyInfluence`), `BottomShade`, `HazeStrength`.
+  `ColorBrightnessBoost` sets the original luminance reference.
+- `UseGameFog` is classic-only: it has no influence on mode 2.
+- `IncludeOriginalTextureInRandom` remains a classic-only override.
+- `CumulusDensity`, `CumulusRimStrength`, `InteriorHaze`, and
+  `NearFadeDistance` retain their existing behavior as advanced overrides.
+  For most users, `Opacity`, `CumulusContrast`, and the defaults suffice.
+- Removed unused `CumulusImpostors` and optional `CanopyFlightClouds`:
+  the latter mixed old card wisps into mode 2 and is no longer needed.
 
-Existing INIs are never overwritten. Explicit RenderMode=0 or 1 remains
-unchanged. To switch an existing installation, edit and restart:
+To switch an existing installation to the recommended renderer:
 
 ```ini
 RenderMode=2
 HybridClouds=1
 CumulusDetail=0
-CumulusDensity=0.95
-CumulusContrast=0.65
-CumulusRimStrength=0.85
-CumulusNightLight=1
-InteriorHaze=0.85
-CanopyFlightClouds=0
-Opacity=1
+CloudDrawDistance=4200
+CloudFogStart=800
+CloudFogEnd=2800
 ```
+
+## Continuous 3D cloud banks (mode 2, default)
+
+### Independent cloud atmosphere
+
+Mode 2 uses its own distance and colour-haze parameters for **both** the
+volume banks and distant canopy. It uses the current sky palette instead
+of the world's active fog colour and parameters. Radial fog is calculated
+per vertex from world distance; D3D9 applies it via specular alpha on
+pretransformed vertices, after texture blending, without a fog overlay or
+a second full-screen pass. Weather changes still control live cloud
+coverage, lighting and visibility.
+
+The game's original projection and viewport are preserved. Local cloud
+fragments use their normal scene depth. Triangles crossing the original
+far clip are split, and cloud geometry beyond it is assigned the maximum
+scene depth while retaining the correct XY projection and reciprocal W.
+It can therefore occupy sky pixels but remains behind rendered scene
+geometry. No edits to the camera far plane, fog globals or world drawing
+distance; the game's fog and post-processing continue as normal. Hardware
+without vertex fog instead fades distant cloud opacity. Standard D3D9
+depth-buffer precision and other mods' rendering remain limitations.
+
+See Microsoft's [vertex fog documentation](https://learn.microsoft.com/en-us/windows/win32/direct3d9/vertex-fog)
+and [pure-device GetViewport documentation](https://learn.microsoft.com/en-us/windows/win32/api/d3d9/nf-d3d9-idirect3ddevice9-getviewport).
 
 ### One density field, not isolated impostors
 
@@ -140,25 +145,30 @@ toward a continuous 3D field derived from the same macro weather map.
   erosion and a flatter base form continuous banks. XYZ density remains
   in world space, translated by native wind, including during flight.
 - **Lighting:** static optical-depth accumulation down the cloud column
-  and four oblique density taps give stronger top/underside relief;
-  a sharper density core leaves more defined gaps and taller crowns.
+  and four oblique density taps, a local density gradient and a soft
+  multiple-scattering proxy give finer billow relief, softer shaded cores
+  and brighter edges. Original detailed noise erodes thinner edges.
   Native sky/timecycle RGB and lightning are applied live, with daylight
   headroom for SA’s post-processing colour filter, especially at dawn. This is approximate baked relief, not dynamic directional
   shadowing or full multiple scattering.
 - **Rendering:** ordinary hardware-filtered RGBA volume textures
   (128×128×32 each, clear/overcast endpoints). A bounded stack of
   parallel view-aligned sample planes carries actual world XYZ texture coordinates.
-  Planes have a fixed 40 m (28 m in detail mode) interval and world phase
-  advected by wind. Changing camera position or clip range cannot rescale
-  the sampling grid as the initial volume iteration did. Pitch/yaw still
-  changes quadrature orientation, but does not rotate the density itself.
+  A nested, wind-advected sampling lattice uses 20/40/80 m intervals
+  (14/28/56 m in detail mode). Smooth optical-weight transitions retain
+  the near samples and reduce distant overdraw. A persistent normal has
+  an eight-degree angular dead zone. Beyond it, the sampling planes rotate
+  about the eye rather than the world origin, retaining the sampling phase.
+  Changing camera position or scene clip range cannot rescale the lattice.
+  Large turns still change the finite quadrature orientation, not density.
   Fixed-function texture stages linearly interpolate the weather endpoints
   and multiply live vertex RGB/alpha. The indexed triangle list is submitted
   back-to-front in one draw, with existing scene depth testing, no depth
   writes, no screen render targets, no 3D noise generation per frame and
   no custom shaders. The 16×16×8 conservative occupancy map rejects
-  transparent cells including a one-texel filtering halo. The active
-  camera far clip remains the limit.
+  transparent cells including a one-texel filtering halo. The cloud-only
+  range drives the distant layer; the actual 3D bank radius is separately
+  bounded to 1400m for fill-rate economy.
 - **Flight:** the volume exists at its actual sampled depths, including
   in front of and behind the player/aircraft. Sampling near the eye
   creates local visibility loss, replacing the depth-unaware
@@ -169,14 +179,19 @@ toward a continuous 3D field derived from the same macro weather map.
   at very close range. Limited sampling does not provide true per-pixel
   volumetric integration.
 - **Cost:** one 3D draw (plus one or two existing canopy draws). Economy
-  caps at 36 × 12 × 10 × 2 = 8,640 slice triangles before rejection,
-  plus up to 960 distant canopy triangles; detail caps at 52 × 12 × 10 × 2.
-  The usual economy flight regression submits 3,374 triangles after culling.
-  Tighter spacing reduces undersampling at the cost of increased alpha fill.
+  caps at 60 × 12 × 10 × 2 = 14,400 source triangles in unusually wide
+  custom views, detail 90 planes. Normal views use far fewer: the reference
+  economy flight pose submits 3514 source triangles after rejection versus
+  3374 before the change. Near planes use a 6×5 grid. Projection may split
+  some triangles at the viewport/scene far plane. Cached ray lengths avoid
+  repeated sqrt calls; only referenced vertices are projected.
+  The canopy and volume share one state-block capture/restore per pass.
+  Finer near sampling may increase fill; coarser distance sampling offsets it.
   Two RGBA volume textures occupy 4 MiB (16 MiB at detail 1); total
   with mipmapped canopy ~6.67 MiB / ~26.67 MiB, excluding driver overhead.
-  CPU keeps the 4/16 MiB volume pixels for device restore, plus a tiny
-  occupancy grid and bounded mesh buffers. No recurring texture uploads.
+  CPU keeps the 4/16 MiB volume pixels and 2/8 MiB canopy source pixels
+  for device restore, plus a tiny occupancy grid and bounded mesh buffers.
+  No recurring texture uploads for weather or lighting.
   GPU fill rate, particularly inside a thick overcast, matters more than
   triangle counts. Performance on old/integrated hardware is not measured.
 - **Compatibility:** the direct D3D9 draw carries actual three-component
@@ -185,7 +200,8 @@ toward a continuous 3D field derived from the same macro weather map.
   read directly (verified against the IDB); the SDK's device getter
   invalidates RW's matrix cache and is deliberately avoided. Pipeline
   state is captured/restored via D3DSBT_ALL, with no prohibited pure-device
-  state getters. RW's pending states are flushed first. Volume textures
+  state getters. RW's pending states are flushed first. Both canopy and
+  banks use native D3D9 textures/vertices in a shared state scope. Volume textures
   are uploaded through system-memory staging into the default pool; a
   managed-pool attempt and smaller power-of-two textures are tried on
   failure. Lower-capability hardware can use point sampling and, only
@@ -238,9 +254,11 @@ The Win32 CTest `cloud_d3d9_volume` creates a native D3D9 device (attempts SA's
 pure-device flags first), uploads actual 3D textures with the same backend
 as the ASI, draws the clear/intermediate/wet endpoints, and reads pixels
 back to verify that changing the third texture coordinate changes the
-output. The expanded test then uploads generated cloud density and draws the
-actual perspective mesh at approximate positions from the flight recording,
-checking nonempty cloud pixels, sky gaps above the layer, and intensity.
+output. The expanded tests check cloud-only vertex fog and foreground
+occlusion outside the scene far plane, fog state restoration through a
+subsequent native draw, native mipmapped canopy upload/draw, and the actual
+perspective volume mesh with a 450m scene far clip at positions from the
+flight recording.
 A machine without a volume-capable D3D9 device reports **skipped**,
 not passed. This does not test the GTA camera or integration.
 
@@ -297,7 +315,7 @@ not a copy of any game's assets, code or shaders.
 - **Geometry:** 257 vertices and 480 indexed triangles in one 32-segment,
   8-ring shallow disk. Absolute layer altitude and world-XY UVs stay stable
   under yaw, pitch, roll and camera altitude. The finite disk is recentered
-  horizontally to cover the active camera clip region; only its gentle
+  horizontally to cover the independent cloud range; only its gentle
   outer curvature and distance fade are camera-relative. There is no
   facing sprite, texture rotation, or per-cloud sort in the default path.
   Near the surface the alpha fades locally to avoid a hard sheet crossing
@@ -306,27 +324,15 @@ not a copy of any game's assets, code or shaders.
   per-frame cloud raymarch, custom vertex/pixel shader, screen copy,
   3D GPU texture or render target. Economy uses two 512² RGBA masks
   (~2.67 MiB with mipmaps); detail 1 uses two 1024² masks (~10.67 MiB
-  with mipmaps). The CPU scalar map, RGBA and RW staging are freed after
-  initial upload. No subsequent canopy texture uploads for weather or
-  lighting. Empty masks are skipped; clear usually needs only one pass.
-  Automatic RW mipmaps are requested, with non-mipmapped fallback if
-  unavailable; detail allocation failure retries economy. Texture creation
-  or upload failure falls back to mode 0 and logs it. All owned resources
-  are destroyed at RW shutdown.
-- **Flight:** the canopy is a thin fake cloud surface, not a true 3D volume.
-  In canopy-only mode, optional supplemental wisps use CanopyFlightClouds=12 (max 24); these
-  native crossed wisps appear only near the center altitude, with
-  altitude/range fading. They are optional because they add alpha overdraw
-  and can reveal card geometry. The default purposely omits these optional native cards.
-
-Mode 2 uses HybridClouds, CumulusDetail, CumulusDensity, CumulusContrast, CumulusRimStrength,
-CumulusNightLight, InteriorHaze, TargetProcClouds, BadWeatherDensityMultiplier, SizeScale,
-Opacity, Seed, WindMoveScale, the altitude and range/fade controls, and
-UseGameFog. ColorBrightnessBoost sets the native luminance reference for
-daylight; LightingMode and tint settings affect only native cards.
-CumulusImpostors is accepted as a legacy no-op. PuffsPerCloud affects only
-mode 1. Texture names, spacing, and group spawn radius controls apply to
-native cards (including optional flight wisps), not the procedural sheet.
+  with mipmaps). Native D3D9 textures have alpha-weighted mipmaps; CPU
+  source RGBA pixels are retained for lost/reset devices. The scalar map
+  is freed. No subsequent uploads for weather or lighting. Empty masks
+  are skipped, and clear usually needs only one pass. The same projected
+  vertices are reused for both masks. On resource upload failure the
+  plugin falls back to classic cards and logs the failure.
+- **Flight:** the distant canopy remains a low-cost two-sided surface;
+  the near volume supplies the actual 3D shape. Canopy-only mode remains
+  available for weak hardware.
 
 ### Previous canopy-only Linux software previews
 

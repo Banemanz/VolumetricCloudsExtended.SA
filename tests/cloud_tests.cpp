@@ -57,6 +57,14 @@ int main() {
     CHECK(close(distanceAlpha(r,r.begin),1) && close(distanceAlpha(r,r.end),0));
     CHECK(close(distanceAlpha(r,(r.begin+r.end)*.5f),.5f));
     CHECK(range(cfg,300,2000).end<300);
+    const auto independent=cloudRange(cfg);
+    CHECK(independent.end==4200.f && independent.end>view.farClip);
+    CHECK(cloudFogFactor(cfg,0)==1 && cloudFogFactor(cfg,cfg.cloudFogStart)==1);
+    CHECK(close(cloudFogFactor(cfg,(cfg.cloudFogStart+cfg.cloudFogEnd)*.5f),.5f));
+    CHECK(cloudFogFactor(cfg,cfg.cloudDrawDistance)==0);
+    std::istringstream fogIni("CloudDrawDistance=6000\nCloudFogEnd=99999\nCloudFogStart=99999\n");
+    Settings changed;load(fogIni,changed);
+    CHECK(cloudRange(changed).end==6000 && changed.cloudFogStart==6000 && cloudFogFactor(changed,6000)==1);
     CHECK(range(cfg,0,1000).end==0);
     CHECK(close(weatherFactor(true,true,.5f,0),1));
     CHECK(close(weatherFactor(true,false,.75f,0),.25f));

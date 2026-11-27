@@ -8,11 +8,13 @@ constexpr int Width=128, Height=128, Depth=32;
 constexpr int DetailWidth=256,DetailDepth=32;
 // Constant world-distance sampling. Never stretch the sample interval to
 // fit the current frustum: that causes the field to swim during flight.
-constexpr float EconomyStep=40.f,DetailStep=28.f;
-constexpr int MaxSlices=36,DetailSlices=52,GridX=12,GridY=10;
+// Nested sampling lattice: fine near the player, standard in the middle,
+// coarse at distance. Contributions crossfade without changing positions.
+constexpr float EconomyStep=20.f,DetailStep=14.f;
+constexpr int MaxSlices=60,DetailSlices=90,GridX=12,GridY=10;
 constexpr int OccupancyXY=16,OccupancyZ=8;
 constexpr float ReferenceStep=90.f; // opacity baked for this path length
-struct Vertex {Vec pos;float u{},v{},w{},alpha{};};
+struct Vertex {Vec pos;float u{},v{},w{},alpha{},fog{1.f};};
 struct Mesh {std::vector<Vertex> vertices;std::vector<std::uint16_t> indices;int slices{};};
 static_assert(DetailSlices*(GridX+1)*(GridY+1)<65536);
 inline float radius(const Settings& s,const Range& r) {
@@ -68,7 +70,10 @@ struct Volume {
             const float ceiling=base+.045f+.39f*tower+.18f*(n1-.5f)+.060f*(n2-.5f);
             const float vertical=smooth((h-floor)/.075f)*smooth((ceiling-h)/.075f);
             const float topTaper=.065f*smooth((h-base+.01f)/.27f);
-            const float f=broad+.28f*(n1-.5f)+.15f*(n2-.5f)+.075f*(n3-.5f)-topTaper;
+            // Erode weak edges with a billow-shaped detail octave instead
+            // of coating the whole formation in uniform high-frequency fuzz.
+            const float edgeDetail=(n3-.5f)*(.07f+.045f*(1.f-tower));
+            const float f=broad+.29f*(n1-.5f)+.165f*(n2-.5f)+edgeDetail-topTaper;
             const auto i=index(x,y,z);
             coverage[i]=f;
             rho[i]=z==0||z==depth-1?0.f:vertical;
@@ -102,11 +107,17 @@ struct Volume {
                         oblique+=at(-k*lateralStep,-k*lateralStep/2,k*riseStep);
                     const float topDepth=column*zStep/90.f;
                     const float sideDepth=oblique*.45f;
-                    const float ambient=std::exp(-.38f*topDepth-.56f*sideDepth);
+                    // Soft multiple-scattering proxy: dense sheltered cores
+                    // remain shaded, but the sun-facing crown retains a
+                    // broad, pale highlight rather than a grey flat mass.
+                    const float trans=std::exp(-.43f*topDepth-.64f*sideDepth);
+                    const float ambient=.22f*std::exp(-.16f*(topDepth+sideDepth))+.78f*trans;
                     const float slope=clamp((at(lateralStep,0,0)-at(-lateralStep,0,0)
                         +at(0,lateralStep,0)-at(0,-lateralStep,0))*.5f,-1.f,1.f);
-                    const float shade=clamp(1.f-s.cumulusContrast*(.59f*(1.f-ambient)+.22f*d+.15f*slope)
-                        +s.cumulusRimStrength*.035f*(1.f-d),.50f,1.f);
+                    const float localRelief=clamp(d-(at(1,0,0)+at(-1,0,0)+at(0,1,0)+at(0,-1,0))*.25f,-.35f,.35f);
+                    const float litRim=(1.f-d)*trans;
+                    const float shade=clamp(.995f-s.cumulusContrast*(.64f*(1.f-ambient)+.18f*d+.19f*slope+.22f*localRelief)
+                        +s.cumulusRimStrength*.065f*litRim,.50f,1.f);
                     // Reference alpha for 90m of cloud; individual slices
                     // scale this by their actual path length.
                     const float alpha=1.f-std::exp(-d*(.32f+.95f*d)*density);
@@ -168,63 +179,122 @@ inline RGB bankLight(const canopy::Light& l,const weather::State& w) {
     const float gain=1.f-l.day*.10f-lowSun*.18f;
     return scaleRGB(l.bright,gain);
 }
-// Parallel, view-facing integration planes, anchored to a fixed world phase.
-// Moving the camera or changing its far clip does not stretch or slide the
-// sampling grid. Pitch/yaw can still change quadrature (not world density).
-// Avoid intersecting axis-aligned cells, which expose their edges in flight.
+// A world-locked sampling normal with a small angular dead zone. Tilt
+// the lattice only when necessary, about the eye rather than world origin.
+// This removes phase jumps from small changes of pitch/yaw at large XYZ.
+struct SamplingFrame {
+    Vec normal{},lastPos{};
+    double phase{},lastWindX{},lastWindY{};
+    bool ready=false;
+    float lastStep{};
+    void update(const View& view,const canopy::Drift& drift,float step,float baseZ) {
+        const double period=4.0*step;
+        if(!ready||lastStep!=step||length(view.pos-lastPos)>600.f) {
+            normal=view.forward;
+            phase=double(normal.x)*(double(view.pos.x)-drift.worldX)
+                +double(normal.y)*(double(view.pos.y)-drift.worldY)
+                +double(normal.z)*(double(view.pos.z)-baseZ);
+            ready=true;
+        } else {
+            const float angle=std::acos(clamp(dot(normal,view.forward),-1.f,1.f));
+            constexpr float deadZone=8.f*Pi/180.f;
+            if(angle>deadZone) {
+                // Exact slerp to the edge of the dead zone; avoid a slow
+                // catch-up or a zero normal after a large camera cut.
+                const float sinAngle=std::sin(angle);
+                normal=std::abs(sinAngle)<.001f?view.forward:
+                    unit(normal*(std::sin(deadZone)/sinAngle)+view.forward*(std::sin(angle-deadZone)/sinAngle));
+            }
+            // The transfer phase is insensitive to rotating in place.
+            phase+=double(normal.x)*(double(view.pos.x-lastPos.x)-(drift.worldX-lastWindX))
+                +double(normal.y)*(double(view.pos.y-lastPos.y)-(drift.worldY-lastWindY))
+                +double(normal.z)*double(view.pos.z-lastPos.z);
+        }
+        phase-=period*std::floor(phase/period);
+        lastPos=view.pos;lastWindX=drift.worldX;lastWindY=drift.worldY;lastStep=step;
+    }
+};
+// Weights are in metres of optical path along the lattice normal. Sum
+// across every four consecutive lattice positions is always 4*step at
+// any fixed blend value. Near 20m, mid 40m, far 80m (detail 14/28/56).
+inline float sampleWeight(int k,float d,float step) {
+    const float fine=1.f-smooth((d-160.f)/200.f);
+    const float coarse=smooth((d-650.f)/350.f);
+    const int parity=((k%4)+4)%4;
+    const float mid=parity%2==0?2.f*(1.f+(parity==0?coarse:-coarse)):0.f;
+    return step*(fine+(1.f-fine)*mid);
+}
 inline void buildMesh(Mesh& m,const Settings& s,const View& view,const Range& r,
-                      const canopy::Drift& drift,float wx,float wy,const Volume* volume=nullptr,float weather=0.f) {
+                      const canopy::Drift& drift,float wx,float wy,const Volume* volume=nullptr,float weather=0.f,
+                      SamplingFrame* persisted=nullptr) {
     m.vertices.clear();m.indices.clear();m.slices=0;
     const float rad=radius(s,r),band=s.maxSpawnZ-s.minSpawnZ;
     if(!s.hybridClouds||!s.targetProcClouds||rad<5.f||band<1.f||
         !std::isfinite(wx)||!std::isfinite(wy)||wx<=0||wy<=0||wx>10.f||wy>10.f||
         view.pos.z<s.minSpawnZ-r.end||view.pos.z>s.maxSpawnZ+r.end)return;
-    // Project bounding prism to view depth; intersect with actual camera clip.
-    const float z0=s.minSpawnZ-view.pos.z,z1=s.maxSpawnZ-view.pos.z;
-    const float lateral=rad*std::sqrt(horizontalSq(view.forward));
-    const float first=std::max(std::max(view.nearClip,8.f),std::min(z0*view.forward.z,z1*view.forward.z)-lateral);
-    const float last=std::min(r.end,std::max(z0*view.forward.z,z1*view.forward.z)+lateral);
-    if(last-first<1.f)return;
-    const int cap=s.cumulusDetail?DetailSlices:MaxSlices;
     const float step=s.cumulusDetail?DetailStep:EconomyStep;
+    const int cap=s.cumulusDetail?DetailSlices:MaxSlices;
+    SamplingFrame local;
+    auto& grid=persisted?*persisted:local;
+    grid.update(view,drift,step,s.minSpawnZ);
+    // Extremely wide custom FOVs may cross the locked plane's tangent.
+    // In that case use the actual view normal, preserving the phase.
+    constexpr int per=(GridX+1)*(GridY+1);
+    std::array<Vec,per> rays{};
+    std::array<float,per> rayLen{},horizontal{};
+    float minCos=1e9f;
+    auto prepare=[&] {
+        minCos=1e9f;
+        for(int y=0;y<=GridY;++y)for(int x=0;x<=GridX;++x) {
+            const int i=y*(GridX+1)+x;
+            const Vec ray=view.forward+view.right*((2.f*x/GridX-1.f)*wx)+view.up*((1.f-2.f*y/GridY)*wy);
+            const float cosine=dot(ray,grid.normal);
+            minCos=std::min(minCos,cosine);
+            rays[i]=ray/std::max(.01f,cosine);
+            rayLen[i]=length(rays[i]);horizontal[i]=std::sqrt(horizontalSq(rays[i]));
+        }
+    };
+    prepare();
+    if(minCos<.35f){grid.normal=view.forward;prepare();}
+    const float z0=s.minSpawnZ-view.pos.z,z1=s.maxSpawnZ-view.pos.z;
+    const float lateral=rad*std::sqrt(horizontalSq(grid.normal));
+    // Bounding prism and radial range, independent of game far clip.
+    const float first=std::max(std::max(view.nearClip,8.f)*minCos,std::min(z0*grid.normal.z,z1*grid.normal.z)-lateral);
+    const float last=std::min({r.end,std::max(z0*grid.normal.z,z1*grid.normal.z)+lateral,rad+band});
+    if(last-first<1.f)return;
+    const int firstPlane=int(std::ceil((first+grid.phase)/step));
+    int lastPlane=int(std::floor((last+grid.phase)/step));
+    int candidates=0;
+    for(int k=firstPlane;k<=lastPlane;++k)if(sampleWeight(k,float(k*step-grid.phase),step)>=.1f)
+        if(++candidates>cap){lastPlane=k-1;break;}
     const float tile=canopy::tileWorldSize(s);
-    // Anchor the phase to the wind-advected density rather than the eye.
-    // Use doubles for the phase so crossing large world coordinates does
-    // not cause the lattice to snap. Only whole planes enter/leave range.
-    const double phase=double(view.forward.x)*(double(view.pos.x)-drift.worldX)
-        +double(view.forward.y)*(double(view.pos.y)-drift.worldY)
-        +double(view.forward.z)*(double(view.pos.z)-s.minSpawnZ);
-    const double phaseOffset=phase-step*std::floor(phase/step);
-    const int firstPlane=int(std::ceil((first+phaseOffset)/step-.5));
-    const int lastPlane=std::min(firstPlane+cap-1,int(std::floor((last+phaseOffset)/step-.5)));
-    if(lastPlane<firstPlane)return;
-    // Keep UVs near zero to retain precision in high-speed flight.
     const double uu=double(view.pos.x)/tile-drift.x,vv=double(view.pos.y)/tile-drift.y;
     const float u0=float(uu-std::floor(uu)),v0=float(vv-std::floor(vv));
-    const float refOpacity=std::min(1.f,step/ReferenceStep);
     const float fade=smooth((rad-5.f)/120.f);
-    const int per=(GridX+1)*(GridY+1);
     m.vertices.reserve(std::size_t(cap)*per);m.indices.reserve(std::size_t(cap)*GridX*GridY*6);
+    // Fixed normal distance is used for LOD, not direction-dependent
+    // screen depth. It stays invariant while the camera pans in the dead zone.
     for(int k=lastPlane;k>=firstPlane;--k) {
-        const float d=float((k+.5)*step-phaseOffset);
+        const float d=float(k*step-grid.phase);
+        // The narrow near slices do not require a high-resolution mesh:
+        // density itself is sampled per pixel. Keep the shared 12x10 ray
+        // table but use 6x5 triangles near the eye, where alpha is smooth.
+        const int stride=d<180.f?2:1;
+        const float weight=sampleWeight(k,d,step);
+        if(weight<.1f)continue;
         const int start=int(m.vertices.size());
-        for(int y=0;y<=GridY;++y)for(int x=0;x<=GridX;++x) {
-            const Vec ray=view.forward+view.right*((2.f*x/GridX-1.f)*wx)+view.up*((1.f-2.f*y/GridY)*wy);
-            const Vec delta=ray*d,pos=view.pos+delta;
-            const float horizontal=std::sqrt(horizontalSq(delta));
-            const float rangeWeight=distanceAlpha(r,length(delta));
-            const float edge=smooth((rad-horizontal)/(rad*.34f));
-            const float capFade=smooth((first+cap*step-d)/(step*2.f));
-            // The density texture is clamped vertically to empty border
-            // slices. Geometry outside the layer therefore contributes zero.
+        for(int i=0;i<per;++i) {
+            const Vec delta=rays[i]*d,pos=view.pos+delta;
+            const float dist=rayLen[i]*d;
+            const float edge=smooth((rad-horizontal[i]*d)/(rad*.34f));
             const float w=(pos.z-s.minSpawnZ)/band;
-            const float nearWeight=mix(smooth((length(delta)-view.nearClip)/std::max(80.f,s.nearFadeDistance)),1.f,s.interiorHaze*.22f);
-            const float a=sat(refOpacity*length(ray))*edge*rangeWeight*nearWeight*fade*capFade;
-            m.vertices.push_back({pos,u0+delta.x/tile,v0+delta.y/tile,w,a});
+            const float nearWeight=smooth((dist-8.f)/24.f)*mix(smooth((dist-view.nearClip)/std::max(80.f,s.nearFadeDistance)),1.f,s.interiorHaze*.22f);
+            const float a=sat(weight*rayLen[i]/ReferenceStep)*edge*distanceAlpha(r,dist)*nearWeight*fade;
+            m.vertices.push_back({pos,u0+delta.x/tile,v0+delta.y/tile,w,a,cloudFogFactor(s,dist)});
         }
         const auto before=m.indices.size();
-        for(int y=0;y<GridY;++y)for(int x=0;x<GridX;++x) {
-            const auto a=std::uint16_t(start+y*(GridX+1)+x),b=std::uint16_t(a+1),c=std::uint16_t(a+GridX+1),e=std::uint16_t(c+1);
+        for(int y=0;y<GridY;y+=stride)for(int x=0;x<GridX;x+=stride) {
+            const auto a=std::uint16_t(start+y*(GridX+1)+x),b=std::uint16_t(a+stride),c=std::uint16_t(a+stride*(GridX+1)),e=std::uint16_t(c+stride);
             const auto& A=m.vertices[a];const auto& B=m.vertices[b];const auto& C=m.vertices[c];const auto& E=m.vertices[e];
             if(std::max({A.alpha,B.alpha,C.alpha,E.alpha})<=1.f/255.f ||
                std::max({A.w,B.w,C.w,E.w})<0.f||std::min({A.w,B.w,C.w,E.w})>1.f)continue;

@@ -727,3 +727,62 @@ discarded after local diagnostics exposed discontinuities at axis transitions.
   changes in angle persists, measure whether a small bounded PS2.0
   integration shader (optional, at equal/lower fill budget) would be
   preferable. Do not add successive experimental modes.
+
+
+## Independent cloud atmosphere, rotation stability and final cosmetic pass (2026-11-27)
+
+User tested prior build and says substantially improved. Screenshot at
+(2532.6,-905.3,399.3), 07:31, still reveals lateral haze and scene fog
+limitations; reports some close-cloud jitter during camera rotations.
+Requested independent D3D9 fog/distance, cosmetic quality and optimization,
+and a concise, human-commented INI.
+
+- Mode 2 no longer calls legacy range() for its visibility. CloudDrawDistance
+  4200, CloudFogStart 800, CloudFogEnd 2800 (world units), independently
+  configurable. Legacy card modes keep their original settings. The near
+  true volume remains 1400m max radius; long-range clouds are the canopy.
+- Direct3D9 pretransformed XYZRHW vertices carry perspective-correct 3D UVs
+  and vertex fog factor in specular alpha. Read the verified current game
+  matrices from their known addresses and GetViewport (explicitly supported
+  on pure devices). Clip against near and lateral frustum planes (CPU);
+  split any triangles across far boundary and clamp only far Z. Keep
+  original XY and reciprocal W. Far clouds render at MaxZ with existing
+  Z test and no Z write; nearby rendered geometry remains in front.
+  Native table fog is disabled for these draws, vertex fog blends into
+  current horizon/sky colour according to radial distance. No extra
+  fullscreen pass, shader, or scene fog/camera changes. Unavailable
+  vertex fog caps fall back to alpha haze. Original game post FX remain.
+- Distant canopy now native D3D9 2D textures with CPU alpha-weighted
+  mipmaps, staged upload and managed fallback; CPU source pixels kept for
+  device reset. No RenderWare private raster extension, same default GPU
+  texture budget. Both canopy masks and volume share a single D3DSBT_ALL
+  snapshot with RW flush; restore before other game effects.
+- Persistent sampling normal with 8-degree dead zone, moves only outside
+  it, preserving phase about current eye during turns. Translation/wind
+  advances phase using world displacement. Nested 20/40/80m economy
+  (14/28/56 detail) samples crossfade optical weights, not coordinates.
+  Finer nearby detail, farther fewer planes. Near slices use 6x5 rather
+  than 12x10 quads; cache rays and lengths, project only referenced
+  vertices. 3514 vs previous 3374 source triangles at reference flight
+  pose; actual alpha fill and old hardware performance still need testing.
+- Cosmetic: edge erosion varies with crown density, local fine relief,
+  softer scattering floor, shaded internal structure and pale rims.
+  Distant canopy has broader directional gradient. Still baked in same
+  two texture endpoints, no per-frame bake/raymarch or extra texture
+  fetches. Original sky palette, night and weather behavior remain.
+- Fresh INIs grouped and commented, reduced to 19 main controls including
+  three independent atmosphere options. Remove CumulusImpostors and
+  CanopyFlightClouds; old INI ignored keys harmless. Classic-only and
+  redundant advanced settings no longer generated but still parsed.
+  Never overwrite an existing file. Ship separately named defaults.ini.
+- Local portable regression: all four passed, including fixed phase
+  through turns/translation/clip, 4-sample optical weight conservation,
+  independent range/fog clamps and generated INI cleanup. Native D3D9
+  CI test extended to cover actual projected 3D/2D draw, far-depth
+  occlusion, fog/restore sentinel, weather blend and perspective scenes
+  with short game clip. Linux previews are diagnostics, not GTA captures.
+- Verify in game: test same flight through 399m, noon/dawn/night, slow
+  orbit/pitch and rapid turns, very short vs long world draw distance,
+  and unchanged distant map/near CJ/objects. Cloud colour distance must
+  no longer track world fog; test alternative CloudFogStart/End and
+  CloudDrawDistance. Check SkyGfx and D3D9Ex alt-tab/reset. No new modes.

@@ -10,12 +10,15 @@ bool close(float a,float b,float eps=.0001f) { return std::abs(a-b)<=eps; }
 
 int main() {
     Settings s;
-    CHECK(s.renderMode==2 && textureSize(s)==512 && s.canopyFlightClouds==0);
+    CHECK(s.renderMode==2 && textureSize(s)==512);
     std::ostringstream ini;write(ini,s);
     CHECK(ini.str().find("RenderMode=2\n")!=std::string::npos);
+    CHECK(ini.str().find("CumulusImpostors=")==std::string::npos && ini.str().find("CanopyFlightClouds=")==std::string::npos);
+    CHECK(ini.str().find("UseGameFog=")==std::string::npos && ini.str().find("CloudFogStart=")!=std::string::npos);
+    CHECK(ini.str().find("[Atmosphere]")!=std::string::npos);
     for(int mode=0;mode<=2;++mode) {
         Settings old;std::istringstream in("RenderMode="+std::to_string(mode)+"\nCumulusDetail=1\nCumulusImpostors=0\nCanopyFlightClouds=99\n");
-        load(in,old);CHECK(old.renderMode==mode && textureSize(old)==1024 && old.canopyFlightClouds==24 && !old.cumulusImpostors);
+        load(in,old);CHECK(old.renderMode==mode && textureSize(old)==1024);
     }
     for(int i=0;i<257;++i) {
         const float v=float(i)/257.f;

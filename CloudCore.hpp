@@ -39,7 +39,8 @@ struct Settings {
     float badWeatherDensityMultiplier = 1.4f;
     float minSpawnZ = 200.f, maxSpawnZ = 650.f;
     float spawnRadiusMin = 300.f, spawnRadiusMax = 2200.f;
-    float renderMaxDist = 2200.f, respawnMaxDist = 2800.f;
+    float renderMaxDist = 2200.f, respawnMaxDist = 2800.f; // legacy cards only
+    float cloudDrawDistance = 4200.f, cloudFogStart = 800.f, cloudFogEnd = 2800.f; // mode 2 independent atmosphere
     float windMoveScale = .9f, minSpacing2D = 45.f, spawnFadeInSpeed = .02f;
     float quadFacingMin = .2f, farClipFadeRange = 450.f, farClipFadeMargin = 80.f;
     float timecycFarClipScale = 1.8f;
@@ -52,11 +53,9 @@ struct Settings {
     int renderMode = 2, puffsPerCloud = 5; // 0: crossed, 1: clustered, 2: connected 3D cloud bank + canopy
     float cumulusDensity = .95f, cumulusContrast = .65f, cumulusRimStrength = .85f;
     bool hybridClouds = true; // mode 2: continuous 3D density layer
-    bool cumulusImpostors = true; // legacy INI compatibility; mode 2 is always world-fixed
     float cumulusNightLight = 1.f;
     float interiorHaze = .85f; // near-cloud density visibility in mode 2
     int cumulusDetail = 0; // 0: economy, 1: higher texture detail
-    int canopyFlightClouds = 0; // optional native crossed groups in the layer
     float sizeScale = 1.f, opacity = 1.f, nearFadeDistance = 25.f;
     float bottomShade = 1.f, hazeStrength = 0.f;
     bool useGameFog = false;
@@ -87,6 +86,7 @@ inline bool boolean(const std::string& s, bool& v) {
     X(BadWeatherDensityMultiplier,badWeatherDensityMultiplier,0.f,3.f) \
     X(MinSpawnZ,minSpawnZ,-500.f,5000.f) X(MaxSpawnZ,maxSpawnZ,-500.f,6000.f) \
     X(SpawnRadiusMin,spawnRadiusMin,0.f,20000.f) X(SpawnRadiusMax,spawnRadiusMax,50.f,20000.f) \
+    X(CloudDrawDistance,cloudDrawDistance,300.f,12000.f) X(CloudFogStart,cloudFogStart,0.f,12000.f) X(CloudFogEnd,cloudFogEnd,0.f,12000.f) \
     X(RenderMaxDist,renderMaxDist,100.f,20000.f) X(RespawnMaxDist,respawnMaxDist,150.f,25000.f) \
     X(WindMoveScale,windMoveScale,0.f,50.f) X(MinSpacing2D,minSpacing2D,0.f,2000.f) \
     X(SpawnFadeInSpeed,spawnFadeInSpeed,.001f,1.f) X(QuadFacingMin,quadFacingMin,0.f,1.f) \
@@ -99,10 +99,10 @@ inline bool boolean(const std::string& s, bool& v) {
     X(CumulusRimStrength,cumulusRimStrength,0.f,1.f) X(CumulusNightLight,cumulusNightLight,0.f,2.f) X(InteriorHaze,interiorHaze,0.f,1.f)
 #define VC_INTS(X) X(TargetProcClouds,targetProcClouds,0,MaxClouds) \
     X(ColorBrightnessBoost,colorBrightnessBoost,0,255) X(LightingMode,lightingMode,0,1) X(RenderMode,renderMode,0,2) X(CumulusDetail,cumulusDetail,0,1) \
-    X(PuffsPerCloud,puffsPerCloud,1,MaxPuffs) X(CanopyFlightClouds,canopyFlightClouds,0,24) X(Seed,seed,1,16777215)
+    X(PuffsPerCloud,puffsPerCloud,1,MaxPuffs) X(Seed,seed,1,16777215)
 #define VC_BOOLS(X) X(UseTimecycTint,useTimecycTint) X(UseAdditionalTextures,useAdditionalTextures) \
     X(IncludeOriginalTextureInRandom,includeOriginalTextureInRandom) X(UseGameFog,useGameFog) \
-    X(CumulusImpostors,cumulusImpostors) X(HybridClouds,hybridClouds)
+    X(HybridClouds,hybridClouds)
 
 inline void load(std::istream& in, Settings& c) {
     std::string line;
@@ -137,18 +137,44 @@ inline void load(std::istream& in, Settings& c) {
             }
         }
     }
+    c.cloudFogEnd=std::min(c.cloudFogEnd,c.cloudDrawDistance);
+    c.cloudFogStart=std::min(c.cloudFogStart,c.cloudFogEnd);
     c.maxSpawnZ=std::max(c.maxSpawnZ,c.minSpawnZ+10.f);
     c.spawnRadiusMin=std::min(c.spawnRadiusMin,c.spawnRadiusMax-1.f);
     c.respawnMaxDist=std::max(c.respawnMaxDist,c.renderMaxDist+50.f);
 }
 inline void write(std::ostream& out, const Settings& c) {
-    out << "; VolumetricCloudsExtended - see README.md for controls.\n";
-#define WRITE_FIELD(name,member,...) out << #name "=" << c.member << '\n';
-    VC_INTS(WRITE_FIELD)
-    VC_FLOATS(WRITE_FIELD)
-    VC_BOOLS(WRITE_FIELD)
-#undef WRITE_FIELD
-    out << "CloudTextureNames=";
+    // Fresh files expose the useful controls, not every historical experiment.
+    // Old INIs are still read, never overwritten; legacy card tuning remains
+    // supported via the parser and documented in README.
+    out << "; VolumetricCloudsExtended - restart the game after editing.\n"
+           "; Distances and heights are in GTA world units (roughly metres).\n"
+           "; The defaults are intended for older GPUs.\n\n";
+#define FIELD(name,member,comment) out << "; " comment "\n" #name "=" << c.member << "\n";
+    out << "[Renderer]\n";
+    FIELD(RenderMode,renderMode,"2 = 3D cloud banks (recommended), 1 = clustered classic clouds, 0 = classic crossed clouds.")
+    FIELD(HybridClouds,hybridClouds,"Mode 2: 1 = full 3D clouds; 0 = only the distant cloud layer for very weak hardware.")
+    FIELD(CumulusDetail,cumulusDetail,"Mode 2: 0 = economy (recommended); 1 = finer textures and more samples.")
+    out << "\n[Clouds]\n";
+    FIELD(TargetProcClouds,targetProcClouds,"How much of the sky is covered (0-512; 0 disables all custom clouds). Classic modes use this as the group count.")
+    FIELD(BadWeatherDensityMultiplier,badWeatherDensityMultiplier,"How much more cloud cover appears in bad weather (1 = unchanged; 0 = none).")
+    FIELD(MinSpawnZ,minSpawnZ,"Bottom of the cloud layer above sea level.")
+    FIELD(MaxSpawnZ,maxSpawnZ,"Top of the cloud layer above sea level. Must be higher than the bottom.")
+    FIELD(SizeScale,sizeScale,"Size of cloud formations (1 = normal, 2 = twice as wide).")
+    FIELD(WindMoveScale,windMoveScale,"How fast clouds drift with the game's wind (0 = stationary).")
+    FIELD(Opacity,opacity,"Overall cloud thickness (0 = invisible, 1 = normal, 2 = thicker).")
+    FIELD(Seed,seed,"Change this number for a different repeatable cloud pattern.")
+    out << "\n[Atmosphere]\n";
+    FIELD(CloudDrawDistance,cloudDrawDistance,"Mode 2: cloud-only visibility distance, independent of the world's draw distance.")
+    FIELD(CloudFogStart,cloudFogStart,"Mode 2: distance where clouds begin to blend into the sky.")
+    FIELD(CloudFogEnd,cloudFogEnd,"Mode 2: distance where cloud colour fully blends into the sky. Set equal to CloudFogStart to disable colour fog.")
+    FIELD(CumulusContrast,cumulusContrast,"Mode 2: cloud shading strength (0 = flat, 1 = stronger shadows).")
+    FIELD(CumulusNightLight,cumulusNightLight,"Mode 2: cloud brightness at night (0 = black, 1 = normal, 2 = brighter).")
+    out << "\n[ClassicModes]\n; Only used with RenderMode=0 or 1 (or if procedural textures cannot load).\n";
+    FIELD(PuffsPerCloud,puffsPerCloud,"Mode 1: number of overlapping puffs per group (1-8).")
+    FIELD(UseAdditionalTextures,useAdditionalTextures,"Use extra textures from particle.txd if present.")
+#undef FIELD
+    out << "; Comma-separated extra texture names; missing ones are ignored.\nCloudTextureNames=";
     for (std::size_t i=0;i<c.textureNames.size();++i) out << (i?",":"") << c.textureNames[i];
     out << '\n';
 }
@@ -207,6 +233,16 @@ inline Range range(const Settings& c, float cameraFar, float timecycFar) {
     const float radius=std::min(c.spawnRadiusMax,end*.90f);
     const float inner=radius*(c.spawnRadiusMin/c.spawnRadiusMax);
     return {end,begin,inner,radius,std::min(c.respawnMaxDist,std::max(end*1.35f,end+300.f*c.sizeScale))};
+}
+// Modern cloud visibility is not limited by the scene fog or far plane.
+// D3D9 projects far clouds onto the existing depth buffer's far boundary.
+inline Range cloudRange(const Settings& s) {
+    const float end=s.cloudDrawDistance;
+    return {end,end*.75f,0.f,end,end};
+}
+inline float cloudFogFactor(const Settings& s,float distance) {
+    const float width=s.cloudFogEnd-s.cloudFogStart;
+    return width>1.f?1.f-smooth((distance-s.cloudFogStart)/width):1.f;
 }
 inline float distanceAlpha(const Range& r, float distance) {
     return r.end>r.begin ? smooth((r.end-distance)/(r.end-r.begin)) : 0.f;
