@@ -308,6 +308,7 @@ struct Brick {
     std::array<int,3> first,last; // half-open world lattice intervals
     Vec lo,hi;
     float nearest{}; // squared radial bound
+    unsigned axes{}; // conservative eligible plane-axis mask
 };
 inline Brick bounds(std::array<int,3> a,std::array<int,3> b,Vec step,Vec origin,Vec eye) {
     Brick out{a,b,{},{},0};
@@ -328,14 +329,46 @@ inline bool visible(const Brick& b,const View& v,float wx,float wy) {
     return !outside(v.forward)&&!outside(v.forward*wx+v.right)&&!outside(v.forward*wx-v.right)
         &&!outside(v.forward*wy+v.up)&&!outside(v.forward*wy-v.up);
 }
-inline bool axisPossible(const Brick& b,Vec eye,int axis) {
-    float highestMin=0.f,maxAxis=0.f;
-    for(int a=0;a<3;++a) {
-        const float l=component(b.lo-eye,a),h=component(b.hi-eye,a);
-        if(a==axis)maxAxis=std::max(std::abs(l),std::abs(h));
-        else highestMin=std::max(highestMin,std::max({l,-h,0.f}));
+inline unsigned axisMask(const Brick& b,Vec eye) {
+    const Vec lo=b.lo-eye,hi=b.hi-eye;
+    const Vec minimum{std::max({lo.x,-hi.x,0.f}),std::max({lo.y,-hi.y,0.f}),std::max({lo.z,-hi.z,0.f})};
+    const Vec maximum{std::max(std::abs(lo.x),std::abs(hi.x)),std::max(std::abs(lo.y),std::abs(hi.y)),std::max(std::abs(lo.z),std::abs(hi.z))};
+    return unsigned(maximum.x>=std::max(minimum.y,minimum.z)*.80f)
+        |(unsigned(maximum.y>=std::max(minimum.x,minimum.z)*.80f)<<1)
+        |(unsigned(maximum.z>=std::max(minimum.x,minimum.y)*.80f)<<2);
+}
+// The nearest corner minimizes both rejection metrics. For the rare
+// corner inside the 8m interior exclusion, retain the original predicate
+// for the other corners. Squared distance keeps the original XYZ sum.
+inline Vec closestCornerDelta(Vec lo,Vec hi) {
+    return {std::abs(lo.x)<=std::abs(hi.x)?lo.x:hi.x,
+        std::abs(lo.y)<=std::abs(hi.y)?lo.y:hi.y,
+        std::abs(lo.z)<=std::abs(hi.z)?lo.z:hi.z};
+}
+template<int a>
+inline float angularThreshold(Vec closest) {
+    constexpr int j=(a+1)%3,k=(a+2)%3;
+    return .799999f*std::max({std::abs(component(closest,j)),std::abs(component(closest,k)),.001f});
+}
+template<int a>
+inline bool planeCandidate(Vec closest,Vec deltaLo,Vec deltaHi,float axisDelta,float minAngularDistance,float limitSq) {
+    constexpr int j=(a+1)%3,k=(a+2)%3;
+    const float axisDistance=std::abs(axisDelta);
+    // Comparing axisDistance to .799999*itself is always true.
+    if(axisDistance<minAngularDistance)return false;
+    setComponent(closest,a,axisDelta);
+    const float d2=dot(closest,closest);
+    if(d2>limitSq)return false;
+    if(d2>63.98f)return true;
+    for(int q=0;q<4;++q) {
+        Vec p=deltaLo;setComponent(p,a,axisDelta);
+        if(q&1)setComponent(p,j,component(deltaHi,j));
+        if(q&2)setComponent(p,k,component(deltaHi,k));
+        const float maxDistance=std::max({std::abs(p.x),std::abs(p.y),std::abs(p.z),.001f});
+        const float q2=dot(p,p);
+        if(axisDistance>=.799999f*maxDistance&&q2<=limitSq&&q2>63.98f)return true;
     }
-    return maxAxis>=highestMin*.80f;
+    return false;
 }
 template<class MeshType>
 inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range& r,
@@ -353,6 +386,9 @@ inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range
     const int nz=verticalSteps(s);
     const Vec step=latticeSpacing(s),origin{0,0,s.minSpawnZ};
     const float brickSize=BrickSteps*base;
+    const auto radiusSquared=[](float distance){const float limit=distance+.01f;return limit*limit;};
+    const float outerLimitSq=radiusSquared(levels.end),middleLimitSq=radiusSquared(std::min(levels.end,1300.f)),
+        innerLimitSq=radiusSquared(std::min(levels.end,440.f));
     const auto tex=textureOrigin(s,view,drift);
     const float tile=tex.tile,uOffset=tex.u,vOffset=tex.v;
     const auto occupied=[&](Vec lo,Vec hi) {
@@ -383,10 +419,10 @@ inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range
     const auto collect=[&](auto&& self,Brick b,bool pretested)->void {
         if((!pretested&&(b.nearest>=levels.end*levels.end||!inView(b)))||!occupied(b.lo,b.hi))return;
         const int n=std::max({b.last[0]-b.first[0],b.last[1]-b.first[1],b.last[2]-b.first[2]});
-        const int axes=int(axisPossible(b,view.pos,0))+int(axisPossible(b,view.pos,1))+int(axisPossible(b,view.pos,2));
+        b.axes=axisMask(b,view.pos);
         // Diagonal views need finer patches so alpha interpolation doesn't
         // reveal an axis boundary. The dominant-axis interior is cheaper.
-        const float splitFactor=axes>1?2.25f:.85f;
+        const float splitFactor=(b.axes&(b.axes-1))?2.25f:.85f;
         if(n>4 && b.nearest < float(n*n)*base*base*splitFactor) {
             std::array<Brick,8> children{};int count=0;
             std::array<int,3> mid{};
@@ -406,9 +442,34 @@ inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range
     };
     const int x0=int(std::floor((view.pos.x-levels.end)/brickSize)),x1=int(std::floor((view.pos.x+levels.end)/brickSize));
     const int y0=int(std::floor((view.pos.y-levels.end)/brickSize)),y1=int(std::floor((view.pos.y+levels.end)/brickSize));
-    for(int y=y0;y<=y1;++y)for(int x=x0;x<=x1;++x)for(int z=0;z<nz;z+=BrickSteps/2) {
-        const auto b=bounds({x*BrickSteps,y*BrickSteps,z},{(x+1)*BrickSteps,(y+1)*BrickSteps,std::min(z+BrickSteps/2,nz)},step,origin,view.pos);
-        if(b.nearest<levels.end*levels.end&&inView(b))parents.push_back(b);
+    // Root grid intervals are shared by every vertical brick in a column.
+    // Skip entire XY columns outside the radial bound and compute their
+    // endpoints only once. Keep the same XYZ accumulation and sort keys.
+    struct RootInterval {int first,last;float lo,hi,nearestSq;};
+    const auto rootInterval=[](int first,int last,float step,float origin,float eye) {
+        const float lo=origin+first*step,hi=origin+last*step;
+        const float n=std::max({lo-eye,eye-hi,0.f});
+        return RootInterval{first,last,lo,hi,n*n};
+    };
+    static thread_local std::vector<RootInterval> rootZ;
+    rootZ.clear();
+    for(int z=0;z<nz;z+=BrickSteps/2)
+        rootZ.push_back(rootInterval(z,std::min(z+BrickSteps/2,nz),step.z,origin.z,view.pos.z));
+    const float endSq=levels.end*levels.end;
+    for(int y=y0;y<=y1;++y) {
+        const auto by=rootInterval(y*BrickSteps,(y+1)*BrickSteps,step.y,origin.y,view.pos.y);
+        for(int x=x0;x<=x1;++x) {
+            const auto bx=rootInterval(x*BrickSteps,(x+1)*BrickSteps,step.x,origin.x,view.pos.x);
+            const float horizontalNearest=bx.nearestSq+by.nearestSq;
+            if(horizontalNearest>=endSq)continue;
+            for(const auto& bz:rootZ) {
+                const float nearest=horizontalNearest+bz.nearestSq;
+                if(nearest>=endSq)continue;
+                const Brick b{{bx.first,by.first,bz.first},{bx.last,by.last,bz.last},
+                    {bx.lo,by.lo,bz.lo},{bx.hi,by.hi,bz.hi},nearest};
+                if(inView(b))parents.push_back(b);
+            }
+        }
     }
     // Sibling grid boxes along a shared ray have a monotonic nearest bound.
     // Sorting siblings recursively keeps whole spatial cells in order.
@@ -432,45 +493,47 @@ inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range
         Volume::CellBox box{};
         if(volume)for(int a=0;a<3;++a)
             box.axis[a]=Volume::cells(uvCoord(component(b.lo,a),a),uvCoord(component(b.hi,a),a),a);
-        for(int a=0;a<3;++a) {
-            if(!axisPossible(b,view.pos,a))continue;
-            const int j=(a+1)%3,k=(a+2)%3;
+        // Independent closest corner coordinates minimize both squared distance
+        // and the dominant-axis threshold for every plane in this brick.
+        const Vec deltaLo=b.lo-view.pos,deltaHi=b.hi-view.pos;
+        const Vec closest=closestCornerDelta(deltaLo,deltaHi);
+        const Vec center=(b.lo+b.hi)*.5f-view.pos;
+        const auto collectAxis=[&](auto axis) {
+            constexpr int a=decltype(axis)::value;
+            if(!(b.axes&(1u<<a)))return;
+            const float eyeAxis=component(view.pos,a),axisOrigin=component(origin,a),axisStep=component(step,a);
+            const float minAngularDistance=angularThreshold<a>(closest);
             int i=b.first[a];const int rem=((i%stride)+stride)%stride;if(rem)i+=stride-rem;
+            // Adjacent world planes often land in the same baked occupancy cell.
+            // Other dimensions and active weather endpoints are constant here.
+            int lastCell=-1;bool lastOccupied=false;
             for(;i<b.last[a];i+=stride) {
                 // A single lattice plane at the center of its finest cell.
                 // Neither its position nor the density UV depends on the eye.
-                Vec lo=b.lo,hi=b.hi;
-                const float plane=component(origin,a)+(i+.5f)*component(step,a);
-                setComponent(lo,a,plane);setComponent(hi,a,plane);
+                const float plane=axisOrigin+(i+.5f)*axisStep;
                 if(volume) {
-                    auto query=box;
                     const float uv=uvCoord(plane,a);
                     if(a==2&&(uv<0.f||uv>1.f))continue;
-                    query.axis[a]=Volume::cells(uv,uv,a);
-                    if(!volume->potentiallyOccupied(query,weather))continue;
+                    const auto cell=Volume::cells(uv,uv,a);
+                    if(lastCell!=cell.first) {
+                        auto query=box;query.axis[a]=cell;
+                        lastOccupied=volume->potentiallyOccupied(query,weather);
+                        lastCell=cell.first;
+                    }
+                    if(!lastOccupied)continue;
                 }
-                bool any=false;
-                const float limit=(i%4==0?levels.end:i%2==0?std::min(levels.end,1300.f):std::min(levels.end,440.f))+.01f;
-                const float limitSq=limit*limit;
-                const float axisDistance=std::abs(plane-component(view.pos,a));
-                // Axis distance is identical for all four corners. Stop at
-                // the first potentially contributing one. The exact same
-                // conservative endpoint classifier serves both backends.
-                for(int q=0;q<4&&!any;++q) {
-                    Vec p=lo;
-                    if(q&1)setComponent(p,j,component(hi,j));
-                    if(q&2)setComponent(p,k,component(hi,k));
-                    const Vec delta=p-view.pos;
-                    const float maxDistance=std::max({std::abs(delta.x),std::abs(delta.y),std::abs(delta.z),.001f});
-                    const float d2=dot(delta,delta);
-                    any=axisDistance>=.799999f*maxDistance&&d2<=limitSq&&d2>63.98f;
-                }
-                if(any) {
-                    const auto center=(lo+hi)*.5f-view.pos;
-                    patches[patchCount++]={dot(center,center),plane,a,i};
+                const float limitSq=i%4==0?outerLimitSq:i%2==0?middleLimitSq:innerLimitSq;
+                if(planeCandidate<a>(closest,deltaLo,deltaHi,plane-eyeAxis,minAngularDistance,limitSq)) {
+                    Vec middle=center;
+                    // Retain the original (lo+hi)*.5 expression for exact depth ordering.
+                    setComponent(middle,a,(plane+plane)*.5f-eyeAxis);
+                    patches[patchCount++]={dot(middle,middle),plane,a,i};
                 }
             }
-        }
+        };
+        collectAxis(std::integral_constant<int,0>{});
+        collectAxis(std::integral_constant<int,1>{});
+        collectAxis(std::integral_constant<int,2>{});
         std::sort(patches.begin(),patches.begin()+patchCount,[](const Patch& a,const Patch& b){
             return a.depth!=b.depth?a.depth<b.depth:a.axis!=b.axis?a.axis<b.axis:a.plane<b.plane;
         });

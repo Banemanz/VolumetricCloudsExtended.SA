@@ -514,3 +514,19 @@ To regenerate the canopy previews:
 g++ -std=c++17 -O2 tests/canopy_preview.cpp -o canopy_preview
 python tests/canopy_preview.py ./canopy_preview docs/previews
 ```
+
+### Lossless CPU geometry optimization
+
+Mode 2 reuses each brick's eligible-axis mask, cached periodic occupancy
+cell results and original squared LOD thresholds. The closest corner
+minimizes both the radial and angular rejection metrics; only a corner
+inside the original near-exclusion region needs the full four-corner
+test. Out-of-range horizontal grid columns are discarded before their
+vertical bricks are constructed. The mesh, depth order, texture data,
+lighting and defaults are unchanged. The default 480-pose source-mesh
+benchmark on one Linux host had a median 0.266 to 0.201 ms change over
+five alternating runs (not a Celeron FPS measurement). The portable
+test compares 300,000 candidate predicates against the original method;
+a separate 1,440-pose old/new benchmark verifies identical CPU vertex,
+index and GPU vertex/span bytes. See `new chat/HANDOFF.md` for reproduction
+details.

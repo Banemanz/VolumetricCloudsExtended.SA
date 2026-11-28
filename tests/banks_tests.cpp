@@ -6,6 +6,50 @@
 #define CHECK(x) do {if(!(x)){std::cerr<<"Line "<<__LINE__<<": "<<#x<<'\n';std::exit(1);}}while(false)
 using namespace vc;
 int main() {
+    // Compare the algebraic closest-corner shortcut with the original
+    // four-corner loop, including the exceptional 8m near exclusion,
+    // diagonal blend threshold and exact boundary cases.
+    std::uint32_t rng=0x75c019e1u;
+    auto random=[&](){rng=rng*1664525u+1013904223u;return float(rng>>8)/16777216.f;};
+    const auto checkAxis=[&](auto axis,Vec lo,Vec hi,float d,float limitSq) {
+        constexpr int a=decltype(axis)::value,j=(a+1)%3,k=(a+2)%3;
+        bool expected=false;
+        for(int q=0;q<4;++q) {
+            Vec p=lo;banks::setComponent(p,a,d);
+            if(q&1)banks::setComponent(p,j,banks::component(hi,j));
+            if(q&2)banks::setComponent(p,k,banks::component(hi,k));
+            const float mx=std::max({std::abs(p.x),std::abs(p.y),std::abs(p.z),.001f}),d2=dot(p,p);
+            expected|=std::abs(d)>=.799999f*mx&&d2<=limitSq&&d2>63.98f;
+        }
+        const auto closest=banks::closestCornerDelta(lo,hi);
+        CHECK(banks::planeCandidate<a>(closest,lo,hi,d,banks::angularThreshold<a>(closest),limitSq)==expected);
+    };
+    for(int i=0;i<100000;++i) {
+        const float scale=i%3==0?10.f:i%3==1?500.f:8000.f;
+        const Vec lo{(random()-.5f)*scale,(random()-.5f)*scale,(random()-.5f)*scale};
+        const Vec hi=lo+Vec{random()*scale,random()*scale,random()*scale};
+        const float d=(random()-.5f)*scale,limit=random()*scale;
+        checkAxis(std::integral_constant<int,0>{},lo,hi,d,limit*limit);
+        checkAxis(std::integral_constant<int,1>{},lo,hi,d,limit*limit);
+        checkAxis(std::integral_constant<int,2>{},lo,hi,d,limit*limit);
+        const banks::Brick box{{},{},lo,hi,0.f};
+        const auto mask=banks::axisMask(box,{});
+        for(int a=0;a<3;++a) {
+            float highestMin=0.f,maxAxis=0.f;
+            for(int t=0;t<3;++t) {
+                const auto l=banks::component(lo,t),h=banks::component(hi,t);
+                if(t==a)maxAxis=std::max(std::abs(l),std::abs(h));
+                else highestMin=std::max(highestMin,std::max({l,-h,0.f}));
+            }
+            CHECK(bool(mask&(1u<<a))==(maxAxis>=highestMin*.80f));
+        }
+    }
+    for(float d:{0.f,.0008f,7.999f,8.f,8.0001f,79.9999f,80.f})for(float limit:{63.98f,64.f,10000.f,500000.f}) {
+        checkAxis(std::integral_constant<int,0>{},{0,0,0},{0,10,100},d,limit);
+        checkAxis(std::integral_constant<int,1>{},{0,0,0},{10,0,100},d,limit);
+        checkAxis(std::integral_constant<int,2>{},{0,0,0},{10,100,0},d,limit);
+    }
+    std::cout<<"PASS: 300000 closest-corner and axis-bound evaluations match the original predicates, including near exclusion\n";
     Settings s;
     CHECK(s.renderMode==2 && s.hybridClouds && s.cumulusDetail==0);
     canopy::Map m;m.build(512,s.seed);m.shadeWeatherLayers(s);

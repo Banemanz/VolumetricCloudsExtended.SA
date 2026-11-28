@@ -1044,3 +1044,45 @@ remained a credible source of the swimming seen in flight.
   sampler settings. Portable tests validate every AABB span and
   omitted vertex against both clip sides. Keep any future changes
   conservative and validate against full uncropped reference.
+
+## Lossless closest-corner and coarse-grid CPU optimization
+
+- Previous Win32 + Linux CI run 46085858567 passed; 12 hardware projection
+  readbacks had exactly zero RGB differences; state dedup skipped 498 of 598
+  multi-pass state setter calls in the scripted multi-pass sequence.
+- A more detailed occupancy grid was prototyped and rejected: the extra
+  prefix queries increased CPU work, while eliminating only ~1.6% of a
+  projected-area proxy in the default 480-pose flight (not a GPU measurement).
+  No additional occupancy data or cache version changes were retained.
+- Instead keep the original 16x16x8 conservative occupancy data and cache
+  per-axis point-cell results within each brick. Each point range is exactly
+  one cell; weather endpoints and the two other dimensions are constant.
+  Calculate a three-bit eligible-axis mask once, reuse for subdivision and
+  slice generation. Precompute original three squared distance limits.
+- For each slicing axis, select the closest independent endpoints on the
+  other two axes: this corner minimizes both the squared radial distance
+  and max absolute coordinate, so an angular/outer-radius failure there
+  implies all four corners fail. If it is inside the original 8m near
+  exclusion, use the original four-corner predicate. Maintain exact XYZ
+  sum order, guarded thresholds, original slice depth key, ordering and
+  lattice. Specialize the three axis loops at compile time.
+- Build root z intervals once per frame; reuse y intervals per row; reject
+  XY columns with nearest XY squared distance >= outer squared radius
+  before constructing individual root bricks. Preserve original XYZ
+  accumulation and sort order. No geometry-quality limits changed.
+- Local GCC -O3, identical flags and machine, 5 alternating 480-pose
+  runs (median): GPU source mesh 0.266 -> 0.201 ms (~24% faster
+  in mesh generation only), identical 7276 triangles / 14552 vertices
+  average, identical packed GPU source hash 16681346361779809689.
+  Separate 1440-pose variation (4200/8000/12000m ranges, economy/detail
+  spacing, weather, near-vertical views) combined CPU vertices, indices,
+  GPU vertices and brick spans: exact same hash 4494552806871744396,
+  26,192,456 total vertices; GPU 0.324 -> 0.263 ms and CPU fallback
+  1.135 -> 1.084 ms for that run. Standalone fixture:
+  tests/mesh_parity_benchmark.cpp (compile with -I<checkout>; compare
+  old/new under same compiler flags). Timings exclude GPU rendering.
+- All 5 portable GCC regression suites passed, including new direct
+  randomized 300,000-candidate equivalence and original 8m/diagonal
+  boundary tests. No changes to textures, shader, draw states, altitude
+  handover, default INI, draw distance, or cache payload. Actual Celeron
+  frame times and in-game screenshots require the target game/hardware.
