@@ -2,6 +2,8 @@
 #include "Canopy.hpp"
 #include <type_traits>
 #include <new>
+#include <atomic>
+#include <cstring>
 
 // Continuous world-space density sampled on fixed world-axis lattices.
 // Camera motion never translates or rotates the sampling planes.
@@ -58,6 +60,11 @@ struct GpuMesh {
     std::vector<GpuVertex> vertices;
     std::vector<VertexSpan> spans;
     int slices{};
+    // Opt-in only for an owned, unmodified renderer source mesh. The
+    // streamer invalidates this flag when it swaps out the vertex bytes.
+    bool cacheGeometry=false,geometryCached=false;
+    std::array<float,24> geometryKey{};
+    std::uint64_t geometryEpoch{},geometryHits{};
     std::size_t triangleCount() const{return std::size_t(slices)*2;}
     VertexRange rangeFor(const ClipPlane& plane) const {
         const auto count=std::uint32_t(vertices.size());
@@ -148,6 +155,10 @@ inline float noise3(float u,float v,float w,int n,int nz,std::uint32_t seed) {
     return mix(plane(k),plane(k+1),c);
 }
 struct Volume {
+    // Unique support generation, even when a new bake reuses this address.
+    // Only edited on bake/load, never in the render loop.
+    inline static std::atomic<std::uint64_t> nextSupportRevision{0};
+    std::uint64_t supportRevision{};
     int width{},depth{};
     std::array<std::array<std::uint8_t,OccupancyXY*OccupancyXY*OccupancyZ>,2> occupied{};
     std::array<std::array<std::uint16_t,OccupancyPrefixCount>,2> occupiedPrefix{};
@@ -160,6 +171,7 @@ struct Volume {
         return ((std::size_t(width-1)*OccupancyXY+height-1)*OccupancyXY+y)*OccupancyXY+x;
     }
     void buildRectangleMasks() {
+        supportRevision=++nextSupportRevision;
         // The normal bake has clear density as a subset of overcast.
         // Check that invariant, rather than assuming it for future caches.
         // Avoid a redundant 64 KiB union table in that common case.
@@ -207,6 +219,7 @@ struct Volume {
     static constexpr int axisCells(int axis) {return axis==2?OccupancyZ:OccupancyXY;}
     int axisTexels(int axis) const {return axis==2?depth:width;}
     void buildPlaneSupport() {
+        supportRevision=++nextSupportRevision;
         planeClearSubset=false;
         for(auto& layer:planeSupport)for(auto& table:layer)table.clear();
         if(width<OccupancyXY||depth<OccupancyZ||width%OccupancyXY||depth%OccupancyZ||
@@ -365,20 +378,23 @@ struct Volume {
     }
     struct CellRange {int first,last;}; // half-open, wrapped XY / clamped Z
     struct CellBox {std::array<CellRange,3> axis;};
-    static CellRange cells(float lo,float hi,int axis) {
-        const int n=axis==2?OccupancyZ:OccupancyXY;
-        int a=int(std::floor(lo*n)),b=int(std::floor(hi*n));
+    static CellRange cellsFromFloor(int a,int b,int axis) {
+        const int n=axisCells(axis);
         if(axis==2)return {std::clamp(a,0,n-1),std::clamp(b,0,n-1)+1};
         const int count=std::min(b-a+1,n);
         a=canopy::wrap(a,n);return {a,a+count};
     }
+    static CellRange cells(float lo,float hi,int axis) {
+        const int n=axisCells(axis);
+        return cellsFromFloor(int(std::floor(lo*n)),int(std::floor(hi*n)),axis);
+    }
     // Query after coarse rejection, using the actual plane coordinate
     // rather than all texels in its coarse-axis cell. The three-slice
     // union covers linear or point filtering, including rounding at seams.
-    bool planeOccupied(int a,float uv,const CellBox& box,float weather) const {
+    bool planeOccupiedTexel(int a,int texel,const CellBox& box,float weather) const {
         if(planeSupport[0][a].empty()||planeSupport[1][a].empty())return true;
         const int j=(a+1)%3,k=(a+2)%3,n=axisTexels(a),rows=axisCells(j),cols=axisCells(k);
-        const int texel=int(std::floor(uv*n)),i=a==2?std::clamp(texel,0,n-1):canopy::wrap(texel,n);
+        const int i=a==2?std::clamp(texel,0,n-1):canopy::wrap(texel,n);
         const auto [ja,jb]=box.axis[j];const auto [ka,kb]=box.axis[k];
         const unsigned bits=(1u<<(kb-ka))-1u;
         const unsigned shifted=bits<<ka,mask=(shifted|(shifted>>cols))&((1u<<cols)-1u);
@@ -391,6 +407,9 @@ struct Volume {
         };
         const bool useWet=weather>.001f;
         return (weather<.999f&&(!useWet||!planeClearSubset)&&scan(clear))||(useWet&&scan(wet));
+    }
+    bool planeOccupied(int a,float uv,const CellBox& box,float weather) const {
+        return planeOccupiedTexel(a,int(std::floor(uv*axisTexels(a))),box,weather);
     }
     // 0..255: conservative occupied Z cells; 256: allocation fallback.
     // The same lookup that rejects an empty slice also supplies its vertical
@@ -532,18 +551,22 @@ inline bool planeCandidate(Vec closest,Vec deltaLo,Vec deltaHi,float axisDelta,f
     }
     return false;
 }
-template<class MeshType>
+template<bool Fast=true,class MeshType>
 inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range& r,
                       const canopy::Drift& drift,float wx,float wy,const Volume* volume=nullptr,
                       float weather=0.f,bool billboardAvailable=true,bool tighten=true,bool precise=true,const Lod* sharedLod=nullptr) {
     using OutputVertex=typename decltype(m.vertices)::value_type;
     constexpr bool gpu=std::is_same_v<OutputVertex,GpuVertex>;
-    m.vertices.clear();if constexpr(gpu)m.spans.clear();else m.indices.clear();m.slices=0;
+    const auto clearOutput=[&] {
+        m.vertices.clear();
+        if constexpr(gpu){m.spans.clear();m.geometryCached=false;}else m.indices.clear();
+        m.slices=0;
+    };
     const float band=s.maxSpawnZ-s.minSpawnZ;
     if(!s.hybridClouds||!s.targetProcClouds||r.end<5.f||band<1.f||
-       !std::isfinite(wx)||!std::isfinite(wy)||wx<=0||wy<=0||wx>10.f||wy>10.f)return;
+       !std::isfinite(wx)||!std::isfinite(wy)||wx<=0||wy<=0||wx>10.f||wy>10.f){clearOutput();return;}
     const auto levels=sharedLod?*sharedLod:lod(s,r,billboardAvailable,view.pos.z-(s.minSpawnZ+s.maxSpawnZ)*.5f);
-    if(view.pos.z<s.minSpawnZ-levels.end||view.pos.z>s.maxSpawnZ+levels.end)return;
+    if(view.pos.z<s.minSpawnZ-levels.end||view.pos.z>s.maxSpawnZ+levels.end){clearOutput();return;}
     const float base=s.cumulusDetail?16.f:20.f;
     const int nz=verticalSteps(s);
     const Vec step=latticeSpacing(s),origin{0,0,s.minSpawnZ};
@@ -553,9 +576,120 @@ inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range
         innerLimitSq=radiusSquared(std::min(levels.end,440.f));
     const auto tex=textureOrigin(s,view,drift);
     const float tile=tex.tile,uOffset=tex.u,vOffset=tex.v;
-    const auto occupied=[&](Vec lo,Vec hi) {
-        return !volume||volume->potentiallyOccupied(lo.x/tile-uOffset,lo.y/tile-vOffset,(lo.z-origin.z)/band,
-            hi.x/tile-uOffset,hi.y/tile-vOffset,(hi.z-origin.z)/band,weather);
+    const int x0=int(std::floor((view.pos.x-levels.end)/brickSize)),x1=int(std::floor((view.pos.x+levels.end)/brickSize));
+    const int y0=int(std::floor((view.pos.y-levels.end)/brickSize)),y1=int(std::floor((view.pos.y+levels.end)/brickSize));
+    const auto uvCoord=[&](float p,int a){
+        return a==0?p/tile-uOffset:a==1?p/tile-vOffset:(p-origin.z)/band;
+    };
+    // The lattice is shared across all bricks. Quantize each edge and
+    // plane once, not once per intersecting cell. Keep the exact original
+    // floating-point expressions (no reciprocal approximation).
+    struct PlaneSample {float position,uv;int coarse,texel;};
+    struct AxisSamples {
+        int first{};
+        std::vector<PlaneSample> centers;
+        std::vector<int> edges;
+    };
+    static thread_local std::array<AxisSamples,3> lattice;
+    // A bounded cache for coarse root bricks. It stores only exact density
+    // support (not camera-dependent alpha, geometry, culling or order).
+    // Small drift updates normally keep quantized texture bins unchanged.
+    struct RootSupport {
+        std::uint64_t epoch{};
+        int occupied=-1;
+        std::array<std::uint16_t,3*BrickSteps> planes;
+    };
+    static thread_local std::vector<RootSupport> rootSupport;
+    static thread_local std::uint64_t supportEpoch=0,revision=0;
+    static thread_local const Volume* previousVolume=nullptr;
+    static thread_local unsigned previousWeather=0;
+    static thread_local bool previousPrecise=false;
+    bool cacheValid=false;
+    const unsigned weatherMask=(weather<.999f?1u:0u)|(weather>.001f?2u:0u);
+    const int rootsX=x1-x0+1,rootsY=y1-y0+1,rootsZ=(nz+BrickSteps/2-1)/(BrickSteps/2);
+    if constexpr(Fast)if(volume) {
+        bool stable=previousVolume==volume&&revision==volume->supportRevision&&
+            previousWeather==weatherMask&&previousPrecise==precise;
+        const int first[]={x0*BrickSteps,y0*BrickSteps,0},last[] ={(x1+1)*BrickSteps,(y1+1)*BrickSteps,nz};
+        for(int a=0;a<3;++a) {
+            auto& axis=lattice[a];
+            const int count=last[a]-first[a],cells=Volume::axisCells(a),texels=volume->axisTexels(a);
+            const float start=component(origin,a),spacing=component(step,a);
+            stable=stable&&axis.first==first[a]&&axis.centers.size()==std::size_t(count);
+            axis.first=first[a];
+            axis.centers.resize(count);axis.edges.resize(std::size_t(count)+1);
+            for(int j=0;j<=count;++j) {
+                const int i=first[a]+j;
+                const int edge=int(std::floor(uvCoord(start+i*spacing,a)*cells));
+                stable=stable&&axis.edges[j]==edge;
+                axis.edges[j]=edge;
+                if(j==count)break;
+                const float position=start+(i+.5f)*spacing,uv=uvCoord(position,a);
+                const int coarse=int(std::floor(uv*cells)),texel=int(std::floor(uv*texels));
+                stable=stable&&axis.centers[j].coarse==coarse&&axis.centers[j].texel==texel;
+                axis.centers[j]={position,uv,coarse,texel};
+            }
+        }
+        previousVolume=volume;revision=volume->supportRevision;previousWeather=weatherMask;previousPrecise=precise;
+        if(!stable)++supportEpoch;
+        const auto n=std::size_t(rootsX)*rootsY*rootsZ;
+        // Limit the optional cache to ~0.8 MiB. Larger custom draw ranges
+        // still render exactly the same via the direct occupancy path.
+        if(n<=4096&&supportEpoch!=0&&volume->supportRevision!=0) {
+            try {rootSupport.resize(n);cacheValid=true;}
+            catch(const std::bad_alloc&) {rootSupport.clear();}
+        }
+    }
+    // An unmoving camera need not rebuild geometry just because wind,
+    // weather interpolation or lighting uniforms change. Reuse only when
+    // every camera/geometry parameter AND quantized support bin agrees.
+    // All per-frame shader uniforms are still updated by the caller.
+    std::array<float,24> geometryKey{};
+    const auto geometryEpoch=volume?supportEpoch:0;
+    bool rememberGeometry=false;
+    if constexpr(Fast&&gpu)if(m.cacheGeometry&&(!volume||volume->supportRevision)) {
+        geometryKey={view.pos.x,view.pos.y,view.pos.z,view.right.x,view.right.y,view.right.z,
+            view.up.x,view.up.y,view.up.z,view.forward.x,view.forward.y,view.forward.z,
+            wx,wy,levels.end,step.x,step.y,step.z,origin.z,band,base,float(tighten),float(volume!=nullptr),float(precise)};
+        rememberGeometry=true;
+        if(m.geometryCached&&m.geometryEpoch==geometryEpoch&&
+           std::memcmp(m.geometryKey.data(),geometryKey.data(),sizeof(geometryKey))==0) {
+            ++m.geometryHits;return;
+        }
+    }
+    clearOutput();
+    const auto rootEntry=[&](const Brick& b)->RootSupport* {
+        if constexpr(!Fast)return nullptr;
+        if(!cacheValid||b.last[0]-b.first[0]!=BrickSteps||b.last[1]-b.first[1]!=BrickSteps||
+           b.first[2]%(BrickSteps/2)||b.last[2]!=std::min(b.first[2]+BrickSteps/2,nz))return nullptr;
+        const auto x=b.first[0]/BrickSteps-x0,y=b.first[1]/BrickSteps-y0,z=b.first[2]/(BrickSteps/2);
+        auto& entry=rootSupport[(std::size_t(z)*rootsY+y)*rootsX+x];
+        if(entry.epoch!=supportEpoch) {
+            entry.epoch=supportEpoch;entry.occupied=-1;entry.planes.fill(0xFFFFu);
+        }
+        return &entry;
+    };
+    const auto cellBox=[&](const Brick& b) {
+        Volume::CellBox box{};
+        for(int a=0;a<3;++a) {
+            if constexpr(Fast) {
+                const auto& axis=lattice[a];
+                box.axis[a]=Volume::cellsFromFloor(axis.edges[b.first[a]-axis.first],axis.edges[b.last[a]-axis.first],a);
+            } else box.axis[a]=Volume::cells(uvCoord(component(b.lo,a),a),uvCoord(component(b.hi,a),a),a);
+        }
+        return box;
+    };
+    const auto occupied=[&](const Brick& b) {
+        if(!volume)return true;
+        if constexpr(Fast) {
+            if(uvCoord(b.hi.z,2)<0.f||uvCoord(b.lo.z,2)>1.f)return false;
+            auto* entry=rootEntry(b);
+            if(entry&&entry->occupied>=0)return entry->occupied!=0;
+            const bool result=volume->potentiallyOccupied(cellBox(b),weather);
+            if(entry)entry->occupied=result;
+            return result;
+        } else return volume->potentiallyOccupied(uvCoord(b.lo.x,0),uvCoord(b.lo.y,1),uvCoord(b.lo.z,2),
+            uvCoord(b.hi.x,0),uvCoord(b.hi.y,1),uvCoord(b.hi.z,2),weather);
     };
     const std::array<Vec,5> planes{view.forward,view.forward*wx+view.right,view.forward*wx-view.right,
         view.forward*wy+view.up,view.forward*wy-view.up};
@@ -579,7 +713,7 @@ inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range
     // sides of subdivision. The smaller patches resolve angular weighting
     // and fog accurately where they subtend a large screen area.
     const auto collect=[&](auto&& self,Brick b,bool pretested)->void {
-        if((!pretested&&(b.nearest>=levels.end*levels.end||!inView(b)))||!occupied(b.lo,b.hi))return;
+        if((!pretested&&(b.nearest>=levels.end*levels.end||!inView(b)))||!occupied(b))return;
         const int n=std::max({b.last[0]-b.first[0],b.last[1]-b.first[1],b.last[2]-b.first[2]});
         b.axes=axisMask(b,view.pos);
         // Diagonal views need finer patches so alpha interpolation doesn't
@@ -602,8 +736,7 @@ inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range
             for(int j=0;j<count;++j)self(self,children[j],false);
         } else bricks.push_back(b);
     };
-    const int x0=int(std::floor((view.pos.x-levels.end)/brickSize)),x1=int(std::floor((view.pos.x+levels.end)/brickSize));
-    const int y0=int(std::floor((view.pos.y-levels.end)/brickSize)),y1=int(std::floor((view.pos.y+levels.end)/brickSize));
+
     // Root grid intervals are shared by every vertical brick in a column.
     // Skip entire XY columns outside the radial bound and compute their
     // endpoints only once. Keep the same XYZ accumulation and sort keys.
@@ -650,12 +783,9 @@ inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range
         // Two axes of the occupancy box are constant across every slice.
         // Compute them once, respecting the same division and floor as the
         // original query; only the sliced axis changes inside the loop.
-        const auto uvCoord=[&](float p,int a){
-            return a==0?p/tile-uOffset:a==1?p/tile-vOffset:(p-origin.z)/band;
-        };
         Volume::CellBox box{};
-        if(volume)for(int a=0;a<3;++a)
-            box.axis[a]=Volume::cells(uvCoord(component(b.lo,a),a),uvCoord(component(b.hi,a),a),a);
+        if(volume)box=cellBox(b);
+        auto* entry=rootEntry(b);
         // Independent closest corner coordinates minimize both squared distance
         // and the dominant-axis threshold for every plane in this brick.
         const Vec deltaLo=b.lo-view.pos,deltaHi=b.hi-view.pos;
@@ -676,37 +806,50 @@ inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range
             for(;i<b.last[a];i+=stride) {
                 // A single lattice plane at the center of its finest cell.
                 // Neither its position nor the density UV depends on the eye.
-                const float plane=axisOrigin+(i+.5f)*axisStep;
-                if(volume) {
-                    const float uv=uvCoord(plane,a);
-                    if(a==2&&(uv<0.f||uv>1.f))continue;
-                    const auto cell=Volume::cells(uv,uv,a);
-                    if(lastCell!=cell.first) {
-                        auto query=box;query.axis[a]=cell;
-                        lastBits=volume->rectangleBits(query,weather);
-                        lastOccupied=lastBits==256?volume->potentiallyOccupied(query,weather):lastBits!=0;
-                        lastCell=cell.first;
-                    }
-                    if(!lastOccupied)continue;
-                }
+                const PlaneSample* sample=nullptr;
+                if constexpr(Fast)if(volume)sample=&lattice[a].centers[i-lattice[a].first];
+                const float plane=sample?sample->position:axisOrigin+(i+.5f)*axisStep;
                 const float limitSq=i%4==0?outerLimitSq:i%2==0?middleLimitSq:innerLimitSq;
-                if(planeCandidate<a>(closest,deltaLo,deltaHi,plane-eyeAxis,minAngularDistance,limitSq)) {
+                // Reject against the camera BEFORE consulting texture support.
+                if constexpr(Fast)if(!planeCandidate<a>(closest,deltaLo,deltaHi,plane-eyeAxis,minAngularDistance,limitSq))continue;
+                const float uv=volume?(sample?sample->uv:uvCoord(plane,a)):0.f;
+                if(volume&&a==2&&(uv<0.f||uv>1.f))continue;
+                unsigned bits=256;
+                std::uint16_t* cached=entry?&entry->planes[a*BrickSteps+i-b.first[a]]:nullptr;
+                // On cache hits no rectangle/fine-mask reads at all.
+                if(cached&&*cached!=0xFFFFu) {
+                    bits=*cached;if(!bits)continue;
+                } else {
+                    if(volume) {
+                        const auto cell=sample?Volume::cellsFromFloor(sample->coarse,sample->coarse,a):Volume::cells(uv,uv,a);
+                        if(lastCell!=cell.first) {
+                            auto query=box;query.axis[a]=cell;
+                            lastBits=volume->rectangleBits(query,weather);
+                            lastOccupied=lastBits==256?volume->potentiallyOccupied(query,weather):lastBits!=0;
+                            lastCell=cell.first;
+                        }
+                        if(!lastOccupied){if(cached)*cached=0;continue;}
+                        bits=lastBits;
+                    }
+                    if(!Fast&&!planeCandidate<a>(closest,deltaLo,deltaHi,plane-eyeAxis,minAngularDistance,limitSq))continue;
                     if(precise&&volume) {
-                        const float uv=uvCoord(plane,a);
-                        const int texel=int(std::floor(uv*volume->axisTexels(a)));
+                        const int texel=sample?sample->texel:int(std::floor(uv*volume->axisTexels(a)));
                         if(lastTexel!=texel) {
-                            lastFine=volume->planeOccupied(a,uv,box,weather);
+                            lastFine=volume->planeOccupiedTexel(a,texel,box,weather);
                             lastTexel=texel;
                         }
-                        if(!lastFine)continue;
+                        if(!lastFine){if(cached)*cached=0;continue;}
                     }
+                    if(cached)*cached=std::uint16_t(bits);
+                }
+                {
                     Vec middle=center;
                     // Retain the original (lo+hi)*.5 expression for exact depth ordering.
                     setComponent(middle,a,(plane+plane)*.5f-eyeAxis);
                     // Trim the upper/lower empty slab only on far, fully
                     // dominant vertical slices. Fixed-function interpolation
                     // varies least here; near/diagonal/quality paths are unchanged.
-                    const unsigned zMask=trim&&a!=2&&lastBits!=256&&otherMax<=std::abs(plane-eyeAxis)*.8f?lastBits:0;
+                    const unsigned zMask=trim&&a!=2&&bits!=256&&otherMax<=std::abs(plane-eyeAxis)*.8f?bits:0;
                     patches[patchCount++]={dot(middle,middle),plane,unsigned(a)|(zMask<<2),i};
                 }
             }
@@ -714,9 +857,20 @@ inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range
         collectAxis(std::integral_constant<int,0>{});
         collectAxis(std::integral_constant<int,1>{});
         collectAxis(std::integral_constant<int,2>{});
-        std::sort(patches.begin(),patches.begin()+patchCount,[](const Patch& a,const Patch& b){
+        const auto less=[](const Patch& a,const Patch& b){
             return a.depth!=b.depth?a.depth<b.depth:(a.axisMask&3)!=(b.axisMask&3)?(a.axisMask&3)<(b.axisMask&3):a.plane<b.plane;
-        });
+        };
+        const auto end=patches.begin()+patchCount;
+        if constexpr(Fast) {
+            // Most distant bricks have one eligible axis; their planes
+            // arrive in monotonic depth order. Compare the full original
+            // tie-breaking key, so rounding ties never reverse ordering.
+            if(!std::is_sorted(patches.begin(),end,less)) {
+                if(std::is_sorted(patches.begin(),end,[&](const Patch& a,const Patch& b){return less(b,a);}))
+                    std::reverse(patches.begin(),end);
+                else std::sort(patches.begin(),end,less);
+            }
+        } else std::sort(patches.begin(),end,less);
         for(std::size_t index=0;index<patchCount;++index) {
             const auto& patch=patches[index];
             if(m.vertices.size()+4>MaxVertices)break;
@@ -736,20 +890,46 @@ inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range
                 upper.z=std::min(upper.z,origin.z+band*high/OccupancyZ+pad);
             }
             setComponent(lower,a,patch.position);setComponent(upper,a,patch.position);
-            for(int q=0;q<4;++q) {
-                Vec p=lower;
-                if(q&1)setComponent(p,j,component(upper,j));
-                if(q&2)setComponent(p,k,component(upper,k));
-                if constexpr(gpu) {
-                    m.vertices.push_back({p,code});
-                } else {
-                    const Vec delta=p-view.pos;
-                    const float d=length(delta),w=component(axisWeights(delta),a);
-                    const float cosine=std::abs(component(delta,a))/std::max(d,.001f);
-                    const float path=planeWeight(i,component(step,a),d)/std::max(cosine,.4f);
-                    const float nearWeight=smooth((d-8.f)/24.f)*mix(smooth((d-view.nearClip)/std::max(80.f,s.nearFadeDistance)),1.f,s.interiorHaze*.22f);
-                    const float alpha=sat(path*w/ReferenceStep)*rangeWeight(r,d)*levels.volume(d)*nearWeight;
-                    m.vertices.push_back({p,p.x/tile-uOffset,p.y/tile-vOffset,(p.z-origin.z)/band,alpha,cloudFogFactor(s,d)});
+            // The GPU representation needs only four positions and a
+            // packed lattice code. Emit an axis-aligned quad in one
+            // contiguous insertion, rather than branch per corner.
+            if constexpr(Fast&&gpu) {
+                const Vec jCorner=a==0?Vec{lower.x,upper.y,lower.z}:
+                    a==1?Vec{lower.x,lower.y,upper.z}:Vec{upper.x,lower.y,lower.z};
+                const Vec kCorner=a==0?Vec{lower.x,lower.y,upper.z}:
+                    a==1?Vec{upper.x,lower.y,lower.z}:Vec{lower.x,upper.y,lower.z};
+                m.vertices.insert(m.vertices.end(),{{lower,code},{jCorner,code},{kCorner,code},{upper,code}});
+            } else {
+                Vec lowerUV{},upperUV{};
+                if constexpr(Fast&&!gpu) {
+                    lowerUV={uvCoord(lower.x,0),uvCoord(lower.y,1),uvCoord(lower.z,2)};
+                    upperUV={uvCoord(upper.x,0),uvCoord(upper.y,1),uvCoord(upper.z,2)};
+                }
+                for(int q=0;q<4;++q) {
+                    Vec p=lower;
+                    if(q&1)setComponent(p,j,component(upper,j));
+                    if(q&2)setComponent(p,k,component(upper,k));
+                    if constexpr(gpu) {
+                        m.vertices.push_back({p,code});
+                    } else {
+                        const Vec delta=p-view.pos;
+                        const float d=length(delta),w=Fast&&b.axes==(1u<<a)?1.f:component(axisWeights(delta),a);
+                        const float cosine=std::abs(component(delta,a))/std::max(d,.001f);
+                        // On the saturated coarse/far branches the full
+                        // smoothstep expressions reduce to these exact values.
+                        const float spacing=component(step,a);
+                        const float path=(Fast&&d>=1300.f?spacing*(i%4==0?4.f:0.f):planeWeight(i,spacing,d))/std::max(cosine,.4f);
+                        const float fadeDistance=std::max(80.f,s.nearFadeDistance);
+                        const float nearWeight=Fast&&d>=32.f&&d-view.nearClip>=fadeDistance?1.f:
+                            smooth((d-8.f)/24.f)*mix(smooth((d-view.nearClip)/fadeDistance),1.f,s.interiorHaze*.22f);
+                        const float alpha=sat(path*w/ReferenceStep)*rangeWeight(r,d)*levels.volume(d)*nearWeight;
+                        if constexpr(Fast) {
+                            Vec uv=lowerUV;
+                            if(q&1)setComponent(uv,j,component(upperUV,j));
+                            if(q&2)setComponent(uv,k,component(upperUV,k));
+                            m.vertices.push_back({p,uv.x,uv.y,uv.z,alpha,cloudFogFactor(s,d)});
+                        } else m.vertices.push_back({p,p.x/tile-uOffset,p.y/tile-vOffset,(p.z-origin.z)/band,alpha,cloudFogFactor(s,d)});
+                    }
                 }
             }
             // The hardware path already owns a static reversed index
@@ -763,5 +943,8 @@ inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range
         if(m.vertices.size()+4>MaxVertices)break;
     }
     if constexpr(!gpu)std::reverse(m.indices.begin(),m.indices.end()); // far first, culling disabled
+    else if(rememberGeometry) {
+        m.geometryKey=geometryKey;m.geometryEpoch=geometryEpoch;m.geometryCached=true;
+    }
 }
 } // namespace vc::banks

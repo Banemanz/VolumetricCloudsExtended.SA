@@ -31,6 +31,7 @@ inline double percentile(std::vector<double> values,unsigned p) {
     std::sort(values.begin(),values.end());
     return values[(values.size()-1)*p/100];
 }
+template<bool Fast=true>
 inline int benchmark(IDirect3DDevice9* device,const D3DCAPS9& caps,bool half=false) {
     using namespace vc;
     using namespace vc::d3d9;
@@ -93,7 +94,8 @@ inline int benchmark(IDirect3DDevice9* device,const D3DCAPS9& caps,bool half=fal
         bf==D3DFMT_A8L8?"A8L8":"RGBA",sf==D3DFMT_A8L8?"A8L8":"RGBA",ff==D3DFMT_A8L8?"A8L8":"RGBA",hardware?"yes":"no");
     canopyVolume::Mesh proxy;
     banks::Mesh card,cpu;
-    banks::GpuMesh gpu;
+    banks::GpuMesh gpu;gpu.cacheGeometry=Fast;
+    std::printf("CPU preparation and proxy state scope: %s\n",Fast?"optimized":"reference");
     ProjectedMesh ps,pa,pb;
     StateScope scoped;
     constexpr int warm=4,frames=24;
@@ -106,7 +108,8 @@ inline int benchmark(IDirect3DDevice9* device,const D3DCAPS9& caps,bool half=fal
     for(const auto& pose:std::array<std::pair<float,float>,6>{{{30.f,.65f},{30.f,1.4f},{443.f,-.24f},{535.f,-.24f},{635.f,-.24f},{1000.f,-.24f}}})for(float coverage:{0.f,.5f}) {
         const float height=pose.first,basePitch=pose.second;
         std::vector<double> prep,submit,complete,gpuTime,passed;
-        std::size_t input=0,submitted=0,bytes=0,skipped=0,tri=0,halfFrames=0;
+        std::size_t input=0,submitted=0,bytes=0,skipped=0,tri=0,halfFrames=0,stateCalls=0,stateSkipped=0;
+        const auto hitsBefore=gpu.geometryHits;
         canopy::Drift drift;
         for(int frame=0;frame<warm+frames;++frame) {
             const int moving=std::max(0,frame-warm-7);
@@ -137,25 +140,25 @@ inline int benchmark(IDirect3DDevice9* device,const D3DCAPS9& caps,bool half=fal
                 const float fogWeight=cloudFogFactor(s,v.distance);
                 ps.clip.push_back(clipVertex(v.pos,v.u,v.v,0,v.alpha*(sheetOpts.vertexFog?1.f:fogWeight),fogWeight,transform));
             }
-            projectMesh(ps,vp,light,directional?canopyVolume::canopyWeight(1.f-column):1.f,proxy.indices.data(),proxy.indices.size());
+            projectMesh<Fast>(ps,vp,light,directional?canopyVolume::canopyWeight(1.f-column):1.f,proxy.indices.data(),proxy.indices.size());
             pa.clip.clear();pa.indices.clear();
             if(farReady&&(!directional||column<1.f-1.f/255.f)) {
-                billboards::buildMesh(card,s,cam,range,drift,atlas,wx,wy,atlasOpts.dual?coverage:0.f,sharedLod);
+                billboards::buildMesh<Fast>(card,s,cam,range,drift,atlas,wx,wy,atlasOpts.dual?coverage:0.f,sharedLod);
                 for(const auto& v:card.vertices)pa.clip.push_back(clipVertex(v.pos,v.u,v.v,v.w,v.alpha*(atlasOpts.vertexFog?1.f:v.fog),v.fog,transform));
-                projectMesh(pa,vp,light,directional?canopyVolume::canopyWeight(column):1.f,card.indices.data(),card.indices.size());
+                projectMesh<Fast>(pa,vp,light,directional?canopyVolume::canopyWeight(column):1.f,card.indices.data(),card.indices.size());
             }
             GpuPasses passes;passes.stream=&hw;if(half)passes.farLayer=&farLayer;
             const bool useGpu=hardware&&passes.prepare(s,cam,range,drift,farReady,bankOpts.vertexFog,1.f,light,transform,projection,vp,sharedLod);
             UINT n=0,nt=0;
             if(useGpu) {
-                banks::buildMesh(gpu,s,cam,range,drift,wx,wy,&volume,bankOpts.dual?coverage:0.f,farReady,true,true,sharedLod);
+                banks::buildMesh<Fast>(gpu,s,cam,range,drift,wx,wy,&volume,bankOpts.dual?coverage:0.f,farReady,true,true,sharedLod);
                 n=UINT(gpu.vertices.size());nt=UINT(gpu.triangleCount());
                 passes.restrictTo(gpu);
             } else {
-                banks::buildMesh(cpu,s,cam,range,drift,wx,wy,&volume,bankOpts.dual?coverage:0.f,farReady,true,true,sharedLod);
+                banks::buildMesh<Fast>(cpu,s,cam,range,drift,wx,wy,&volume,bankOpts.dual?coverage:0.f,farReady,true,true,sharedLod);
                 pb.clip.clear();
                 for(const auto& v:cpu.vertices)pb.clip.push_back(clipVertex(v.pos,v.u,v.v,v.w,v.alpha*(bankOpts.vertexFog?1.f:v.fog),v.fog,transform));
-                projectMesh(pb,vp,light,1.f,cpu.indices.data(),cpu.indices.size());
+                projectMesh<Fast>(pb,vp,light,1.f,cpu.indices.data(),cpu.indices.size());
                 n=UINT(pb.vertices.size());nt=UINT(pb.indices.size()/3);
             }
             const auto ready=Clock::now();
@@ -170,7 +173,7 @@ inline int benchmark(IDirect3DDevice9* device,const D3DCAPS9& caps,bool half=fal
             vc::d3d9::DrawState states;
             if(!drawProjected(device,{sheet[0],sheet[1]},sheetOpts,ps,coverage,false,fog,true,false,&states))return 1;
             bool usedProxy=false;
-            if(!drawFarProjected(device,{farAtlasTex[0],farAtlasTex[1]},atlasOpts,pa,coverage,fog,vp,half?&farLayer:nullptr,&states,&usedProxy))return 1;
+            if(!drawFarProjected(device,{farAtlasTex[0],farAtlasTex[1]},atlasOpts,pa,coverage,fog,vp,half?&farLayer:nullptr,&states,&usedProxy,!Fast))return 1;
             bool reused=false;
             if(useGpu&&n) {
                 if(!hw.uploadReusable(gpu,&reused))return 1;
@@ -202,13 +205,14 @@ inline int benchmark(IDirect3DDevice9* device,const D3DCAPS9& caps,bool half=fal
                 if(samples)passed.push_back(double(pixels));
                 input+=n;submitted+=useGpu?passes.ranges[0].count()+passes.ranges[1].count():n;
                 bytes+=useGpu&&!reused?n*sizeof(banks::GpuVertex):0;skipped+=reused;halfFrames+=passes.usedFarLayer||usedProxy;
+                stateCalls+=states.calls;stateSkipped+=states.skipped;
                 tri+=ps.indices.size()/3+pa.indices.size()/3+(useGpu?(passes.ranges[0].count()+passes.ranges[1].count())/2:nt);
             }
         }
-        std::printf("Z=%4.0f pitch=%.2f weather=%.1f N=%d | CPU prep med/p95 %.3f/%.3f | submit %.3f/%.3f | completion %.3f/%.3f | GPU interval %.3f/%.3f (N=%zu) | avg verts %zu/%zu tris %zu, VB upload %zu B, reused %zu/%d, median passing samples %.0f, half-res frames %zu\n",
+        std::printf("Z=%4.0f pitch=%.2f weather=%.1f N=%d | CPU prep med/p95 %.3f/%.3f | submit %.3f/%.3f | completion %.3f/%.3f | GPU interval %.3f/%.3f (N=%zu) | avg verts %zu/%zu tris %zu, VB upload %zu B, reused %zu/%d, median passing samples %.0f, half-res frames %zu; GPU mesh reuse %llu, tracked state calls/skips %zu/%zu\n",
             height,basePitch,coverage,frames,percentile(prep,50),percentile(prep,95),percentile(submit,50),percentile(submit,95),
             percentile(complete,50),percentile(complete,95),percentile(gpuTime,50),percentile(gpuTime,95),gpuTime.size(),
-            input/frames,submitted/frames,tri/frames,bytes/frames,skipped,frames,percentile(passed,50),halfFrames);
+            input/frames,submitted/frames,tri/frames,bytes/frames,skipped,frames,percentile(passed,50),halfFrames,static_cast<unsigned long long>(gpu.geometryHits-hitsBefore),stateCalls/frames,stateSkipped/frames);
     }
     std::puts("Benchmark complete. GPU -1 means unsupported/disjoint; completion includes synchronization, not in-game FPS.");
     return 0;

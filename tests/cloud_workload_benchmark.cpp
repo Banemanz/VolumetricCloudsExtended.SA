@@ -25,16 +25,17 @@ void competingSceneWork() {
         result=visible;(void)result;
     }
 }
-template<class BankMesh>
-void run(const Settings& s,const banks::Volume& volume,const billboards::Atlas& atlas,const canopyVolume::Relief& relief,bool tighten,bool legacy) {
+template<bool Fast,class BankMesh>
+void run(const Settings& s,const banks::Volume& volume,const billboards::Atlas& atlas,const canopyVolume::Relief& relief,bool tighten,bool legacy,bool stationary) {
     canopyVolume::Mesh canopy;banks::Mesh cards;BankMesh bankMesh;
+    if constexpr(std::is_same_v<BankMesh,vc::banks::GpuMesh>)bankMesh.cacheGeometry=true;
     for(float z:{30.f,317.f,400.f,523.f,635.f,1000.f}) {
         std::vector<double> times;times.reserve(480);
         std::size_t sheet=0,volumeTris=0,cardTris=0;canopy::Drift drift;
         for(int frame=0;frame<480;++frame) {
-            const float yaw=frame*.043f,pitch=(frame%120<30?1.35f:frame%120<60?.38f:frame%120<90?-.25f:0.f);
+            const float yaw=stationary?1.57f:frame*.043f,pitch=stationary?.38f:(frame%120<30?1.35f:frame%120<60?.38f:frame%120<90?-.25f:0.f);
             const Vec f=unit(Vec{std::cos(yaw)*std::cos(pitch),std::sin(yaw)*std::cos(pitch),std::sin(pitch)});
-            const Vec right=unit(cross(f,{0,0,1}));View v{{2239.f+frame*2.f,-1262.f-frame*.8f,z},right,cross(right,f),f,450,1};
+            const Vec right=unit(cross(f,{0,0,1}));View v{{2239.f+(stationary?0.f:frame*2.f),-1262.f-(stationary?0.f:frame*.8f),z},right,cross(right,f),f,450,1};
             const float blend=canopy::handover(s,z),weather=float(frame%100)/100;
             const auto full=cloudRange(s);
             const bool directional=!legacy&&billboards::eligible(s,full);
@@ -46,11 +47,14 @@ void run(const Settings& s,const banks::Volume& volume,const billboards::Atlas& 
             drift.update(s,{.2f,.1f,0},.016f);
             const auto start=Clock::now();
             if(column<=1.f/255.f)canopy.indices.clear();else canopyVolume::mesh(canopy,relief,s,v,full,drift,.94f,.53f,blend,directional?nullptr:&local);
-            banks::buildMesh(bankMesh,s,v,local,drift,.94f,.53f,&volume,weather,distant,tighten,true,sharedLod);
-            if(distant&&(!directional||column<1.f-1.f/255.f))billboards::buildMesh(cards,s,v,local,drift,atlas,.94f,.53f,weather,sharedLod);
+            banks::buildMesh<Fast>(bankMesh,s,v,local,drift,.94f,.53f,&volume,weather,distant,tighten,true,sharedLod);
+            if(distant&&(!directional||column<1.f-1.f/255.f))billboards::buildMesh<Fast>(cards,s,v,local,drift,atlas,.94f,.53f,weather,sharedLod);
             else cards.indices.clear();
             times.push_back(std::chrono::duration<double,std::milli>(Clock::now()-start).count());
             sheet+=canopy.indices.size()/3;volumeTris+=bankMesh.vertices.size()/2;cardTris+=cards.indices.size()/3;
+        }
+        if constexpr(std::is_same_v<BankMesh,vc::banks::GpuMesh>) {
+            std::cout<<"Exact source mesh reuse: "<<bankMesh.geometryHits<<" cumulative frames\n";
         }
         std::sort(times.begin(),times.end());
         std::cout<<(std::is_same_v<BankMesh,vc::banks::GpuMesh>?"GPU-source":"CPU-source")
@@ -66,6 +70,13 @@ int main(int argc,char** argv) {
     std::cout<<"Cloud-only source preparation, no rasterization, no D3D driver or game timing\n";
     const bool tighten=argc<=1||std::string(argv[1])!="--no-trim";
     const bool legacy=argc>1&&std::string(argv[1])=="--legacy";
-    run<banks::GpuMesh>(s,volume,atlas,relief,tighten,legacy);
-    run<banks::Mesh>(s,volume,atlas,relief,tighten,legacy);
+    bool reference=false,stationary=false;
+    for(int i=1;i<argc;++i){reference|=std::string(argv[i])=="--reference";stationary|=std::string(argv[i])=="--stationary";}
+    if(reference) {
+        run<false,banks::GpuMesh>(s,volume,atlas,relief,tighten,legacy,stationary);
+        run<false,banks::Mesh>(s,volume,atlas,relief,tighten,legacy,stationary);
+    } else {
+        run<true,banks::GpuMesh>(s,volume,atlas,relief,tighten,legacy,stationary);
+        run<true,banks::Mesh>(s,volume,atlas,relief,tighten,legacy,stationary);
+    }
 }

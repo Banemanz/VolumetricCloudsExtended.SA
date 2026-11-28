@@ -35,6 +35,8 @@ struct Atlas {
     // impostors. The split has no overlap, so blending does not change.
     using Regions=std::array<Bounds,5>; // whole, left, right, top, bottom
     std::array<std::array<Regions,SlotCount>,2> bounds{};
+    std::array<Regions,SlotCount> mixedBounds{};
+    std::array<std::uint32_t,2> occupiedCells{};
     static unsigned area(Bounds b) {return unsigned(b.x1-b.x0)*unsigned(b.y1-b.y0);}
     static Bounds unite(Bounds a,Bounds b) {
         if(!a.x1)return b;
@@ -59,6 +61,19 @@ struct Atlas {
                     add(4,x0,std::max(y0,TileH/2),x1,y1);
                 }
         }
+        occupiedCells={};
+        for(unsigned i=0;i<SlotCount;++i) {
+            for(unsigned part=0;part<mixedBounds[i].size();++part)
+                mixedBounds[i][part]=unite(bounds[0][i][part],bounds[1][i][part]);
+            for(int layer=0;layer<2;++layer)if(occupied[layer][i])
+                occupiedCells[layer]|=1u<<(i/(Directions*Elevations));
+        }
+    }
+    const Regions& supportCached(int index,float weather) const {
+        return weather<=.001f?bounds[0][index]:weather>=.999f?bounds[1][index]:mixedBounds[index];
+    }
+    std::uint32_t cellMask(float weather) const {
+        return (weather<.999f?occupiedCells[0]:0u)|(weather>.001f?occupiedCells[1]:0u);
     }
     Regions support(int index,float weather) const {
         if(weather<=.001f)return bounds[0][index];
@@ -135,7 +150,8 @@ inline std::array<AngularSample,3> angularSamples(float azimuth,float elevation)
     if(x>=y)return {{{a,b,1.f-x},{a+1,b,x-y},{a+1,b+1,y}}};
     return {{{a,b,1.f-y},{a,b+1,y-x},{a+1,b+1,x}}};
 }
-struct Card {Vec center,right,up;float alpha,weight,depth,fog;bool transition;int index;Atlas::Regions bounds;};
+struct Card {Vec center,right,up;float alpha,weight,depth,fog;bool transition;int index;};
+template<bool Fast=true>
 inline void buildMesh(banks::Mesh& mesh,const Settings& s,const View& view,const Range& r,
                       const canopy::Drift& drift,const Atlas& atlas,float wx,float wy,float weather,
                       const banks::Lod* sharedLod=nullptr) {
@@ -157,42 +173,78 @@ inline void buildMesh(banks::Mesh& mesh,const Settings& s,const View& view,const
     const float wxExtent=cardExtent*std::sqrt(1+wx*wx),wyExtent=cardExtent*std::sqrt(1+wy*wy);
     const float inner=std::max(0.f,levels.start-cardExtent-1.f),outer=r.end+1.f;
     const float inner2=inner*inner,outer2=outer*outer;
-    for(int y=iy-span;y<=iy+span;++y)for(int x=ix-span;x<=ix+span;++x) {
-        const Vec delta{float((x+.5-ex)*cell),float((y+.5-ey)*cell),base-view.pos.z};
-        const float squared=dot(delta,delta);
-        if(squared<1.e-6f||squared<inner2||squared>outer2)continue;
-        const float d=std::sqrt(squared);
-        const float fade=levels.billboard(d)*banks::rangeWeight(r,d);
-        const bool transition=d+cardExtent>levels.start&&d-cardExtent<levels.end;
-        const float possible=transition?levels.billboard(d+cardExtent)*banks::rangeWeight(r,std::max(0.f,d-cardExtent)):fade;
-        if(possible<=1.f/255.f)continue;
+    // Row/column coordinates and the fixed elevation scale are shared
+    // by every candidate. Calculate once (bit-exact original arithmetic).
+    std::array<float,161> dx{};
+    std::array<int,161> cellX{};
+    std::array<float,Elevations> heights{};
+    struct PoleBasis {Vec right,up;};
+    std::array<std::array<PoleBasis,Directions+2>,2> poles{};
+    const auto cellMask=atlas.cellMask(weather);
+    if constexpr(Fast) {
+        for(int i=0;i<=span*2;++i) {
+            const int x=ix-span+i;dx[i]=float((x+.5-ex)*cell);cellX[i]=canopy::wrap(x,Cells);
+        }
+        for(int e=0;e<Elevations;++e)heights[e]=projectedHalfHeight(halfWidth,halfHeight,e);
+        for(int p=0;p<2;++p)for(int a=0;a<Directions+2;++a) {
+            const float az=2.f*Pi*float(a)/Directions;
+            auto& b=poles[p][a];b.right={std::sin(az),-std::cos(az),0};
+            b.up=cross(b.right,direction(a,p?Elevations-1:0));
+        }
+    }
+    const auto visible=[&](Vec delta) {
         const float forward=dot(delta,view.forward);
-        if(forward+cardExtent<=0||std::abs(dot(delta,view.right))>wx*forward+wxExtent||
-            std::abs(dot(delta,view.up))>wy*forward+wyExtent)continue;
-        Vec radial=unit(Vec{delta.x,delta.y,0});
-        if(horizontalSq(radial)<.5f)radial={1.f,0.f,0.f};
-        float angle=std::atan2(radial.y,radial.x)*Directions/(2.f*Pi);
-        if(angle<0.f)angle+=Directions;
-        const float pitch=std::asin(clamp(delta.z/d,-1.f,1.f));
-        const Vec right=cross(radial,{0,0,1}),up=cross(right,delta*(1.f/d));
-        for(const auto& sample:angularSamples(angle,pitch)) {
-            const float weight=sample.weight;
-            const int index=slot(x,y,sample.azimuth,sample.elevation);
-            if(weight*possible<=1.f/255.f||!atlas.any(index,weather))continue;
-            // Approximate optical-depth splitting to reduce the opacity
-            // dip during crossfades, without introducing a second field.
-            const float alpha=weight*fade*(1.f+.25f*(1.f-weight*fade));
-            Vec cardRight=right,cardUp=up;
-            if(sample.elevation==0||sample.elevation==Elevations-1) {
-                // Zenith/nadir images are projections of the world XY
-                // field. Keep their basis world-fixed even through the
-                // singularity directly above/below a cell centre.
-                const float az=2.f*Pi*float(sample.azimuth)/Directions;
-                cardRight={std::sin(az),-std::cos(az),0};
-                cardUp=cross(cardRight,direction(sample.azimuth,sample.elevation));
+        return forward+cardExtent>0&&std::abs(dot(delta,view.right))<=wx*forward+wxExtent&&
+            std::abs(dot(delta,view.up))<=wy*forward+wyExtent;
+    };
+    for(int y=iy-span;y<=iy+span;++y) {
+        const float dy=float((y+.5-ey)*cell);
+        const int row=canopy::wrap(y,Cells)*Cells;
+        for(int x=ix-span;x<=ix+span;++x) {
+            const int sourceCell=row+(Fast?cellX[x-(ix-span)]:canopy::wrap(x,Cells));
+            if constexpr(Fast)if(!(cellMask&(1u<<sourceCell)))continue;
+            const Vec delta{Fast?dx[x-(ix-span)]:float((x+.5-ex)*cell),dy,base-view.pos.z};
+            const float squared=dot(delta,delta);
+            if(squared<1.e-6f||squared<inner2||squared>outer2)continue;
+            if constexpr(Fast)if(!visible(delta))continue;
+            const float d=std::sqrt(squared);
+            const float fade=levels.billboard(d)*banks::rangeWeight(r,d);
+            const bool transition=d+cardExtent>levels.start&&d-cardExtent<levels.end;
+            const float possible=transition?levels.billboard(d+cardExtent)*banks::rangeWeight(r,std::max(0.f,d-cardExtent)):fade;
+            if(possible<=1.f/255.f)continue;
+            if constexpr(!Fast)if(!visible(delta))continue;
+            Vec radial=unit(Vec{delta.x,delta.y,0});
+            if(horizontalSq(radial)<.5f)radial={1.f,0.f,0.f};
+            float angle=std::atan2(radial.y,radial.x)*Directions/(2.f*Pi);
+            if(angle<0.f)angle+=Directions;
+            const float pitch=std::asin(clamp(delta.z/d,-1.f,1.f));
+            const Vec right=cross(radial,{0,0,1}),up=cross(right,delta*(1.f/d));
+            const float fog=cloudFogFactor(s,d);
+            for(const auto& sample:angularSamples(angle,pitch)) {
+                const float weight=sample.weight;
+                const int index=Fast?(sourceCell*Directions+canopy::wrap(sample.azimuth,Directions))*Elevations+sample.elevation:
+                    slot(x,y,sample.azimuth,sample.elevation);
+                if(weight*possible<=1.f/255.f||!atlas.any(index,weather))continue;
+                // Approximate optical-depth splitting to reduce the opacity
+                // dip during crossfades, without introducing a second field.
+                const float alpha=weight*fade*(1.f+.25f*(1.f-weight*fade));
+                Vec cardRight=right,cardUp=up;
+                if(sample.elevation==0||sample.elevation==Elevations-1) {
+                    // Zenith/nadir images are projections of the world XY
+                    // field. Keep their basis world-fixed even through the
+                    // singularity directly above/below a cell centre.
+                    if constexpr(Fast) {
+                        const auto& b=poles[sample.elevation==Elevations-1][sample.azimuth];
+                        cardRight=b.right;cardUp=b.up;
+                    } else {
+                        const float az=2.f*Pi*float(sample.azimuth)/Directions;
+                        cardRight={std::sin(az),-std::cos(az),0};
+                        cardUp=cross(cardRight,direction(sample.azimuth,sample.elevation));
+                    }
+                }
+                cards.push_back({view.pos+delta,cardRight*halfWidth,cardUp*(Fast?heights[sample.elevation]:
+                    projectedHalfHeight(halfWidth,halfHeight,sample.elevation)),alpha,weight,d,fog,transition,index});
             }
-            cards.push_back({view.pos+delta,cardRight*halfWidth,cardUp*projectedHalfHeight(halfWidth,halfHeight,sample.elevation),
-                alpha,weight,d,cloudFogFactor(s,d),transition,index,atlas.support(index,weather)});
         }
     }
     std::sort(cards.begin(),cards.end(),[](const Card& a,const Card& b){
@@ -203,7 +255,7 @@ inline void buildMesh(banks::Mesh& mesh,const Settings& s,const View& view,const
     });
     if(cards.size()>MaxCards)cards.erase(cards.begin(),cards.begin()+std::ptrdiff_t(cards.size()-MaxCards));
     for(const auto& c:cards) {
-        const auto& b=c.bounds;
+        const auto b=Fast?atlas.supportCached(c.index,weather):atlas.support(c.index,weather);
         int first=0,last=0;
         // More triangles are worth it only for larger, substantially
         // sparse sprites. Keep the hard source-vertex budget.

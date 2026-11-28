@@ -1372,3 +1372,89 @@ short-range full flight. The cache signature tracks atlas eligibility;
 old short caches without the atlas rebuild. Added coverage/range and
 cross-range cache roundtrip tests. Existing explicit FarBillboards=0
 remains a legacy mode.
+
+## CPU starvation pass (PassMark ~500 target) — 2026-11-27
+
+Base b981800; preserve the existing PR and all visual settings. The user
+explicitly wants more than small incremental optimizations for a very weak
+CPU running Windows 10. This pass attacks actual recurring CPU work without
+altering the cloud field or reducing quality. MinSpawnZ=450, 70% altitude
+handover, existing directional/zenith synchronization and FarHalfRes remain
+unchanged.
+
+- Lattice quantization: one exact array of plane positions, UV, coarse
+  and fine indices and edge floors per axis rather than repeated divisions
+  and quantization in each brick. Reject camera candidate first. Skip
+  redundant patch sort when its complete original ordering is monotonic.
+- Root support memoization: lazy per-root plane support and Z masks;
+  direct density queries for subdivided roots. Epoch changes on lattice
+  quantization, weather endpoint mask, precise-mode flag, volume pointer
+  or unique bake/load revision. Optional cache capped at ~0.81 MiB per
+  backend; no hash collision or time-based heuristic. Oversize and
+  allocation failure retain exact direct lookup.
+- Unmoving-camera VS2 geometry reuse: the camera/frustum, range, lattice,
+  trim, band and support epoch must match. Source bytes and span order
+  remain unchanged; opacity, wind UVs, lighting and matrices are still
+  prepared per frame. The vertex-buffer swap invalidates the mesh reuse
+  flag; an identical upload on the next stable frame allows reuse without
+  extra copies. Opt-in only for owned, unmodified renderer source meshes.
+- Faster source emission: one contiguous four-vertex GPU quad insertion;
+  CPU fallback uses exact dominant-axis saturation, coarse/far saturated
+  fades and per-quad UV reuse. Atlas caches mixed weather support and
+  empty cells, reuses position/elevation arithmetic, rejects offscreen
+  cells before trig, and sorts smaller card records.
+- D3D9: constant RGB packing and branchless homogeneous clip mask,
+  ping-pong polygon buffers (avoid full per-plane copy); reduced proxy
+  accumulates using the existing group state cache without an extra
+  full stateblock Capture/Apply. All state setters tracked, invalidate
+  on uncertainty; explicit RT/depth/viewport restoration remains. The
+  volume half-res inner scope remains intact for the following VS2 pass.
+  Device capability lookup cached only within the resource lifetime.
+
+A/B: g++ -std=c++17 -O3, same executable/reference switch, pinned to one
+logical CPU, 480 deterministic moving or stationary frames per altitude,
+weather sweep and continuously updated drift. No game, GPU, or driver
+included. On this Linux host, median moving source prep (ms):
+| Z | GPU reference | GPU optimized | CPU reference | CPU optimized |
+|---|---:|---:|---:|---:|
+|30|.04829|.03994|.04764|.03987|
+|523|.12267|.09133|.32374|.25003|
+|635|.18005|.12718|.59429|.41753|
+|1000|.11978|.09008|.39770|.24744|
+
+Stationary Z635 GPU .17286 -> .03032 ms (82.5% lower), 468 of 480
+frames per non-ground altitude reused in this workload. CPU fallback
+stationary .63911 -> .46646 ms. Triangle counts identical. An additional
+same-core artificial scene workload before stationary reuse was added
+showed Z635 moving medians GPU .17828 -> .12869, CPU .59185 -> .41737;
+CPU p95 4.70 -> 4.49 ms reflected scheduler contention, not a target
+CPU emulation. This is useful evidence of work removal but not GTA FPS
+or a PassMark 500 emulator. Real machine CPU/GPU and OS scheduling
+remain unverified.
+
+Regression: all five Linux portable suites passed, 480 paired frames
+of GPU vertices/spans, CPU vertices/indices, directional cards and draw
+order byte-exact (including weather endpoints, wrapping, repeated frames,
+trim/precision switches, short and long ranges and no-density path).
+Software rasterization of ground/entry/flight at 640x360 with
+VC_HALF_RES=1 was PNG byte-identical to the actual b981800 source:
+ground 1c3297ba0d490e5b2226ecb38179f8594a8aad88d255cad03390b5f4bcde3044;
+entry 020647c749207ea04cb5db0aace81418b87cabe94415f0032793a9f7960e3240;
+flight aa18fe34b38b662fff2ae6c4a353356199c9657c701c05d275151be42a392081.
+Native CI adds 87,360 randomized clipped triangles byte parity and full
+RGB comparison of nested vs group-owned proxy draws, including a
+following native draw. It also runs reference and optimized half-res
+workloads at 640x480. Tracked setter counts exclude setters in the old
+nested state scope; do not compare those counts as total API calls.
+
+Research: Direct3D 9 performance guidance on avoiding redundant state
+and buffer updates; GPU Gems, Graphics Pipeline Performance and
+Geometry Clipmaps (incremental reuse of quantized world lattices).
+Future worthwhile work, subject to parity tests: avoid inner volume
+snapshot via a selective proof of restoration; persistent per-brick
+support across individual phase changes; further fixed-function blend
+fill reductions using exact footprint support. Do not unify two
+half-resolution compositions blindly: premultiplied filtering and
+rounding can change their output. No visual tweaks are bundled in this
+CPU-only revision; residual directional projection/handover errors in
+the previous revision still require in-game confirmation.

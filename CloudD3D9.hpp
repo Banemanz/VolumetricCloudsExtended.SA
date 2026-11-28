@@ -186,7 +186,7 @@ inline ClipVertex clipVertex(Vec pos,float u,float v,float w,float alpha,float f
         pos.x*m._13+pos.y*m._23+pos.z*m._33+m._43,
         pos.x*m._14+pos.y*m._24+pos.z*m._34+m._44,u,v,w,alpha,fog};
 }
-inline ScreenVertex project(const ClipVertex& v,const D3DVIEWPORT9& vp,RGB colour,float visibility) {
+inline ScreenVertex projectPacked(const ClipVertex& v,const D3DVIEWPORT9& vp,DWORD rgb,float visibility) {
     const float inv=1.f/v.w;
     // Retain actual XY projection and reciprocal W, even outside the scene
     // far plane. Clamp ONLY Z to the cleared far depth. Distant clouds can
@@ -194,8 +194,11 @@ inline ScreenVertex project(const ClipVertex& v,const D3DVIEWPORT9& vp,RGB colou
     return {float(vp.X)+(v.x*inv+1.f)*.5f*vp.Width,
         float(vp.Y)+(1.f-v.y*inv)*.5f*vp.Height,
         mix(vp.MinZ,vp.MaxZ,sat(v.z*inv)),inv,
-        D3DCOLOR_ARGB(byte(v.alpha*visibility*255.f),byte(colour.r),byte(colour.g),byte(colour.b)),
+        (DWORD(byte(v.alpha*visibility*255.f))<<24)|rgb,
         D3DCOLOR_ARGB(byte(v.fog*255.f),0,0,0),v.u,v.v,v.t};
+}
+inline ScreenVertex project(const ClipVertex& v,const D3DVIEWPORT9& vp,RGB colour,float visibility) {
+    return projectPacked(v,vp,D3DCOLOR_ARGB(0,byte(colour.r),byte(colour.g),byte(colour.b)),visibility);
 }
 struct ProjectedMesh {
     std::vector<ClipVertex> clip;
@@ -217,20 +220,34 @@ inline float planeDistance(const ClipVertex& v,int plane) {
         default:return v.w-v.y;
     }
 }
+template<bool Fast=true>
 inline unsigned clipMask(const ClipVertex& v) {
+    if constexpr(Fast) {
+        const float edge=-.0001f*std::abs(v.w);
+        return unsigned(v.z<0.f)|(unsigned(v.w-.001f<0.f)<<1)|
+            (unsigned(v.x+v.w<edge)<<2)|(unsigned(v.w-v.x<edge)<<3)|
+            (unsigned(v.y+v.w<edge)<<4)|(unsigned(v.w-v.y<edge)<<5);
+    }
+
     unsigned mask=0;for(int i=0;i<6;++i)if(planeDistance(v,i)<(i<2?0.f:-.0001f*std::abs(v.w)))mask|=1u<<i;
     return mask;
 }
+template<bool Fast=true>
 inline void projectMesh(ProjectedMesh& mesh,const D3DVIEWPORT9& vp,RGB color,float visibility,
                         const std::uint16_t* indices,std::size_t count) {
     mesh.vertices.resize(mesh.clip.size());mesh.indices.clear();mesh.indices.reserve(count);
     // Unreferenced invalid vertices are never drawn.
     constexpr unsigned unvisited=~0u;
     auto& masks=mesh.masks;masks.assign(mesh.clip.size(),unvisited);
+    const DWORD rgb=D3DCOLOR_ARGB(0,byte(color.r),byte(color.g),byte(color.b));
+    const auto projectVertex=[&](const ClipVertex& v) {
+        if constexpr(Fast)return projectPacked(v,vp,rgb,visibility);
+        else return project(v,vp,color,visibility);
+    };
     const auto visit=[&](std::uint16_t i) {
         if(masks[i]!=unvisited)return;
-        masks[i]=clipMask(mesh.clip[i]);
-        if(!masks[i])mesh.vertices[i]=project(mesh.clip[i],vp,color,visibility);
+        masks[i]=clipMask<Fast>(mesh.clip[i]);
+        if(!masks[i])mesh.vertices[i]=projectVertex(mesh.clip[i]);
     };
     for(std::size_t i=0;i+2<count;i+=3) {
         const auto a=indices[i],b=indices[i+1],c=indices[i+2];
@@ -240,7 +257,11 @@ inline void projectMesh(ProjectedMesh& mesh,const D3DVIEWPORT9& vp,RGB color,flo
         const bool farA=mesh.clip[a].z>mesh.clip[a].w,farB=mesh.clip[b].z>mesh.clip[b].w,farC=mesh.clip[c].z>mesh.clip[c].w;
         const bool crossFar=farA!=farB||farA!=farC;
         if(!planes&&!crossFar){mesh.indices.insert(mesh.indices.end(),{a,b,c});continue;}
-        std::array<ClipVertex,12> poly{},next{};
+        // Ping-pong the active polygon; do not zero or copy 24 vertices
+        // for every crossing triangle. Only elements [0,n) are read.
+        ClipVertex storage[2][12];
+        if constexpr(!Fast)std::memset(storage,0,sizeof(storage));
+        auto* poly=storage[0];auto* next=storage[1];
         poly[0]=mesh.clip[a];poly[1]=mesh.clip[b];poly[2]=mesh.clip[c];int n=3;
         for(int p=0;p<6&&n>=3;++p)if(planes&(1u<<p)) {
             int out=0;
@@ -250,12 +271,14 @@ inline void projectMesh(ProjectedMesh& mesh,const D3DVIEWPORT9& vp,RGB color,flo
                 if(d>=0)next[out++]=start;
                 if((d<0)!=(e<0))next[out++]=lerp(start,end,d/(d-e));
             }
-            poly=next;n=out;
+            if constexpr(Fast)std::swap(poly,next);
+            else std::copy_n(next,12,poly);
+            n=out;
         }
         const auto emit=[&](const auto& polygon,int nVertices) {
             if(nVertices<3||mesh.vertices.size()+std::size_t(nVertices)>=65536)return;
             const auto base=std::uint16_t(mesh.vertices.size());
-            for(int j=0;j<nVertices;++j)mesh.vertices.push_back(project(polygon[j],vp,color,visibility));
+            for(int j=0;j<nVertices;++j)mesh.vertices.push_back(projectVertex(polygon[j]));
             for(int j=1;j+1<nVertices;++j)mesh.indices.insert(mesh.indices.end(),{base,std::uint16_t(base+j),std::uint16_t(base+j+1)});
         };
         if(!crossFar){emit(poly,n);continue;}
@@ -321,6 +344,35 @@ struct StateScope {
     StateScope(const StateScope&)=delete;
     StateScope& operator=(const StateScope&)=delete;
 };
+// Only used between capture/restore of one cloud group. All first uses
+// are sent to D3D (the game/mods may have changed anything). DrawUP/VS
+// changes don't touch these states. No cross-frame guesses or device gets.
+struct DrawState {
+    template<std::size_t N> struct Values {
+        std::array<DWORD,N> value;
+        std::bitset<N> known;
+        template<class Setter> HRESULT set(std::size_t index,DWORD v,Setter&& setter,unsigned& calls,unsigned& skipped) {
+            if(index<N&&known[index]&&value[index]==v){++skipped;return S_OK;}
+            ++calls;const HRESULT hr=setter();
+            if(SUCCEEDED(hr)&&index<N){known[index]=true;value[index]=v;}
+            return hr;
+        }
+    };
+    Values<256> render;
+    Values<4*33> stage;
+    Values<2*14> sampler;
+    unsigned calls=0,skipped=0;
+    void invalidate() {render.known.reset();stage.known.reset();sampler.known.reset();}
+    HRESULT rs(IDirect3DDevice9* d,D3DRENDERSTATETYPE st,DWORD v) {
+        return render.set(unsigned(st),v,[&]{return d->SetRenderState(st,v);},calls,skipped);
+    }
+    HRESULT ts(IDirect3DDevice9* d,DWORD i,D3DTEXTURESTAGESTATETYPE st,DWORD v) {
+        return stage.set(i*33+unsigned(st),v,[&]{return d->SetTextureStageState(i,st,v);},calls,skipped);
+    }
+    HRESULT ss(IDirect3DDevice9* d,DWORD i,D3DSAMPLERSTATETYPE st,DWORD v) {
+        return sampler.set(i*14+unsigned(st),v,[&]{return d->SetSamplerState(i,st,v);},calls,skipped);
+    }
+};
 // Optional distant-only half-resolution accumulation. The original scene
 // depth buffer is never copied, sampled, cleared or downsampled. It is
 // rebound for the final premultiplied quad at the cleared far depth.
@@ -330,13 +382,15 @@ struct FarLayer {
     IDirect3DSurface9* surface{};
     UINT width{},height{};
     bool disabled{};
+    IDirect3DDevice9* capsDevice{};
+    D3DCAPS9 caps{};
     StateScope snapshot;
     std::vector<ScreenVertex> scaled; // reusable projected proxy scratch
     void release() {
         snapshot.release();
         if(surface)surface->Release();
         if(texture)texture->Release();
-        surface=nullptr;texture=nullptr;width=height=0;disabled=false;
+        surface=nullptr;texture=nullptr;width=height=0;disabled=false;capsDevice=nullptr;
     }
     ~FarLayer(){release();}
     bool ensure(IDirect3DDevice9* d,UINT w,UINT h) {
@@ -350,11 +404,14 @@ struct FarLayer {
         width=w;height=h;return true;
     }
     template<class Draw>
-    Result render(IDirect3DDevice9* d,const D3DVIEWPORT9& vp,Draw&& draw,bool& used,const RECT* bounds=nullptr) {
+    Result render(IDirect3DDevice9* d,const D3DVIEWPORT9& vp,Draw&& draw,bool& used,const RECT* bounds=nullptr,DrawState* states=nullptr) {
         used=false;
         if(disabled||vp.Width<320||vp.Height<240)return {};
-        D3DCAPS9 caps{};
-        if(FAILED(d->GetDeviceCaps(&caps))||!(caps.PrimitiveMiscCaps&D3DPMISCCAPS_SEPARATEALPHABLEND)||
+        if(capsDevice!=d) {
+            if(FAILED(d->GetDeviceCaps(&caps)))return {};
+            capsDevice=d;
+        }
+        if(!(caps.PrimitiveMiscCaps&D3DPMISCCAPS_SEPARATEALPHABLEND)||
            (caps.TextureFilterCaps&(D3DPTFILTERCAPS_MINFLINEAR|D3DPTFILTERCAPS_MAGFLINEAR))!=
             (D3DPTFILTERCAPS_MINFLINEAR|D3DPTFILTERCAPS_MAGFLINEAR))return {};
         struct SurfaceRef {IDirect3DSurface9* p{};~SurfaceRef(){if(p)p->Release();}};
@@ -368,12 +425,13 @@ struct FarLayer {
             if((SUCCEEDED(result)&&extra.p)||(FAILED(result)&&result!=D3DERR_NOTFOUND))return {};
         }
         if(!ensure(d,(vp.Width+1)/2,(vp.Height+1)/2))return {};
-        if(!snapshot.capture(d))return {};
+        capsDevice=d;
+        if(!states&&!snapshot.capture(d))return {};
         HRESULT hr=S_OK;
         const auto check=[&](HRESULT value){if(SUCCEEDED(hr)&&FAILED(value))hr=value;};
-        const auto rs=[&](D3DRENDERSTATETYPE st,DWORD val){if(SUCCEEDED(hr))check(d->SetRenderState(st,val));};
-        const auto ts=[&](DWORD i,D3DTEXTURESTAGESTATETYPE st,DWORD val){if(SUCCEEDED(hr))check(d->SetTextureStageState(i,st,val));};
-        const auto ss=[&](D3DSAMPLERSTATETYPE st,DWORD val){if(SUCCEEDED(hr))check(d->SetSamplerState(0,st,val));};
+        const auto rs=[&](D3DRENDERSTATETYPE st,DWORD val){if(SUCCEEDED(hr))check(states?states->rs(d,st,val):d->SetRenderState(st,val));};
+        const auto ts=[&](DWORD i,D3DTEXTURESTAGESTATETYPE st,DWORD val){if(SUCCEEDED(hr))check(states?states->ts(d,i,st,val):d->SetTextureStageState(i,st,val));};
+        const auto ss=[&](D3DSAMPLERSTATETYPE st,DWORD val){if(SUCCEEDED(hr))check(states?states->ss(d,0,st,val):d->SetSamplerState(0,st,val));};
         check(d->SetDepthStencilSurface(nullptr));
         if(SUCCEEDED(hr))check(d->SetRenderTarget(0,surface));
         const D3DVIEWPORT9 reducedViewport{0,0,width,height,0,1};
@@ -511,7 +569,7 @@ struct GpuStream {
             return {};
         }
         const auto result=upload(mesh);
-        if(result){resident.swap(mesh.vertices);residentValid=true;}
+        if(result){resident.swap(mesh.vertices);residentValid=true;mesh.geometryCached=false;}
         return result;
     }
 };
@@ -599,34 +657,6 @@ struct GpuPasses {
         }
         const auto restore=viewportChanged?d->SetViewport(&viewport):S_OK;
         return FAILED(restore)?failed(restore,"cloud viewport restore"):failed(hr,"hardware cloud draw");
-    }
-};
-// Only used between capture/restore of one cloud group. All first uses
-// are sent to D3D (the game/mods may have changed anything). DrawUP/VS
-// changes don't touch these states. No cross-frame guesses or device gets.
-struct DrawState {
-    template<std::size_t N> struct Values {
-        std::array<DWORD,N> value;
-        std::bitset<N> known;
-        template<class Setter> HRESULT set(std::size_t index,DWORD v,Setter&& setter,unsigned& calls,unsigned& skipped) {
-            if(index<N&&known[index]&&value[index]==v){++skipped;return S_OK;}
-            ++calls;const HRESULT hr=setter();
-            if(SUCCEEDED(hr)&&index<N){known[index]=true;value[index]=v;}
-            return hr;
-        }
-    };
-    Values<256> render;
-    Values<4*33> stage;
-    Values<2*14> sampler;
-    unsigned calls=0,skipped=0;
-    HRESULT rs(IDirect3DDevice9* d,D3DRENDERSTATETYPE st,DWORD v) {
-        return render.set(unsigned(st),v,[&]{return d->SetRenderState(st,v);},calls,skipped);
-    }
-    HRESULT ts(IDirect3DDevice9* d,DWORD i,D3DTEXTURESTAGESTATETYPE st,DWORD v) {
-        return stage.set(i*33+unsigned(st),v,[&]{return d->SetTextureStageState(i,st,v);},calls,skipped);
-    }
-    HRESULT ss(IDirect3DDevice9* d,DWORD i,D3DSAMPLERSTATETYPE st,DWORD v) {
-        return sampler.set(i*14+unsigned(st),v,[&]{return d->SetSamplerState(i,st,v);},calls,skipped);
     }
 };
 inline Result drawRaw(IDirect3DDevice9* d,const std::array<IDirect3DBaseTexture9*,2>& textures,
@@ -735,7 +765,7 @@ inline Result drawProjected(IDirect3DDevice9* d,const std::array<IDirect3DBaseTe
 // projected-area estimate avoids a costly RT switch for a few small cards.
 inline Result drawFarProjected(IDirect3DDevice9* d,const std::array<IDirect3DBaseTexture9*,2>& textures,
         const Options& opts,const ProjectedMesh& mesh,float coverage,RGB fogColor,
-        const D3DVIEWPORT9& vp,FarLayer* layer,DrawState* states=nullptr,bool* usedLayer=nullptr) {
+        const D3DVIEWPORT9& vp,FarLayer* layer,DrawState* states=nullptr,bool* usedLayer=nullptr,bool nestedScope=false) {
     if(usedLayer)*usedLayer=false;
     if(!layer||mesh.indices.size()<96)
         return drawProjected(d,textures,opts,mesh,coverage,false,fogColor,true,false,states);
@@ -766,6 +796,7 @@ inline Result drawFarProjected(IDirect3DDevice9* d,const std::array<IDirect3DBas
     try {layer->scaled=mesh.vertices;}
     catch(const std::bad_alloc&) {return drawProjected(d,textures,opts,mesh,coverage,false,fogColor,true,false,states);}
     bool used=false;
+    auto* accumulationStates=nestedScope?nullptr:states;
     const auto result=layer->render(d,vp,[&]{
         const float sx=float(layer->width)/vp.Width,sy=float(layer->height)/vp.Height;
         // Unreferenced vertices can remain stale; only actual prefix
@@ -773,8 +804,14 @@ inline Result drawFarProjected(IDirect3DDevice9* d,const std::array<IDirect3DBas
         for(auto& v:layer->scaled){v.x=(v.x-vp.X)*sx;v.y=(v.y-vp.Y)*sy;v.z=1.f;}
         return drawRaw(d,textures,opts,layer->scaled.data(),UINT(layer->scaled.size()),sizeof(ScreenVertex),fvf,
             mesh.indices.data(),UINT(prefix/3),coverage,opts.vertexFog,true,false,colour,
-            nullptr,nullptr,false,nullptr,nullptr,true).hr;
-    },used,&bounds);
+            nullptr,nullptr,false,nullptr,accumulationStates,true).hr;
+    },used,&bounds,accumulationStates);
+    // An outer group snapshot already captures the game state. Avoid a
+    // nested full device Capture/Apply solely to perform the proxy pass.
+    // Every render/stage/sampler setter is tracked through the same
+    // group cache. Uncertain/failed accumulation invalidates it; scene
+    // surfaces and viewport were restored independently even on failure.
+    if(accumulationStates&&(!result||!used))accumulationStates->invalidate();
     if(!result)return result;
     if(!used)return drawProjected(d,textures,opts,mesh,coverage,false,fogColor,true,false,states);
     if(usedLayer)*usedLayer=true;

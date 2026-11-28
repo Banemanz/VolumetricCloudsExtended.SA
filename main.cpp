@@ -562,6 +562,7 @@ bool DrawBanks(RwCamera* camera,const vc::View& view,const vc::Range& range,
         useGpu=bankGpu.available()&&passes.prepare(settings,view,range,canopyDrift,farReady,
             bankOptions.vertexFog,visibility,bankLight,transform,projection,viewport,sharedLod);
         if(useGpu) {
+            bankGpuMesh.cacheGeometry=true;
             vc::banks::buildMesh(bankGpuMesh,settings,view,range,canopyDrift,wx,wy,occupancy,weather,farReady,true,true,sharedLod);
             if(bankGpuMesh.vertices.empty())return true;
             passes.restrictTo(bankGpuMesh);

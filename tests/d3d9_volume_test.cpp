@@ -139,6 +139,26 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
     // deliberately incompatible; cloud rendering must override/restore it.
     D3DVIEWPORT9 viewport{};
     if(FAILED(hr=device->GetViewport(&viewport)))return fail("Pure-device GetViewport",hr);
+    // Randomized triangles straddling near, viewport and scene-far
+    // planes. Compare all actually referenced vertex bytes and order.
+    {
+        std::uint32_t seed=0x29165u;
+        const auto rnd=[&](){seed=1664525u*seed+1013904223u;return float(seed>>8)/16777216.f;};
+        for(int batch=0;batch<32;++batch) {
+            d3d9::ProjectedMesh ref,fast;std::vector<std::uint16_t> ix;
+            for(int i=0;i<2048;++i)ref.clip.push_back({(rnd()-.5f)*16,(rnd()-.5f)*16,
+                (rnd()-.2f)*8,(rnd()-.2f)*8,rnd(),rnd(),rnd(),rnd(),rnd()});
+            fast.clip=ref.clip;
+            for(int i=0;i<8190;++i)ix.push_back(std::uint16_t(rnd()*2048));
+            const RGB tint{rnd()*255,rnd()*255,rnd()*255};const float opacity=rnd();
+            d3d9::projectMesh<false>(ref,viewport,tint,opacity,ix.data(),ix.size());
+            d3d9::projectMesh(fast,viewport,tint,opacity,ix.data(),ix.size());
+            if(ref.indices!=fast.indices||ref.masks!=fast.masks)return fail("Projection clip/order parity");
+            for(auto i:ref.indices)if(std::memcmp(&ref.vertices[i],&fast.vertices[i],sizeof(d3d9::ScreenVertex)))
+                return fail("Projection indexed vertex parity");
+        }
+        std::puts("PASS: 87360 randomized projected triangles, referenced vertices byte-exact");
+    }
     d3d9::ProjectedMesh projected;
     for(int i=0;i<8;++i) {
         const auto& v=vertices[i];
@@ -605,17 +625,36 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
         if(batch.indices.empty())return fail("No directional ground canopy");
         const D3DRECT sentinel{0,0,LONG(desc.Width/4),LONG(desc.Height/4)};
         d3d9::StateScope scope;d3d9::FarLayer layer;
-        std::vector<DWORD> full;
-        for(int half=0;half<2;++half) {
+        std::vector<DWORD> full,nested,nestedSequence;
+        bool nestedUsed=false,sequenceUsed=false;
+        for(int half=0;half<5;++half) {
             if(FAILED(device->Clear(0,nullptr,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER,0xFF50779F,1.f,0)))return fail("Directional ground clear");
             if(FAILED(device->Clear(1,&sentinel,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER,0xFF008000,.1f,0)))return fail("Directional ground sentinel");
             if(FAILED(device->BeginScene())||!scope.capture(device))return fail("Directional ground begin");
             bool used=false;d3d9::DrawState cache;
             const auto result=d3d9::drawFarProjected(device,{compactFar[0],compactFar[1]},atlasOpts,batch,.5f,
-                {90,120,160},viewport,half?&layer:nullptr,&cache,&used);
+                {90,120,160},viewport,half?&layer:nullptr,&cache,&used,half==1||half==3);
+            if(!result)return fail("Directional ground draw",result.hr);
+            // Draw another full native proxy after the reduced pass. The
+            // outer-owned path must correctly re-emit affected state.
+            if(half>=3) {
+                const auto next=d3d9::drawProjected(device,{compactFar[0],compactFar[1]},atlasOpts,batch,.45f,false,
+                    {90,120,160},true,false,&cache);
+                if(!next)return fail("Directional ground following draw",next.hr);
+            }
             if(!scope.restore()||FAILED(device->EndScene())||!result)return fail("Directional ground draw");
             std::vector<DWORD> pixels;if(!capture(pixels))return fail("Directional ground capture");
             if(!half){full=std::move(pixels);continue;}
+            if(half==1){nested=pixels;nestedUsed=used;}
+            else if(half==3){nestedSequence=std::move(pixels);sequenceUsed=used;continue;}
+            else {
+                const auto& expected=half==2?nested:nestedSequence;
+                if(used!=(half==2?nestedUsed:sequenceUsed))return fail("Outer-owned state scope path parity");
+                for(std::size_t i=0;i<pixels.size();++i)if((pixels[i]&0xFFFFFFu)!=(expected[i]&0xFFFFFFu))
+                    return fail("Outer-owned state scope visual parity");
+                if(half==4)std::puts("PASS: nested versus outer-only state scope RGB exact, including following native draw");
+                continue;
+            }
             unsigned large=0;std::uint64_t error=0;
             for(UINT y=0;y<desc.Height;++y)for(UINT x=0;x<desc.Width;++x) {
                 const auto i=std::size_t(y)*desc.Width+x;
@@ -698,7 +737,8 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
 }
 }
 int main(int argc,char** argv) {
-    const bool halfBench=argc==4&&std::strcmp(argv[1],"--benchmark-half")==0;
+    const bool referenceBench=argc==4&&std::strcmp(argv[1],"--benchmark-half-reference")==0;
+    const bool halfBench=referenceBench||(argc==4&&std::strcmp(argv[1],"--benchmark-half")==0);
     const bool bench=halfBench||(argc==4&&std::strcmp(argv[1],"--benchmark")==0);
     const UINT width=bench?UINT(std::atoi(argv[2])):320u,height=bench?UINT(std::atoi(argv[3])):240u;
     if(!width||!height||width>1920||height>1080)return 1;
@@ -731,7 +771,7 @@ int main(int argc,char** argv) {
             }
             D3DCAPS9 actual{};
             if(FAILED(device->GetDeviceCaps(&actual)))return fail("GetDeviceCaps");
-            const int result=bench?synthetic::benchmark(device.p,actual,halfBench):run(device.p,actual);
+            const int result=bench?(referenceBench?synthetic::benchmark<false>(device.p,actual,halfBench):synthetic::benchmark(device.p,actual,halfBench)):run(device.p,actual);
             if(result==77)continue;
             if(result!=0)return result;
             any=true;pure|=(flags&D3DCREATE_PUREDEVICE)!=0;

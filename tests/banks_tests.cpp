@@ -457,6 +457,45 @@ int main() {
     for(float x=.25f;x<=.75f;x+=.01f)CHECK(std::abs(billboards::window(x)+billboards::window(1.f-x)-1.f)<.0001f);
     billboards::Atlas atlas;atlas.build(s,b);
     CHECK(atlas.pixels[0].size()==billboards::AtlasSize*billboards::AtlasSize && atlas.pixels[1].size()==billboards::AtlasSize*billboards::AtlasSize);
+    // Byte-exact comparison of cached lattice/support and ordering against
+    // the original per-brick/per-card evaluation. Include changing views,
+    // weather endpoints, periodic seams, and repeated frames.
+    const auto identical=[](const auto& a,const auto& b) {
+        using T=typename std::decay_t<decltype(a)>::value_type;
+        return a.size()==b.size()&&(a.empty()||std::memcmp(a.data(),b.data(),a.size()*sizeof(T))==0);
+    };
+    banks::GpuMesh oldGpu,newGpu;newGpu.cacheGeometry=true;
+    banks::Mesh oldCpu,newCpu,oldCards,newCards;
+    for(int frame=0;frame<240;++frame) {
+        auto config=s;
+        if(frame%17==0)config.cloudDrawDistance=4200;
+        if(frame%23==0)config.cloudDrawDistance=12000;
+        const float z=std::array<float,8>{30,317,400,442.4f,523,632,635,1000}[frame%8];
+        const float yaw=frame*.13f,pitch=std::sin(frame*.21f)*1.5f;
+        const Vec forward=unit(Vec{std::cos(yaw)*std::cos(pitch),std::sin(yaw)*std::cos(pitch),std::sin(pitch)});
+        const Vec right=unit(cross(forward,{0,0,1}));
+        View eye{{float(frame%31)*342.5f-5000,float(frame%23)*-541.25f+4000,z},right,cross(right,forward),forward,450,1};
+        canopy::Drift wind;wind.x=frame*.00083;wind.y=-frame*.00187;
+        const float weather=std::array<float,7>{0,.0009f,.001f,.45f,.999f,.9991f,1}[frame%7];
+        const auto range=cloudRange(config);
+        const auto hybrid=banks::hybridLod(config,range,z,z);
+        const auto* shared=frame%11?&hybrid:nullptr;
+        const auto* density=frame%19?&b:nullptr;
+        const bool trim=frame%13!=0,precise=frame%9!=0;
+        for(int repeat=0;repeat<2;++repeat) {
+            banks::buildMesh<false>(oldGpu,config,eye,range,wind,.94f,.53f,density,weather,true,trim,precise,shared);
+            banks::buildMesh(newGpu,config,eye,range,wind,.94f,.53f,density,weather,true,trim,precise,shared);
+            CHECK(identical(oldGpu.vertices,newGpu.vertices)&&identical(oldGpu.spans,newGpu.spans)&&oldGpu.slices==newGpu.slices);
+            banks::buildMesh<false>(oldCpu,config,eye,range,wind,.94f,.53f,density,weather,true,trim,precise,shared);
+            banks::buildMesh(newCpu,config,eye,range,wind,.94f,.53f,density,weather,true,trim,precise,shared);
+            CHECK(identical(oldCpu.vertices,newCpu.vertices)&&identical(oldCpu.indices,newCpu.indices)&&oldCpu.slices==newCpu.slices);
+            billboards::buildMesh<false>(oldCards,config,eye,range,wind,atlas,.94f,.53f,weather,shared);
+            billboards::buildMesh(newCards,config,eye,range,wind,atlas,.94f,.53f,weather,shared);
+            CHECK(identical(oldCards.vertices,newCards.vertices)&&identical(oldCards.indices,newCards.indices));
+        }
+    }
+    CHECK(newGpu.geometryHits>=200);
+    std::cout<<"PASS: 480 paired frames of GPU, CPU and directional canopy source geometry byte-exact\n";
     // Validate the baked cell support independent of mesh output: every
     // nonzero texel's bilinear support survives whole or split trimming.
     std::size_t supportChecks=0;

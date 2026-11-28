@@ -817,3 +817,39 @@ configured range. The procedural cache is reusable across eligible
 short and long ranges; an old short-range cache without the atlas
 invalidates by its bake signature. Explicit `FarBillboards=0` still
 selects the legacy path.
+
+### CPU-constrained machines: exact work reuse
+
+The same procedural field, directional atlas, handover, cloud sizes, draw
+distance, texture quality and transparency order are retained. The low-CPU
+path now quantizes shared lattice edges/planes once, rejects view geometry
+before density queries, and memoizes exact root-brick occupancy while the
+quantized density phase is unchanged. The cache is bounded and invalidated on
+weather endpoint category, precision, support rebuild or lattice changes.
+For an unmoving camera, the VS2 source mesh can be reused while shader
+uniforms continue to update every frame. No time-based geometry throttling,
+approximate math, dynamic quality reduction, or extra thread is involved.
+
+Directional atlas support unions and source-cell masks are derived during
+bake/load. CPU fallback avoids redundant saturated fades, dominant-axis
+weights and repeated UV evaluation. The D3D9 projected path uses ping-pong
+clipping scratch, packs constant RGB once, and shares its existing group
+state cache with the far proxy accumulation/composite. The outer game-state
+snapshot and explicit RT/depth/viewport restoration remain.
+
+Reproduce the portable A/B workload:
+```sh
+g++ -std=c++17 -O3 tests/cloud_workload_benchmark.cpp -o cloud_workload
+taskset -c 0 ./cloud_workload --reference
+taskset -c 0 ./cloud_workload
+taskset -c 0 ./cloud_workload --reference --stationary
+taskset -c 0 ./cloud_workload --stationary
+# Optional separate deterministic competing scene task pinned to the same CPU:
+taskset -c 0 ./cloud_workload --scene-load
+```
+Each mode uses 480 frames per height and identical cloud geometry. Source
+preparation timings exclude game, driver and rasterization. The CI D3D9
+benchmark also provides `--benchmark-half-reference 640 480` for the
+previous source path and nested state scope versus `--benchmark-half 640 480`.
+No PassMark-to-FPS estimate is made. See the handoff for measurements and
+limitations.
