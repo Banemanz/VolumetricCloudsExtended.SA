@@ -1360,3 +1360,15 @@ difference .946/255, four >32 pixels, depth guard preserved. Same-run
 10.382→5.903ms, Z443 40.065→26.079ms, Z635 111.316→84.409ms.
 Those are not hardware or GTA FPS. Subsequent zenith changes should
 be built and tested in the same workflow.
+
+
+One final compatibility refinement: short draw ranges (e.g. existing
+4200m INIs) must not fall back to the mismatched ground sheet just
+because the far-flight crossover is outside the range. Split
+`billboards::eligible` (directional ground atlas) from
+`billboards::farEligible` (flight-only old threshold). `hybridLod`
+now grows from the directional layer to {range.end,range.end} for
+short-range full flight. The cache signature tracks atlas eligibility;
+old short caches without the atlas rebuild. Added coverage/range and
+cross-range cache roundtrip tests. Existing explicit FarBillboards=0
+remains a legacy mode.

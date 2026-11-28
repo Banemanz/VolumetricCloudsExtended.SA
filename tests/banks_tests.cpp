@@ -523,6 +523,16 @@ int main() {
     s.cloudDrawDistance=4200;
     billboards::buildMesh(culled,s,flight,cloudRange(s),{},atlas,.94f,.53f,0);
     CHECK(culled.indices.empty());
+    const auto shortRange=cloudRange(s);
+    CHECK(billboards::eligible(s,shortRange)&&!billboards::farEligible(s,shortRange));
+    const auto shortGround=banks::hybridLod(s,shortRange,ground.pos.z,ground.pos.z);
+    billboards::buildMesh(culled,s,ground,shortRange,{},atlas,.94f,.53f,0,&shortGround);
+    CHECK(!culled.indices.empty());
+    auto high=flight;high.pos.z=canopy::altitude(s)+1.f;
+    const auto shortFlight=banks::hybridLod(s,shortRange,high.pos.z,high.pos.z);
+    CHECK(shortFlight.start==shortRange.end&&shortFlight.end==shortRange.end);
+    billboards::buildMesh(culled,s,high,shortRange,{},atlas,.94f,.53f,0,&shortFlight);
+    CHECK(culled.indices.empty());
     s.hybridClouds=false;banks::buildMesh(culled,s,flight,r,{},.94f,.53f,&b,0);
     CHECK(culled.indices.empty());
     std::cout<<"PASS: deterministic density, world-ray invariance, bounded LOD and projected atlas; "<<bake<<" ms CPU volume bake; default flight "<<count<<" triangles vs "<<unculled<<" unculled, "<<spriteCount<<" distant cards\n";

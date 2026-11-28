@@ -105,7 +105,7 @@ inline Lod lod(const Settings& s,const Range& r,bool available=true,float altitu
 inline Lod hybridLod(const Settings& s,const Range& r,float playerZ,float cameraZ) {
     const float offset=cameraZ-(s.minSpawnZ+s.maxSpawnZ)*.5f;
     const auto flight=lod(s,r,true,offset);
-    if(flight.start>=flight.end)return flight;
+    if(!s.farBillboards)return flight;
     const float blend=canopy::handover(s,playerZ);
     // Five atlas cells per tile: keep close rays in the actual volume.
     const float cell=canopy::tileWorldSize(s)/5.f;

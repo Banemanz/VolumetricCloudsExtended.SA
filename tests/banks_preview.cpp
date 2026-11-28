@@ -79,7 +79,7 @@ int main(int argc,char** argv) {
     if(s.hybridClouds){
         const auto bankLight=banks::bankLight(light,climate);
         banks::Mesh silhouettes;
-        if((directional&&column<1.f-1.f/255.f)||(!directional&&billboards::eligible(s,local))) {
+        if((directional&&column<1.f-1.f/255.f)||(!directional&&billboards::farEligible(s,local))) {
             billboards::Atlas atlas;atlas.build(s,volume);
             save(atlas.pixels[0],".atlas0");save(atlas.pixels[1],".atlas1");
             billboards::buildMesh(silhouettes,s,view,local,{},atlas,480.f/510.f,270.f/510.f,climate.coverage,sharedLod);
@@ -91,7 +91,7 @@ int main(int argc,char** argv) {
             }
             for(std::size_t i=0;i<silhouettes.indices.size();i+=3)std::cout<<silhouettes.indices[i]<<' '<<silhouettes.indices[i+1]<<' '<<silhouettes.indices[i+2]<<'\n';
         }
-        banks::Mesh mesh;banks::buildMesh(mesh,s,view,local,{},480.f/510.f,270.f/510.f,&volume,climate.coverage,directional||billboards::eligible(s,local),tighten,true,sharedLod);
+        banks::Mesh mesh;banks::buildMesh(mesh,s,view,local,{},480.f/510.f,270.f/510.f,&volume,climate.coverage,directional||billboards::farEligible(s,local),tighten,true,sharedLod);
         std::cout<<2<<' '<<mesh.vertices.size()<<' '<<mesh.indices.size()/3<<' '<<climate.coverage<<'\n';
         for(const auto& v:mesh.vertices){
             const auto d=v.pos-view.pos;

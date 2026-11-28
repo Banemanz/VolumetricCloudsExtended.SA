@@ -41,6 +41,13 @@ int main(){
     std::istringstream truncated(bytes.substr(0,bytes.size()-1));
     CHECK(!vc::cache::load(truncated,s,size,loaded,lv,la));
     wrong=s;wrong.cloudFogStart+=100;CHECK(vc::cache::key(s,size)==vc::cache::key(wrong,size));
+    wrong=s;wrong.cloudDrawDistance=4200;
+    CHECK(vc::billboards::eligible(wrong,vc::cloudRange(wrong)));
+    CHECK(vc::cache::key(s,size)==vc::cache::key(wrong,size));
+    std::istringstream shortRangeCache(bytes);
+    CHECK(vc::cache::load(shortRangeCache,wrong,size,loaded,lv,la));
+    CHECK(equal(a.pixels[0],la.pixels[0])&&equal(a.pixels[1],la.pixels[1]));
+
     std::stringstream ini;vc::write(ini,s);vc::Settings parsed;vc::load(ini,parsed);
     CHECK(vc::cache::key(s,size)==vc::cache::key(parsed,size));
     std::cout<<"Schematic byte-exact round trip: "<<bytes.size()<<" bytes; bad key, checksum and truncation rejected.\n";

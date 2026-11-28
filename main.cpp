@@ -546,7 +546,7 @@ bool DrawBanks(RwCamera* camera,const vc::View& view,const vc::Range& range,
     const float handoverVisibility=vc::weather::visibility(climate)*vc::weather::clearOpacity(climate)*(canopyRelief.ready?1.f:handover);
     if(handoverVisibility<=1.f/255.f)return true;
     const float visibility=canopyRelief.ready?handoverVisibility:handoverVisibility*handover;
-    bool farReady=(sharedLod||vc::billboards::eligible(settings,range))&&EnsureBillboards();
+    bool farReady=(sharedLod||vc::billboards::farEligible(settings,range))&&EnsureBillboards();
     const auto bankLight=vc::banks::bankLight(light,climate);
     vc::d3d9::GpuPasses passes;
     passes.stream=&bankGpu;

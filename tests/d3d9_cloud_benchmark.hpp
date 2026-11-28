@@ -123,7 +123,7 @@ inline int benchmark(IDirect3DDevice9* device,const D3DCAPS9& caps,bool half=fal
             const auto lod=banks::hybridLod(s,full,height,cam.pos.z);
             const auto* sharedLod=directional?&lod:nullptr;
             const float column=directional?banks::columnShare(s,cam,height):1.f;
-            const bool farReady=directional||billboards::eligible(s,range);
+            const bool farReady=directional||billboards::farEligible(s,range);
             auto view=identity();
             view._11=right.x;view._21=right.y;view._31=right.z;view._41=-dot(pos,right);
             view._12=up.x;view._22=up.y;view._32=up.z;view._42=-dot(pos,up);

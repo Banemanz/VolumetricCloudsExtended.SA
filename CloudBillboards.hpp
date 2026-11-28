@@ -242,7 +242,12 @@ inline void buildMesh(banks::Mesh& mesh,const Settings& s,const View& view,const
     }
 }
 inline bool eligible(const Settings& s,const Range& r) {
-    return banks::lod(s,r).start<banks::lod(s,r).end &&
-        r.end/(canopy::tileWorldSize(s)/Cells)<45.f;
+    return s.farBillboards&&r.end/(canopy::tileWorldSize(s)/Cells)<45.f;
+}
+// The shared directional ground canopy has no minimum range. Only
+// standalone far-flight impostors retain the old distance threshold.
+inline bool farEligible(const Settings& s,const Range& r) {
+    const auto levels=banks::lod(s,r);
+    return eligible(s,r)&&levels.start<levels.end;
 }
 } // namespace vc::billboards

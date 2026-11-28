@@ -42,7 +42,7 @@ void run(const Settings& s,const banks::Volume& volume,const billboards::Atlas& 
             const auto lod=banks::hybridLod(s,full,z,v.pos.z);
             const auto* sharedLod=directional?&lod:nullptr;
             const float column=directional?banks::columnShare(s,v,z):1.f;
-            const bool distant=directional||billboards::eligible(s,local);
+            const bool distant=directional||billboards::farEligible(s,local);
             drift.update(s,{.2f,.1f,0},.016f);
             const auto start=Clock::now();
             if(column<=1.f/255.f)canopy.indices.clear();else canopyVolume::mesh(canopy,relief,s,v,full,drift,.94f,.53f,blend,directional?nullptr:&local);

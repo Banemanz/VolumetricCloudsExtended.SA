@@ -189,7 +189,8 @@ and [pure-device GetViewport documentation](https://learn.microsoft.com/en-us/wi
   by default; the transition ends 10% of the draw distance later
   (at least 350m, not beyond draw distance). At 8000m, that means full
   3D up to 5200m, blended 3D/cards to 6000m, cards beyond. At 4200m,
-  there are no billboards. The two geometric representations crossfade
+  there are no far-flight billboards, but the same directional canopy is
+  available below the cloud deck. The two geometric representations crossfade
   over distance, not camera height or heading.
 - **Directional canopy and far LOD:** project the exact clear/wet volume
   into two 1024² atlases, 25 overlapping periodic world cells × 8
@@ -806,3 +807,13 @@ Z30 mixed 10.382→5.903ms, Z443 mixed 40.065→26.079ms, Z635 mixed
 111.316→84.409ms. These are paired **WARP** measurements, not 2006
 hardware or GTA frame times; a prior runner's absolute timings are
 not directly comparable.
+
+
+The directional canopy is now available even for older short-range
+INIs (e.g. 4200m), independently of whether the flight far-billboard
+threshold falls outside the configured draw range. At full flight
+height a short-range configuration uses real volume through its entire
+configured range. The procedural cache is reusable across eligible
+short and long ranges; an old short-range cache without the atlas
+invalidates by its bake signature. Explicit `FarBillboards=0` still
+selects the legacy path.
