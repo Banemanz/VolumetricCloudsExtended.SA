@@ -291,15 +291,35 @@ inline Options options(const D3DCAPS9& caps) {
 }
 struct StateScope {
     IDirect3DStateBlock9* block=nullptr;
+    bool active=false;
     Result capture(IDirect3DDevice9* d) {
-        return failed(d->CreateStateBlock(D3DSBT_ALL,&block),"CreateStateBlock(ALL)");
+        // The caller owns this snapshot for exactly one device lifetime.
+        // Capture refreshes every state: never assume the game left a state
+        // unchanged across frames. Re-create if a driver rejects recapture.
+        if(active)return failed(E_FAIL,"nested cloud state capture");
+        HRESULT hr=block?block->Capture():E_FAIL;
+        if(FAILED(hr)) {
+            release();
+            hr=d->CreateStateBlock(D3DSBT_ALL,&block);
+        }
+        active=SUCCEEDED(hr);
+        return failed(hr,"Capture/CreateStateBlock(ALL)");
     }
     Result restore() {
-        if(!block)return {};
-        const auto hr=block->Apply();block->Release();block=nullptr;
+        if(!active)return {};
+        active=false;
+        const auto hr=block->Apply();
+        if(FAILED(hr))release();
         return failed(hr,"StateBlock::Apply");
     }
-    ~StateScope(){restore();}
+    void release() {
+        if(active)restore();
+        if(block){block->Release();block=nullptr;}
+    }
+    ~StateScope(){release();}
+    StateScope()=default;
+    StateScope(const StateScope&)=delete;
+    StateScope& operator=(const StateScope&)=delete;
 };
 // Dynamic streaming avoids a driver-side UP copy; DISCARD lets the driver
 // rename busy buffers rather than stall the CPU waiting for the previous frame.
@@ -308,14 +328,17 @@ struct GpuStream {
     IDirect3DVertexDeclaration9* declaration{};
     IDirect3DVertexBuffer9* vb{};
     IDirect3DIndexBuffer9* ib{};
+    std::vector<banks::GpuVertex> resident;
+    bool residentValid=false;
     bool available() const {return shader&&declaration&&vb&&ib;}
     void release() {
         if(vb)vb->Release();if(ib)ib->Release();
         if(shader)shader->Release();if(declaration)declaration->Release();
         vb=nullptr;ib=nullptr;shader=nullptr;declaration=nullptr;
+        residentValid=false;resident.clear();
     }
     ~GpuStream(){release();}
-    bool create(IDirect3DDevice9* d,const D3DCAPS9& caps,DWORD behavior) {
+    bool create(IDirect3DDevice9* d,const D3DCAPS9& caps,DWORD behavior,const DWORD* comparisonShader=nullptr) {
         release();
 #ifdef VC_GPU_VERTEX
         if(caps.VertexShaderVersion<D3DVS_VERSION(2,0)||!(behavior&D3DCREATE_HARDWARE_VERTEXPROCESSING))return false;
@@ -328,7 +351,7 @@ struct GpuStream {
         static_assert(sizeof(cloudBankVS)%sizeof(DWORD)==0);
         std::array<DWORD,sizeof(cloudBankVS)/sizeof(DWORD)> code{};
         std::memcpy(code.data(),cloudBankVS,sizeof(cloudBankVS));
-        if(SUCCEEDED(d->CreateVertexShader(code.data(),&shader))&&
+        if(SUCCEEDED(d->CreateVertexShader(comparisonShader?comparisonShader:code.data(),&shader))&&
            SUCCEEDED(d->CreateVertexDeclaration(elements,&declaration))&&
            SUCCEEDED(d->CreateVertexBuffer(UINT(banks::MaxVertices*sizeof(banks::GpuVertex)),D3DUSAGE_DYNAMIC|D3DUSAGE_WRITEONLY,0,D3DPOOL_DEFAULT,&vb,nullptr))&&
            SUCCEEDED(d->CreateIndexBuffer(UINT(banks::MaxVertices/4*6*sizeof(std::uint16_t)),D3DUSAGE_WRITEONLY,D3DFMT_INDEX16,D3DPOOL_DEFAULT,&ib,nullptr))) {
@@ -348,17 +371,34 @@ struct GpuStream {
         }
         release();
 #else
-        (void)d;(void)caps;(void)behavior;
+        (void)d;(void)caps;(void)behavior;(void)comparisonShader;
 #endif
         return false;
     }
     Result upload(const banks::GpuMesh& mesh) {
+        residentValid=false; // a DISCARD invalidates any previous shadow
         void* data=nullptr;
         const UINT vbytes=UINT(mesh.vertices.size()*sizeof(banks::GpuVertex));
         HRESULT hr=vb->Lock(0,vbytes,&data,D3DLOCK_DISCARD);
         if(FAILED(hr))return failed(hr,"cloud VB lock");
         std::memcpy(data,mesh.vertices.data(),vbytes);
         return failed(vb->Unlock(),"cloud VB unlock");
+    }
+    // The input vertices are a world-fixed position + lattice code. They
+    // can remain identical for many frames even while weather, lighting,
+    // camera and wind uniforms change. Keep exact bytes (not a hash).
+    // After a successful upload swap CPU arrays; next build reuses the
+    // old allocation without copying into a second shadow buffer.
+    Result uploadReusable(banks::GpuMesh& mesh,bool* reused=nullptr) {
+        if(reused)*reused=false;
+        if(residentValid&&mesh.vertices.size()==resident.size()&&
+           (resident.empty()||std::memcmp(mesh.vertices.data(),resident.data(),resident.size()*sizeof(banks::GpuVertex))==0)) {
+            if(reused)*reused=true;
+            return {};
+        }
+        const auto result=upload(mesh);
+        if(result){resident.swap(mesh.vertices);residentValid=true;}
+        return result;
     }
 };
 struct GpuPasses {
@@ -408,20 +448,28 @@ struct GpuPasses {
         if(FAILED(hr=d->SetStreamSource(0,stream->vb,0,sizeof(banks::GpuVertex))))return failed(hr,"cloud stream");
         if(FAILED(hr=d->SetStreamSourceFreq(0,1)))return failed(hr,"cloud stream frequency");
         if(FAILED(hr=d->SetIndices(stream->ib)))return failed(hr,"cloud indices");
+        bool constantsSet=false,viewportChanged=false;
         for(int pass=0;pass<2;++pass) {
             const auto range=restrictedCount==count?ranges[pass]:banks::VertexRange{0,count};
             if(!range.count())continue;
             const auto& m=pass?scene:distant;
             for(int i=0;i<4;++i)constants[i]={m.m[0][i],m.m[1][i],m.m[2][i],m.m[3][i]};
-            if(FAILED(hr=d->SetVertexShaderConstantF(0,constants[0].data(),UINT(constants.size()))))break;
-            auto vp=viewport;if(!pass)vp.MinZ=vp.MaxZ;
-            if(FAILED(hr=d->SetViewport(&vp)))break;
+            // All non-matrix uniforms are identical between passes.
+            if(FAILED(hr=d->SetVertexShaderConstantF(0,constants[0].data(),constantsSet?4u:UINT(constants.size()))))break;
+            constantsSet=true;
+            // The common scene-only path already has the correct viewport.
+            // Restore it only if the distant pass actually changed it.
+            if(!pass||viewportChanged) {
+                auto vp=viewport;if(!pass)vp.MinZ=vp.MaxZ;
+                if(FAILED(hr=d->SetViewport(&vp)))break;
+                viewportChanged=!pass;
+            }
             // Reversed IB: a subrange's last (farthest) vertex selects
             // its first index. No primitives are reordered or split.
             if(FAILED(hr=d->DrawIndexedPrimitive(D3DPT_TRIANGLELIST,0,range.begin,range.count(),
                 UINT((banks::MaxVertices-range.end)/4*6),restrictedCount==count?range.count()/2:triangles)))break;
         }
-        const auto restore=d->SetViewport(&viewport);
+        const auto restore=viewportChanged?d->SetViewport(&viewport):S_OK;
         return FAILED(restore)?failed(restore,"cloud viewport restore"):failed(hr,"hardware cloud draw");
     }
 };

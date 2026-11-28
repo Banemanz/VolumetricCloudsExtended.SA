@@ -30,8 +30,14 @@ Output main(float3 position : POSITION, float4 lattice : TEXCOORD0) {
     float3 weights=saturate((ad/max(max(max(ad.x,ad.y),ad.z),.001)-.8)*5);
     weights=weights*weights*(3-2*weights);
     float3 axis=lattice.rgb; // exact one-hot D3DCOLOR channels
+#ifdef VC_REFERENCE_VERTEX
     float parity=floor(lattice.a*2+.5);
     float even=min(parity,1),fourth=max(parity-1,0);
+#else
+    // D3DCOLOR alpha has exactly three possible values: 0, 128/255, 1.
+    // Two VS2 comparisons decode the same binary flags without floor.
+    float even=step(.25,lattice.a),fourth=step(.75,lattice.a);
+#endif
     float w=dot(weights,axis)/max(dot(weights,float3(1,1,1)),.0001);
     float cosine=dot(ad,axis)/max(d,.001);
     float fine=1-ease((d-140)/300);

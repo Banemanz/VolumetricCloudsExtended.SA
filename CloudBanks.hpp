@@ -1,6 +1,7 @@
 #pragma once
 #include "Canopy.hpp"
 #include <type_traits>
+#include <new>
 
 // Continuous world-space density sampled on fixed world-axis lattices.
 // Camera motion never translates or rotates the sampling planes.
@@ -118,6 +119,52 @@ struct Volume {
     int width{},depth{};
     std::array<std::array<std::uint8_t,OccupancyXY*OccupancyXY*OccupancyZ>,2> occupied{};
     std::array<std::array<std::uint16_t,OccupancyPrefixCount>,2> occupiedPrefix{};
+    // One byte encodes all eight Z occupancy cells for any periodic XY
+    // rectangle. Precomputed once; no per-frame prefix sum gathers.
+    // Two weather endpoints plus their exact logical union.
+    std::array<std::vector<std::uint8_t>,3> rectangleMask;
+    static constexpr std::size_t RectangleCount=OccupancyXY*OccupancyXY*OccupancyXY*OccupancyXY;
+    static std::size_t rectangleIndex(int x,int y,int width,int height) {
+        return ((std::size_t(width-1)*OccupancyXY+height-1)*OccupancyXY+y)*OccupancyXY+x;
+    }
+    void buildRectangleMasks() {
+        // The normal bake has clear density as a subset of overcast.
+        // Check that invariant, rather than assuming it for future caches.
+        // Avoid a redundant 64 KiB union table in that common case.
+        bool subset=true;
+        for(std::size_t i=0;i<occupied[0].size();++i)
+            if(occupied[0][i]&&!occupied[1][i]){subset=false;break;}
+        try {
+            for(int layer=0;layer<3;++layer) {
+                if(layer==2&&subset){rectangleMask[layer].clear();break;}
+                rectangleMask[layer].assign(RectangleCount,0);
+            }
+        } catch(const std::bad_alloc&) {
+            for(auto& table:rectangleMask)std::vector<std::uint8_t>().swap(table);
+            return; // retain the exact prefix path on memory-starved devices
+        }
+        for(int layer=0;layer<3;++layer) {
+            auto& table=rectangleMask[layer];
+            if(table.empty())continue;
+            for(int y=0;y<OccupancyXY;++y)for(int x=0;x<OccupancyXY;++x) {
+                std::uint8_t m=0;
+                for(int z=0;z<OccupancyZ;++z) {
+                    const auto i=(z*OccupancyXY+y)*OccupancyXY+x;
+                    if(layer==2?(occupied[0][i]||occupied[1][i]):occupied[layer][i])m|=1u<<z;
+                }
+                table[rectangleIndex(x,y,1,1)]=m;
+            }
+            for(int w=1;w<=OccupancyXY;++w)for(int h=1;h<=OccupancyXY;++h) {
+                if(w==1&&h==1)continue;
+                for(int y=0;y<OccupancyXY;++y)for(int x=0;x<OccupancyXY;++x) {
+                    const auto m=w>1?
+                        table[rectangleIndex(x,y,w-1,h)]|table[rectangleIndex((x+w-1)%OccupancyXY,y,1,h)]:
+                        table[rectangleIndex(x,y,1,h-1)]|table[rectangleIndex(x,(y+h-1)%OccupancyXY,1,1)];
+                    table[rectangleIndex(x,y,w,h)]=std::uint8_t(m);
+                }
+            }
+        }
+    }
     static std::size_t prefixIndex(int x,int y,int z) {
         return (std::size_t(z)*OccupancySpan+y)*OccupancySpan+x;
     }
@@ -237,6 +284,7 @@ struct Volume {
                     -at(x-1,y-1,z)-at(x-1,y,z-1)-at(x,y-1,z-1)+at(x-1,y-1,z-1));
             }
         }
+        buildRectangleMasks();
     }
     struct CellRange {int first,last;}; // half-open, wrapped XY / clamped Z
     struct CellBox {std::array<CellRange,3> axis;};
@@ -251,6 +299,13 @@ struct Volume {
         const auto [xa,xb]=box.axis[0];
         const auto [ya,yb]=box.axis[1];
         const auto [za,zb]=box.axis[2];
+        const bool clear=weather<.999f,wet=weather>.001f;
+        if(!clear&&!wet)return false;
+        const auto& table=rectangleMask[clear&&wet&&!rectangleMask[2].empty()?2:wet?1:0];
+        if(!table.empty()) {
+            const auto zMask=(1u<<zb)-(1u<<za);
+            return (table[rectangleIndex(xa,ya,xb-xa,yb-ya)]&zMask)!=0;
+        }
         const auto count=[&](int layer) {
             const auto& p=occupiedPrefix[layer];
             const auto at=[&](int x,int y,int z){return int(p[prefixIndex(x,y,z)]);};

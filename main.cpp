@@ -39,6 +39,7 @@ int canopySize=0;
 std::array<bool,2> canopyHasPixels{};
 vc::d3d9::Options canopyOptions;
 vc::d3d9::CloudProfiler cloudProfiler;
+vc::d3d9::StateScope cloudState;
 vc::d3d9::ProjectedMesh canopyProjected,bankProjected;
 vc::canopyVolume::Relief canopyRelief;
 vc::canopyVolume::Mesh canopyReliefMesh;
@@ -120,6 +121,7 @@ void LoadIni() {
 }
 
 void ReleaseCanopyTextures() {
+    cloudState.release();
     cloudProfiler.release();
     for(auto& texture:canopyTextures){if(texture)texture->Release();texture=nullptr;}
     canopyDevice=nullptr;canopyUploadFailed=false;
@@ -546,6 +548,7 @@ bool DrawBanks(RwCamera* camera,const vc::View& view,const vc::Range& range,
     vc::d3d9::GpuPasses passes;
     passes.stream=&bankGpu;
     bool useGpu=false;
+    UINT gpuCount=0;
     const auto weather=bankOptions.dual?climate.coverage:(climate.coverage>=.5f?1.f:0.f);
     const auto* occupancy=bankDownsampled?nullptr:&bankVolume;
     try {
@@ -557,7 +560,8 @@ bool DrawBanks(RwCamera* camera,const vc::View& view,const vc::Range& range,
             vc::banks::buildMesh(bankGpuMesh,settings,view,range,canopyDrift,wx,wy,occupancy,weather,farReady);
             if(bankGpuMesh.vertices.empty())return true;
             passes.restrictTo(bankGpuMesh);
-            const auto uploaded=bankGpu.upload(bankGpuMesh);
+            gpuCount=UINT(bankGpuMesh.vertices.size());
+            const auto uploaded=bankGpu.uploadReusable(bankGpuMesh);
             if(!uploaded) {
                 LogD3DFailure("hardware cloud upload; using CPU",uploaded);
                 bankGpu.release();useGpu=false;
@@ -583,7 +587,7 @@ bool DrawBanks(RwCamera* camera,const vc::View& view,const vc::Range& range,
     }
     const bool queryThisDraw=bankPixelQuery&&bankQueryFrames==0&&!bankDrawLogged;
     const auto result=useGpu?vc::d3d9::drawRaw(bankDevice,{bankTextures[0],bankTextures[1]},bankOptions,
-        bankGpuMesh.vertices.data(),UINT(bankGpuMesh.vertices.size()),sizeof(vc::banks::GpuVertex),0,
+        nullptr,gpuCount,sizeof(vc::banks::GpuVertex),0,
         nullptr,UINT(bankGpuMesh.triangleCount()),climate.coverage,bankOptions.vertexFog,
         true,false,D3DCOLOR_XRGB(vc::d3d9::byte(fog.r),vc::d3d9::byte(fog.g),vc::d3d9::byte(fog.b)),
         nullptr,nullptr,false,&passes,&states):
@@ -707,8 +711,7 @@ void __cdecl RenderClouds() {
             if(device&&SUCCEEDED(device->GetViewport(&viewport))) {
                 plugin::Call<0x7FC200>(); // flush RW pending state before snapshot
                 const bool profiled=cloudProfiler.begin(device,Log);
-                vc::d3d9::StateScope state;
-                const auto captured=state.capture(device);
+                const auto captured=cloudState.capture(device);
                 if(captured) {
                     bool drawn=false;
                     try {
@@ -723,7 +726,7 @@ void __cdecl RenderClouds() {
                             bankFailed=true;Log("3D cloud draw failed; retaining full canopy from next frame.");
                         }
                     } catch(const std::bad_alloc&) {Log("Cloud projection allocation failed.");}
-                    const auto restored=state.restore();
+                    const auto restored=cloudState.restore();
                     cloudProfiler.end(profiled,drawn&&bool(restored),playerZ,climate.coverage,volumeReady?localVolume.end:0.f,Log);
                     if(!restored){LogD3DFailure("restore",restored);return;}
                     if(drawn) {haveFrame=true;lastFrame=frameId;return;}

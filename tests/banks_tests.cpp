@@ -103,6 +103,30 @@ int main() {
             CHECK(b.potentiallyOccupied(u0,v0,w0,u1,v1,w1,weather)==expected);
         }
     }
+    // Exhaust all 65,536 wrapped rectangles and 36 Z intervals, in
+    // each of the three weather cases, against the old prefix-sum path.
+    banks::Volume prefixOnly;
+    prefixOnly.occupiedPrefix=b.occupiedPrefix;
+    std::size_t queries=0;
+    for(int x=0;x<banks::OccupancyXY;++x)for(int y=0;y<banks::OccupancyXY;++y)
+    for(int w=1;w<=banks::OccupancyXY;++w)for(int h=1;h<=banks::OccupancyXY;++h)
+    for(int z=0;z<banks::OccupancyZ;++z)for(int top=z+1;top<=banks::OccupancyZ;++top) {
+        const banks::Volume::CellBox box{{{{x,x+w},{y,y+h},{z,top}}}};
+        for(float weather:{0.f,.001f,.5f,.999f,1.f}) {
+            CHECK(b.potentiallyOccupied(box,weather)==prefixOnly.potentiallyOccupied(box,weather));
+            ++queries;
+        }
+    }
+    std::cout<<"Exact rectangular mask checks: "<<queries<<"\n";
+    banks::Volume endpoints;
+    endpoints.occupied[0][0]=255;
+    endpoints.occupied[1][1]=255;
+    endpoints.buildRectangleMasks();
+    CHECK(!endpoints.rectangleMask[2].empty());
+    CHECK(endpoints.potentiallyOccupied(0.f,0.f,0.f,0.f,0.f,0.f,.5f));
+    CHECK(endpoints.potentiallyOccupied(1.f/16,0.f,0.f,1.f/16,0.f,0.f,.5f));
+    CHECK(!endpoints.potentiallyOccupied(0.f,0.f,0.f,0.f,0.f,0.f,1.f));
+    CHECK(!endpoints.potentiallyOccupied(1.f/16,0.f,0.f,1.f/16,0.f,0.f,0.f));
     // Actual underneath projection of the volume: test source-resolution
     // optical integration against an independent product of transmittance.
     canopyVolume::MaskPair projection;

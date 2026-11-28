@@ -53,6 +53,13 @@ jobs:
           if (!(Test-Path build/generated/CloudBankVS.hpp)) { throw "Hardware cloud vertex bytecode was not built" }
           ctest --test-dir build -C Release --verbose
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Synthetic D3D9 cloud workload (not target hardware)
+        shell: pwsh
+        run: |
+          & build/Release/d3d9_volume_test.exe --benchmark 640 480
+          if ($LASTEXITCODE -notin @(0,77)) { exit $LASTEXITCODE }
+          & build/Release/d3d9_volume_test.exe --benchmark 1024 768
+          if ($LASTEXITCODE -notin @(0,77)) { exit $LASTEXITCODE }
       - name: Package Win32 plugin
         shell: pwsh
         run: |

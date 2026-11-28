@@ -79,6 +79,7 @@ inline bool load(std::istream& in,const Settings& s,int size,Masks& masks,banks:
     std::uint64_t check=0;
     if(!in.read(reinterpret_cast<char*>(&check),sizeof(check))||check!=h.value||
        in.peek()!=std::char_traits<char>::eof())return false;
+    if(s.hybridClouds)v.buildRectangleMasks();
     masks=std::move(m);volume=std::move(v);atlas=std::move(a);
     return true;
 }

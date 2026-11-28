@@ -1146,3 +1146,53 @@ with the old art. Preserve all earlier exact source-mesh optimizations.
   30/317/400m both endpoints, visibility and foreground depth sentinel.
   Portable tests include independent optical product and fixed world
   vertex parity across camera rotation, monotonic local range, v3 cache.
+
+## CPU/GPU optimization continuation (no visual changes)
+
+User specifically does not want the potato owner to run profiling. Keep
+default art/geometry, all INI keys, existing v3 disk cache and PR #1 unchanged.
+CPU source-preparation workload now uses an exact periodic rectangular
+occupancy lookup, generated at startup from resident block maxima. With
+16 possible starting cells and 16 possible widths along each XY axis,
+one byte covers all eight vertical cells per rectangle: 65,536 bytes
+per endpoint. Use the wet table for a clear/wet union only if clear is
+provably a subset; otherwise derive a third table. Prefix-sum fallback
+remains for allocation failure. Nothing new is written to disk.
+Exhaustive portable testing compares 11,796,480 queries (all rectangles
+and Z intervals, five coverage values) against the old prefix query and
+tests disjoint endpoints separately. Same 1,440-pose old/new CPU/index/
+GPU/span FNV-1a hash 4690002431142756287, 26,169,700 vertices, same compiler
+and FP flags. Existing terrain-independent draw distance and handover stay
+untouched. Earlier three paired source-mesh timings for the initial lookup
+implementation: 0.257/0.240, 0.260/0.244, 0.253/0.241 ms GPU-source means.
+Linux Xeon measurements, not target timings.
+
+GpuStream::uploadReusable compares exact bytes and swaps CPU buffers after
+a successful DISCARD. On equality the existing GPU buffer is reused;
+no temporal approximation, hash collision, or delayed update. Main saves
+the vertex count before this swap. A failed upload/restore preserves
+existing fallback/error handling. Device loss/reset invalidates the resident
+buffer. VS2 parity decode uses two comparisons: 0, 128/255, 1 decode
+identically to the previous floor. Test compiles the original parity
+shader as a separate reference; the shipping ASI uses only the new shader.
+The two-pass projection still obeys the same clipping and depth settings;
+only redundant matrix constants/viewport calls are removed. Reuse the
+D3DSBT_ALL snapshot object but Capture current game state every frame;
+release on canopy resource/device release. The scope does not modify
+individual lights, which Microsoft documents are not captured if created
+after a state block. The test renders native color-write sentinels after
+two different game-state snapshots, even on pure devices.
+
+Standalone D3D9 synthetic workload in tests/d3d9_cloud_benchmark.hpp
+runs through the existing d3d9_volume_test.exe --benchmark W H mode.
+It uses actual upload paths including native compact formats, camera
+matrices, canopy, volume, distant atlas, weather endpoints and depth,
+actual event-fenced completion and GPU timestamps where valid.
+No synchronization or diagnostic overhead added to runtime. CI measures
+640x480 and 1024x768; results depend on its adapter, which is logged.
+No GPU exposed to local Linux, no GTA executable, and no cycle-accurate
+Sandy Bridge graphics emulator. Synthetic CPU single-core contention and
+native D3D9 workload counts/timings are useful independent comparisons,
+not an estimate of actual target frame time. No new screenshots needed
+for a lossless optimization; the native readback compares old/new shader,
+range trimming, exact resident VB use and state restoration.

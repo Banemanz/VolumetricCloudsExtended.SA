@@ -19,6 +19,7 @@ int main(){
     const auto equal=[](const auto& x,const auto& y){return x.size()==y.size()&&(x.empty()||!std::memcmp(x.data(),y.data(),x.size()*sizeof(vc::canopy::Pixel)));};
     for(int i=0;i<2;++i){CHECK(equal(m[i],loaded[i]));CHECK(equal(v.pixels[i],lv.pixels[i]));CHECK(equal(a.pixels[i],la.pixels[i]));}
     CHECK(v.occupied==lv.occupied&&v.occupiedPrefix==lv.occupiedPrefix&&a.occupied==la.occupied);
+    CHECK(v.rectangleMask==lv.rectangleMask);
     // The compressed layout is unchanged, but the art is different.
     // Reject older versions even if they have the same dimensions.
     for(std::uint32_t version:{1u,2u}) {

@@ -8,6 +8,11 @@
 #include <windows.h>
 #include <cstdio>
 #include <cmath>
+#include <cstdlib>
+#include "d3d9_cloud_benchmark.hpp"
+#ifdef VC_GPU_VERTEX
+#include "CloudBankReferenceVS.hpp"
+#endif
 
 using namespace vc;
 namespace {
@@ -270,11 +275,17 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
     const float wx=.94f,wy=.53f;
     const Vec forward=unit(Vec{.96f,-.27f,-.17f});
     const Vec right=unit(cross(forward,{0,0,1})),up=cross(right,forward);
-    d3d9::GpuStream hw;
+    d3d9::GpuStream hw,referenceHw;
 #ifdef VC_GPU_VERTEX
     const bool expectHardware=caps.VertexShaderVersion>=D3DVS_VERSION(2,0)&&
         (creation.BehaviorFlags&D3DCREATE_HARDWARE_VERTEXPROCESSING);
     if(expectHardware&&!hw.create(device,caps,creation.BehaviorFlags))return fail("VS2 hardware stream creation");
+    static_assert(sizeof(cloudBankReferenceVS)%sizeof(DWORD)==0);
+    std::array<DWORD,sizeof(cloudBankReferenceVS)/sizeof(DWORD)> referenceCode{};
+    std::memcpy(referenceCode.data(),cloudBankReferenceVS,sizeof(cloudBankReferenceVS));
+    if(expectHardware&&!referenceHw.create(device,caps,creation.BehaviorFlags,referenceCode.data()))
+        return fail("Reference VS2 stream creation");
+    std::printf("VS2 bytecode: previous %zu bytes, new %zu bytes\n",sizeof(cloudBankReferenceVS),sizeof(cloudBankVS));
 #endif
     // Ground and climb: render the actual shared-density canopy and its
     // limited nearby 3D complement with a short scene far clip.
@@ -440,6 +451,7 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
                     D3DCOLOR_XRGB(90,120,160),nullptr,nullptr,true,&selected);
                 return SUCCEEDED(device->EndScene())&&bool(result);
             };
+            if(!referenceHw.available()||!referenceHw.upload(gm))return fail("Reference shader upload");
             std::size_t saved=0;
             for(float sceneDistance:{75.f,450.f,1800.f,12000.f}) {
                 auto pr=projection;
@@ -456,6 +468,20 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
                 if(!renderHardware(trimmed))return fail("Range-trimmed draw");
                 std::printf("Scene clip %.0f: %u of %zu two-pass input vertices\n",sceneDistance,submitted,2*gm.vertices.size());
                 if(!exact("Range-trimmed two-pass draw",full))return fail("Visual regression from pass range trimming");
+                trimmed.stream=&referenceHw;
+                if(!renderHardware(trimmed)||!exact("Simplified lattice shader",full))return fail("VS2 parity simplification changed RGB");
+                trimmed.stream=&hw;
+                // Reuse a resident VB only for an exactly equal source mesh.
+                // Exercise both the first DISCARD and the no-lock path.
+                auto temp=gm;bool reused=false;
+                if(!hw.uploadReusable(temp,&reused))return fail("Reusable VB upload");
+                temp=gm;
+                if(!hw.uploadReusable(temp,&reused)||!reused)return fail("Identical VB not reused");
+                if(!renderHardware(trimmed)||!exact("Resident VB reuse",full))return fail("Resident VB changed RGB");
+                // A one-bit lattice/position edit must invalidate reuse.
+                temp=gm;temp.vertices[0].lattice^=1u;
+                if(!hw.uploadReusable(temp,&reused)||reused)return fail("Changed VB incorrectly reused");
+                if(!hw.upload(gm))return fail("Restore reference VB");
                 if(sceneDistance==12000.f&&trimmed.ranges[0].count()!=0)return fail("Failed to omit empty distant pass");
             }
             if(!saved)return fail("Pass range trimming failed to reduce submissions");
@@ -524,10 +550,15 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
     // state cache. Includes stage 1/2 enable/disable, filter/fog toggles,
     // different texture types and repeated coverage. Never use state getters.
     std::vector<DWORD> uncached;
+    d3d9::StateScope sequenceScope;
     for(int fast=0;fast<2;++fast) {
         if(FAILED(hr=device->Clear(0,nullptr,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER,0xFF000000,1.f,0)))return fail("State sequence clear",hr);
         if(FAILED(hr=device->BeginScene()))return fail("State sequence begin",hr);
-        d3d9::StateScope scope;if(!scope.capture(device))return fail("State sequence capture");
+        // Different game state on each frame. A stale snapshot must not
+        // survive recapture, even on a pure device.
+        const DWORD mask=fast?D3DCOLORWRITEENABLE_RED:D3DCOLORWRITEENABLE_GREEN;
+        if(FAILED(hr=device->SetRenderState(D3DRS_COLORWRITEENABLE,mask)))return fail("State sequence sentinel",hr);
+        if(!sequenceScope.capture(device))return fail("State sequence capture");
         d3d9::DrawState states;
         auto* cache=fast?&states:nullptr;
         for(int i=0;i<2;++i) {
@@ -540,18 +571,49 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
             result=d3d9::drawProjected(device,{textures[0],textures[1]},opts,projected,coverage,true,{90,120,160},false,false,cache);
             if(!result)return fail(result.operation,result.hr);
         }
-        if(!scope.restore())return fail("State sequence restore");
+        if(!sequenceScope.restore())return fail("State sequence restore");
+        if(!(creation.BehaviorFlags&D3DCREATE_PUREDEVICE)) {
+            DWORD restoredMask=0;
+            if(FAILED(hr=device->GetRenderState(D3DRS_COLORWRITEENABLE,&restoredMask))||restoredMask!=mask)
+                return fail("Recaptured game write mask not restored",hr);
+        }
         if(FAILED(hr=device->EndScene()))return fail("State sequence end",hr);
         if(fast) {
             if(!exact("Scoped render-state deduplication",uncached))return fail("State deduplication visual regression");
             std::printf("State calls: %u of %u sent, %u skipped\n",states.calls,states.calls+states.skipped,states.skipped);
             if(states.skipped<=states.calls)return fail("State deduplication failed to remove repeated calls");
         } else if(!capture(uncached))return fail("Uncached state sequence readback");
+        // The colour write mask is not touched by this native sentinel.
+        // It can test the restored state with no forbidden pure-device gets.
+        if(FAILED(hr=device->Clear(0,nullptr,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER,0xFF000000,1.f,0)))return fail("Snapshot sentinel clear",hr);
+        if(FAILED(hr=device->BeginScene()))return fail("Snapshot sentinel begin",hr);
+        set(device->SetVertexShader(nullptr));set(device->SetPixelShader(nullptr));
+        set(device->SetFVF(D3DFVF_XYZRHW|D3DFVF_DIFFUSE));
+        set(device->SetRenderState(D3DRS_LIGHTING,FALSE));set(device->SetRenderState(D3DRS_FOGENABLE,FALSE));
+        set(device->SetRenderState(D3DRS_ZENABLE,FALSE));set(device->SetRenderState(D3DRS_ALPHABLENDENABLE,FALSE));
+        set(device->SetRenderState(D3DRS_ALPHATESTENABLE,FALSE));set(device->SetRenderState(D3DRS_CULLMODE,D3DCULL_NONE));
+        set(device->SetTextureStageState(0,D3DTSS_COLOROP,D3DTOP_SELECTARG1));
+        set(device->SetTextureStageState(0,D3DTSS_COLORARG1,D3DTA_DIFFUSE));
+        set(device->SetTextureStageState(0,D3DTSS_ALPHAOP,D3DTOP_SELECTARG1));
+        set(device->SetTextureStageState(0,D3DTSS_ALPHAARG1,D3DTA_DIFFUSE));
+        set(device->SetTextureStageState(1,D3DTSS_COLOROP,D3DTOP_DISABLE));
+        struct Screen {float x,y,z,w;DWORD rgba;};
+        const Screen tri[]={{0,0,.5f,1,0xFFFFFFFF},{float(desc.Width),0,.5f,1,0xFFFFFFFF},{0,float(desc.Height),.5f,1,0xFFFFFFFF}};
+        set(device->DrawPrimitiveUP(D3DPT_TRIANGLELIST,1,tri,sizeof(Screen)));
+        set(device->EndScene());
+        if(FAILED(hr))return fail("Snapshot sentinel draw",hr);
+        std::vector<DWORD> native;if(!capture(native))return fail("Snapshot sentinel capture");
+        const auto value=native[std::size_t(desc.Height/4)*desc.Width+desc.Width/4]&0xFFFFFFu;
+        if(value!=(fast?0xFF0000u:0x00FF00u))return fail("State block recapture leaked game state");
+        std::printf("Refreshed state block native sentinel: %06lX\n",static_cast<unsigned long>(value));
     }
     return 0;
 }
 }
-int main() {
+int main(int argc,char** argv) {
+    const bool bench=argc==4&&std::strcmp(argv[1],"--benchmark")==0;
+    const UINT width=bench?UINT(std::atoi(argv[2])):128u,height=bench?UINT(std::atoi(argv[3])):128u;
+    if(!width||!height||width>1920||height>1080)return 1;
     const HWND window=CreateWindowExA(0,"STATIC","D3D9 volume test",WS_OVERLAPPEDWINDOW,
         0,0,128,128,nullptr,nullptr,GetModuleHandleA(nullptr),nullptr);
     if(!window){std::puts("SKIP: cannot create test window.");return 77;}
@@ -562,6 +624,7 @@ int main() {
     // Non-pure HAL and software REF are secondary coverage, not proof of PURE.
     bool any=false,pure=false;
     for(auto type:{D3DDEVTYPE_HAL,D3DDEVTYPE_REF}) {
+        if(bench&&type==D3DDEVTYPE_REF)continue;
         D3DCAPS9 caps{};
         if(FAILED(api->GetDeviceCaps(D3DADAPTER_DEFAULT,type,&caps)))continue;
         for(DWORD flags:{DWORD(D3DCREATE_HARDWARE_VERTEXPROCESSING|D3DCREATE_PUREDEVICE),
@@ -569,7 +632,7 @@ int main() {
                          DWORD(D3DCREATE_SOFTWARE_VERTEXPROCESSING)}) {
             D3DPRESENT_PARAMETERS pp{};
             pp.Windowed=TRUE;pp.SwapEffect=D3DSWAPEFFECT_DISCARD;pp.hDeviceWindow=window;
-            pp.BackBufferWidth=pp.BackBufferHeight=128;pp.BackBufferFormat=D3DFMT_X8R8G8B8;
+            pp.BackBufferWidth=width;pp.BackBufferHeight=height;pp.BackBufferFormat=D3DFMT_X8R8G8B8;
             pp.EnableAutoDepthStencil=TRUE;pp.AutoDepthStencilFormat=D3DFMT_D16;
             Com<IDirect3DDevice9> device;
             const auto hr=api->CreateDevice(D3DADAPTER_DEFAULT,type,window,flags,&pp,&device.p);
@@ -580,7 +643,7 @@ int main() {
             }
             D3DCAPS9 actual{};
             if(FAILED(device->GetDeviceCaps(&actual)))return fail("GetDeviceCaps");
-            const int result=run(device.p,actual);
+            const int result=bench?synthetic::benchmark(device.p,actual):run(device.p,actual);
             if(result==77)continue;
             if(result!=0)return result;
             any=true;pure|=(flags&D3DCREATE_PUREDEVICE)!=0;
@@ -589,6 +652,7 @@ int main() {
         if(any)break;
     }
     if(!any){std::puts("SKIP: no available D3D9 volume-capable device.");return 77;}
+    if(bench)return 0;
     std::puts(pure?"PASS: actual pure-device 3D texture rendering/readback.":"PASS: actual non-pure 3D rendering/readback; PURE was unavailable.");
     return 0;
 }

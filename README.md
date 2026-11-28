@@ -578,3 +578,48 @@ refer to the cloud pass, not the complete game's frame. See
 Diagnostic software views (not GTA screenshots):
 [Ground](docs/previews/new_ground.jpg) · [Looking up](docs/previews/new_zenith.jpg) ·
 [Handover](docs/previews/new_entry.jpg) · [Above](docs/previews/new_above.jpg).
+
+### Additional low-end optimization and automatic D3D9 workload
+
+The cache and cloud art have not changed. At preload, derive byte-sized
+Z-occupancy masks for every rectangle of the 16x16 periodic XY occupancy
+grid. A query uses one table lookup plus a Z bit test instead of eight
+prefix sum reads per active weather endpoint. Clear is normally a subset
+of overcast; when it is not, build an exact union table. This uses 128 KiB
+normally (192 KiB worst case); allocation failure keeps the existing exact
+prefix queries. The existing v3 cache still loads without rebaking.
+
+The VS2 hardware path retains its fixed, 16-byte world-space vertices in
+the GPU buffer when the next mesh has identical bytes. No DISCARD lock,
+new driver allocation or transfer is needed on such frames. CPU vector
+storage is swapped, not copied. Camera, wind, weather and lighting uniforms
+still update normally. Changed geometry is streamed immediately. The
+three possible parity codes are decoded with two comparisons instead of
+floor/min/max; no texture samples or lighting equations changed. The second
+depth pass updates only matrix constants, and the viewport is set/restored
+only when the distant pass requires it. The all-state snapshot object is
+reused, but freshly captured every frame (released on device loss/reset).
+See Microsoft's [state blocks](https://learn.microsoft.com/en-us/windows/win32/api/d3d9helper/nf-d3d9helper-idirect3dstateblock9-capture)
+and [dynamic-buffer guidance](https://learn.microsoft.com/en-us/windows/win32/direct3d9/performance-optimizations).
+
+There is no need to profile a player's PC to run the synthetic workload.
+Win32 CI runs the real D3D9 cloud backend at 640x480 and 1024x768 with
+clear and mixed weather, fixed and moving cameras, five altitudes, actual
+texture uploads, cloud geometry, shader/fixed-function blend, and a depth
+occluder. Each case has 4 warm-up and 24 timed frames. It reports source
+preparation, driver submission, event-fenced completion, supported and
+valid GPU timestamp intervals, submitted vertex counts, average streamed
+bytes, exact VB reuse counts and alpha/depth-passing sample counts. The
+reported adapter/driver identifies what was actually measured. The event
+fence is benchmark-only, not a gameplay synchronization point. Negative
+GPU timing/sample fields mean unavailable, not zero cost.
+
+```powershell
+build/Release/d3d9_volume_test.exe --benchmark 640 480
+build/Release/d3d9_volume_test.exe --benchmark 1024 768
+```
+
+The Linux same-core stress benchmark and D3D9 synthetic yardstick are
+complementary, not an emulation of the Celeron 847/Intel HD Graphics,
+RenderWare world rendering, or shared-memory contention on that system.
+Do not convert their timings into an alleged in-game FPS for that hardware.
