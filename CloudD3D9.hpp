@@ -404,8 +404,8 @@ struct FarLayer {
         width=w;height=h;return true;
     }
     template<class Draw>
-    Result render(IDirect3DDevice9* d,const D3DVIEWPORT9& vp,Draw&& draw,bool& used,const RECT* bounds=nullptr,DrawState* states=nullptr) {
-        used=false;
+    Result render(IDirect3DDevice9* d,const D3DVIEWPORT9& vp,Draw&& draw,bool& used,const RECT* bounds=nullptr,DrawState* states=nullptr,bool* mutated=nullptr) {
+        used=false;if(mutated)*mutated=false;
         if(disabled||vp.Width<320||vp.Height<240)return {};
         if(capsDevice!=d) {
             if(FAILED(d->GetDeviceCaps(&caps)))return {};
@@ -432,6 +432,7 @@ struct FarLayer {
         const auto rs=[&](D3DRENDERSTATETYPE st,DWORD val){if(SUCCEEDED(hr))check(states?states->rs(d,st,val):d->SetRenderState(st,val));};
         const auto ts=[&](DWORD i,D3DTEXTURESTAGESTATETYPE st,DWORD val){if(SUCCEEDED(hr))check(states?states->ts(d,i,st,val):d->SetTextureStageState(i,st,val));};
         const auto ss=[&](D3DSAMPLERSTATETYPE st,DWORD val){if(SUCCEEDED(hr))check(states?states->ss(d,0,st,val):d->SetSamplerState(0,st,val));};
+        if(mutated)*mutated=true;
         check(d->SetDepthStencilSurface(nullptr));
         if(SUCCEEDED(hr))check(d->SetRenderTarget(0,surface));
         const D3DVIEWPORT9 reducedViewport{0,0,width,height,0,1};
@@ -576,7 +577,7 @@ struct GpuStream {
 struct GpuPasses {
     GpuStream* stream{};
     FarLayer* farLayer{};
-    bool usedFarLayer{};
+    bool usedFarLayer{},nestedScope{};
     std::array<std::array<float,4>,11> constants{};
     D3DMATRIX scene{},distant{};
     D3DVIEWPORT9 viewport{};
@@ -617,11 +618,16 @@ struct GpuPasses {
         ranges={mesh.rangeFor(distantPlane),mesh.rangeFor(scenePlane)};
         restrictedCount=UINT(mesh.vertices.size());
     }
-    Result draw(IDirect3DDevice9* d,UINT count,UINT triangles) {
-        HRESULT hr;
-        if(FAILED(hr=d->SetStreamSource(0,stream->vb,0,sizeof(banks::GpuVertex))))return failed(hr,"cloud stream");
-        if(FAILED(hr=d->SetStreamSourceFreq(0,1)))return failed(hr,"cloud stream frequency");
-        if(FAILED(hr=d->SetIndices(stream->ib)))return failed(hr,"cloud indices");
+    template<class Configure>
+    Result draw(IDirect3DDevice9* d,UINT count,UINT triangles,DrawState* states,Configure&& configure) {
+        HRESULT hr=S_OK;
+        const auto bindStream=[&]()->Result {
+            HRESULT status;
+            if(FAILED(status=d->SetStreamSource(0,stream->vb,0,sizeof(banks::GpuVertex))))return failed(status,"cloud stream");
+            if(FAILED(status=d->SetStreamSourceFreq(0,1)))return failed(status,"cloud stream frequency");
+            return failed(d->SetIndices(stream->ib),"cloud indices");
+        };
+        const auto bound=bindStream();if(!bound)return bound;
         bool constantsSet=false,viewportChanged=false;
         for(int pass=0;pass<2;++pass) {
             const auto range=restrictedCount==count?ranges[pass]:banks::VertexRange{0,count};
@@ -643,11 +649,29 @@ struct GpuPasses {
             const auto draw=[&]{return d->DrawIndexedPrimitive(D3DPT_TRIANGLELIST,0,range.begin,range.count(),
                 UINT((banks::MaxVertices-range.end)/4*6),restrictedCount==count?range.count()/2:triangles);};
             if(!pass&&farLayer&&range.count()>=1024) {
-                const auto result=farLayer->render(d,viewport,draw,usedFarLayer);
+                auto* group=nestedScope?nullptr:states;
+                bool mutated=false;
+                const auto result=farLayer->render(d,viewport,draw,usedFarLayer,nullptr,group,&mutated);
                 if(!result){hr=result.hr;break;}
+                // A far-only volume needs no restoration of cloud state:
+                // the outer group snapshot will restore the game once.
+                // If a near draw or native fallback is required, rebind
+                // only changed render state through the cache, plus the
+                // shader/stream/texture bindings overwritten by DrawUP.
+                viewportChanged=false;
+                if(group&&mutated) {
+                    if(usedFarLayer&&restrictedCount==count&&!ranges[1].count())continue;
+                    if(!usedFarLayer)group->invalidate();
+                    const auto restored=configure();if(!restored)return restored;
+                    const auto rebound=bindStream();if(!rebound)return rebound;
+                    constantsSet=false;
+                    if(!usedFarLayer) {
+                        if(FAILED(hr=d->SetVertexShaderConstantF(0,constants[0].data(),UINT(constants.size()))))break;
+                        constantsSet=true;
+                    }
+                }
                 // render() restores the ordinary scene viewport, including
                 // on recoverable failure. A native fallback must flatten it.
-                viewportChanged=false;
                 if(usedFarLayer)continue;
                 auto vp=viewport;vp.MinZ=vp.MaxZ;
                 if(FAILED(hr=d->SetViewport(&vp)))break;
@@ -675,68 +699,72 @@ inline Result drawRaw(IDirect3DDevice9* d,const std::array<IDirect3DBaseTexture9
     const auto rs=[&](D3DRENDERSTATETYPE st,DWORD value){check(states?states->rs(d,st,value):d->SetRenderState(st,value),"SetRenderState");};
     const auto ts=[&](DWORD stage,D3DTEXTURESTAGESTATETYPE st,DWORD value){check(states?states->ts(d,stage,st,value):d->SetTextureStageState(stage,st,value),"SetTextureStageState");};
     const auto ss=[&](DWORD stage,D3DSAMPLERSTATETYPE st,DWORD value){check(states?states->ss(d,stage,st,value):d->SetSamplerState(stage,st,value),"SetSamplerState");};
-    const auto world=identity();
-    if(!projected)check(d->SetTransform(D3DTS_WORLD,&world),"SetTransform(WORLD)");
-    if(view)check(d->SetTransform(D3DTS_VIEW,view),"SetTransform(VIEW)");
-    if(projection)check(d->SetTransform(D3DTS_PROJECTION,projection),"SetTransform(PROJECTION)");
-    check(d->SetVertexShader(gpu?gpu->stream->shader:nullptr),"SetVertexShader");
-    check(d->SetPixelShader(nullptr),"SetPixelShader");
-    if(gpu)check(d->SetVertexDeclaration(gpu->stream->declaration),"SetVertexDeclaration");
-    else check(d->SetFVF(fvf),"SetFVF(clouds)");
-    rs(D3DRS_LIGHTING,FALSE);rs(D3DRS_SPECULARENABLE,FALSE);
-    rs(D3DRS_VERTEXBLEND,D3DVBF_DISABLE);rs(D3DRS_INDEXEDVERTEXBLENDENABLE,FALSE);
-    rs(D3DRS_FOGENABLE,fog?TRUE:FALSE);
-    if(projected) {
-        // For transformed/lit vertices D3D9 consumes the explicitly supplied
-        // fog factor (specular alpha), not the game's table fog or fog start.
-        rs(D3DRS_FOGTABLEMODE,D3DFOG_NONE);rs(D3DRS_FOGVERTEXMODE,D3DFOG_NONE);
-        rs(D3DRS_RANGEFOGENABLE,FALSE);rs(D3DRS_FOGCOLOR,fogColor);
-    }
-    rs(D3DRS_ZENABLE,accumulate?D3DZB_FALSE:D3DZB_TRUE);rs(D3DRS_ZWRITEENABLE,FALSE);
-    rs(D3DRS_ZFUNC,D3DCMP_LESSEQUAL);rs(D3DRS_ALPHABLENDENABLE,TRUE);
-    rs(D3DRS_ALPHATESTENABLE,TRUE);rs(D3DRS_ALPHAFUNC,D3DCMP_GREATER);rs(D3DRS_ALPHAREF,0);
-    rs(D3DRS_SRCBLEND,D3DBLEND_SRCALPHA);rs(D3DRS_DESTBLEND,D3DBLEND_INVSRCALPHA);
-    rs(D3DRS_BLENDOP,D3DBLENDOP_ADD);rs(D3DRS_SEPARATEALPHABLENDENABLE,accumulate?TRUE:FALSE);
-    if(accumulate) {
-        rs(D3DRS_SRCBLENDALPHA,D3DBLEND_ONE);rs(D3DRS_DESTBLENDALPHA,D3DBLEND_INVSRCALPHA);
-        rs(D3DRS_BLENDOPALPHA,D3DBLENDOP_ADD);
-    }
-    rs(D3DRS_CULLMODE,D3DCULL_NONE);rs(D3DRS_SHADEMODE,D3DSHADE_GOURAUD);
-    rs(D3DRS_COLORWRITEENABLE,0xF);rs(D3DRS_SRGBWRITEENABLE,FALSE);rs(D3DRS_STENCILENABLE,FALSE);
-    rs(D3DRS_SCISSORTESTENABLE,FALSE);rs(D3DRS_CLIPPING,TRUE);
-    rs(D3DRS_CLIPPLANEENABLE,0);rs(D3DRS_WRAP0,0);rs(D3DRS_WRAP1,0);
-    const auto factor=byte(coverage*255.f);
-    rs(D3DRS_TEXTUREFACTOR,D3DCOLOR_ARGB(factor,factor,factor,factor));
-    const bool blend=opts.dual&&factor>0&&factor<255;
-    const DWORD first=blend?0:coverage>=.5f?1:0;
-    check(d->SetTexture(0,textures[first]),"SetTexture(volume0)");
-    for(DWORD i=0;i<(blend?2u:1u);++i) {
-        ss(i,D3DSAMP_ADDRESSU,D3DTADDRESS_WRAP);ss(i,D3DSAMP_ADDRESSV,D3DTADDRESS_WRAP);
-        ss(i,D3DSAMP_ADDRESSW,D3DTADDRESS_CLAMP);
-        ss(i,D3DSAMP_MINFILTER,opts.filter);ss(i,D3DSAMP_MAGFILTER,opts.filter);
-        ss(i,D3DSAMP_MIPFILTER,mipmaps?D3DTEXF_LINEAR:D3DTEXF_NONE);ss(i,D3DSAMP_SRGBTEXTURE,FALSE);
-        ts(i,D3DTSS_TEXCOORDINDEX,0);ts(i,D3DTSS_TEXTURETRANSFORMFLAGS,D3DTTFF_DISABLE);
-        ts(i,D3DTSS_RESULTARG,D3DTA_CURRENT);
-    }
-    ts(0,D3DTSS_COLOROP,blend?D3DTOP_SELECTARG1:D3DTOP_MODULATE);
-    ts(0,D3DTSS_ALPHAOP,blend?D3DTOP_SELECTARG1:D3DTOP_MODULATE);
-    ts(0,D3DTSS_COLORARG1,D3DTA_TEXTURE);ts(0,D3DTSS_ALPHAARG1,D3DTA_TEXTURE);
-    ts(0,D3DTSS_COLORARG2,D3DTA_DIFFUSE);ts(0,D3DTSS_ALPHAARG2,D3DTA_DIFFUSE);
-    if(blend) {
-        check(d->SetTexture(1,textures[1]),"SetTexture(volume1)");
-        ts(1,D3DTSS_COLOROP,opts.blendOp);ts(1,D3DTSS_ALPHAOP,opts.blendOp);
-        ts(1,D3DTSS_COLORARG0,D3DTA_TFACTOR);ts(1,D3DTSS_ALPHAARG0,D3DTA_TFACTOR);
-        ts(1,D3DTSS_COLORARG1,D3DTA_TEXTURE);ts(1,D3DTSS_ALPHAARG1,D3DTA_TEXTURE);
-        ts(1,D3DTSS_COLORARG2,D3DTA_CURRENT);ts(1,D3DTSS_ALPHAARG2,D3DTA_CURRENT);
-        ts(2,D3DTSS_RESULTARG,D3DTA_CURRENT);
-        ts(2,D3DTSS_TEXCOORDINDEX,0);ts(2,D3DTSS_TEXTURETRANSFORMFLAGS,D3DTTFF_DISABLE);
-        ts(2,D3DTSS_COLOROP,D3DTOP_MODULATE);ts(2,D3DTSS_ALPHAOP,D3DTOP_MODULATE);
-        ts(2,D3DTSS_COLORARG1,D3DTA_CURRENT);ts(2,D3DTSS_ALPHAARG1,D3DTA_CURRENT);
-        ts(2,D3DTSS_COLORARG2,D3DTA_DIFFUSE);ts(2,D3DTSS_ALPHAARG2,D3DTA_DIFFUSE);
-    }
-    ts(blend?3:1,D3DTSS_COLOROP,D3DTOP_DISABLE);
-    ts(blend?3:1,D3DTSS_ALPHAOP,D3DTOP_DISABLE);
-    if(result&&gpu)result=gpu->draw(d,count,triangles);
+    const auto configure=[&]()->Result {
+        const auto world=identity();
+        if(!projected)check(d->SetTransform(D3DTS_WORLD,&world),"SetTransform(WORLD)");
+        if(view)check(d->SetTransform(D3DTS_VIEW,view),"SetTransform(VIEW)");
+        if(projection)check(d->SetTransform(D3DTS_PROJECTION,projection),"SetTransform(PROJECTION)");
+        check(d->SetVertexShader(gpu?gpu->stream->shader:nullptr),"SetVertexShader");
+        check(d->SetPixelShader(nullptr),"SetPixelShader");
+        if(gpu)check(d->SetVertexDeclaration(gpu->stream->declaration),"SetVertexDeclaration");
+        else check(d->SetFVF(fvf),"SetFVF(clouds)");
+        rs(D3DRS_LIGHTING,FALSE);rs(D3DRS_SPECULARENABLE,FALSE);
+        rs(D3DRS_VERTEXBLEND,D3DVBF_DISABLE);rs(D3DRS_INDEXEDVERTEXBLENDENABLE,FALSE);
+        rs(D3DRS_FOGENABLE,fog?TRUE:FALSE);
+        if(projected) {
+            // For transformed/lit vertices D3D9 consumes the explicitly supplied
+            // fog factor (specular alpha), not the game's table fog or fog start.
+            rs(D3DRS_FOGTABLEMODE,D3DFOG_NONE);rs(D3DRS_FOGVERTEXMODE,D3DFOG_NONE);
+            rs(D3DRS_RANGEFOGENABLE,FALSE);rs(D3DRS_FOGCOLOR,fogColor);
+        }
+        rs(D3DRS_ZENABLE,accumulate?D3DZB_FALSE:D3DZB_TRUE);rs(D3DRS_ZWRITEENABLE,FALSE);
+        rs(D3DRS_ZFUNC,D3DCMP_LESSEQUAL);rs(D3DRS_ALPHABLENDENABLE,TRUE);
+        rs(D3DRS_ALPHATESTENABLE,TRUE);rs(D3DRS_ALPHAFUNC,D3DCMP_GREATER);rs(D3DRS_ALPHAREF,0);
+        rs(D3DRS_SRCBLEND,D3DBLEND_SRCALPHA);rs(D3DRS_DESTBLEND,D3DBLEND_INVSRCALPHA);
+        rs(D3DRS_BLENDOP,D3DBLENDOP_ADD);rs(D3DRS_SEPARATEALPHABLENDENABLE,accumulate?TRUE:FALSE);
+        if(accumulate) {
+            rs(D3DRS_SRCBLENDALPHA,D3DBLEND_ONE);rs(D3DRS_DESTBLENDALPHA,D3DBLEND_INVSRCALPHA);
+            rs(D3DRS_BLENDOPALPHA,D3DBLENDOP_ADD);
+        }
+        rs(D3DRS_CULLMODE,D3DCULL_NONE);rs(D3DRS_SHADEMODE,D3DSHADE_GOURAUD);
+        rs(D3DRS_COLORWRITEENABLE,0xF);rs(D3DRS_SRGBWRITEENABLE,FALSE);rs(D3DRS_STENCILENABLE,FALSE);
+        rs(D3DRS_SCISSORTESTENABLE,FALSE);rs(D3DRS_CLIPPING,TRUE);
+        rs(D3DRS_CLIPPLANEENABLE,0);rs(D3DRS_WRAP0,0);rs(D3DRS_WRAP1,0);
+        const auto factor=byte(coverage*255.f);
+        rs(D3DRS_TEXTUREFACTOR,D3DCOLOR_ARGB(factor,factor,factor,factor));
+        const bool blend=opts.dual&&factor>0&&factor<255;
+        const DWORD first=blend?0:coverage>=.5f?1:0;
+        check(d->SetTexture(0,textures[first]),"SetTexture(volume0)");
+        for(DWORD i=0;i<(blend?2u:1u);++i) {
+            ss(i,D3DSAMP_ADDRESSU,D3DTADDRESS_WRAP);ss(i,D3DSAMP_ADDRESSV,D3DTADDRESS_WRAP);
+            ss(i,D3DSAMP_ADDRESSW,D3DTADDRESS_CLAMP);
+            ss(i,D3DSAMP_MINFILTER,opts.filter);ss(i,D3DSAMP_MAGFILTER,opts.filter);
+            ss(i,D3DSAMP_MIPFILTER,mipmaps?D3DTEXF_LINEAR:D3DTEXF_NONE);ss(i,D3DSAMP_SRGBTEXTURE,FALSE);
+            ts(i,D3DTSS_TEXCOORDINDEX,0);ts(i,D3DTSS_TEXTURETRANSFORMFLAGS,D3DTTFF_DISABLE);
+            ts(i,D3DTSS_RESULTARG,D3DTA_CURRENT);
+        }
+        ts(0,D3DTSS_COLOROP,blend?D3DTOP_SELECTARG1:D3DTOP_MODULATE);
+        ts(0,D3DTSS_ALPHAOP,blend?D3DTOP_SELECTARG1:D3DTOP_MODULATE);
+        ts(0,D3DTSS_COLORARG1,D3DTA_TEXTURE);ts(0,D3DTSS_ALPHAARG1,D3DTA_TEXTURE);
+        ts(0,D3DTSS_COLORARG2,D3DTA_DIFFUSE);ts(0,D3DTSS_ALPHAARG2,D3DTA_DIFFUSE);
+        if(blend) {
+            check(d->SetTexture(1,textures[1]),"SetTexture(volume1)");
+            ts(1,D3DTSS_COLOROP,opts.blendOp);ts(1,D3DTSS_ALPHAOP,opts.blendOp);
+            ts(1,D3DTSS_COLORARG0,D3DTA_TFACTOR);ts(1,D3DTSS_ALPHAARG0,D3DTA_TFACTOR);
+            ts(1,D3DTSS_COLORARG1,D3DTA_TEXTURE);ts(1,D3DTSS_ALPHAARG1,D3DTA_TEXTURE);
+            ts(1,D3DTSS_COLORARG2,D3DTA_CURRENT);ts(1,D3DTSS_ALPHAARG2,D3DTA_CURRENT);
+            ts(2,D3DTSS_RESULTARG,D3DTA_CURRENT);
+            ts(2,D3DTSS_TEXCOORDINDEX,0);ts(2,D3DTSS_TEXTURETRANSFORMFLAGS,D3DTTFF_DISABLE);
+            ts(2,D3DTSS_COLOROP,D3DTOP_MODULATE);ts(2,D3DTSS_ALPHAOP,D3DTOP_MODULATE);
+            ts(2,D3DTSS_COLORARG1,D3DTA_CURRENT);ts(2,D3DTSS_ALPHAARG1,D3DTA_CURRENT);
+            ts(2,D3DTSS_COLORARG2,D3DTA_DIFFUSE);ts(2,D3DTSS_ALPHAARG2,D3DTA_DIFFUSE);
+        }
+        ts(blend?3:1,D3DTSS_COLOROP,D3DTOP_DISABLE);
+        ts(blend?3:1,D3DTSS_ALPHAOP,D3DTOP_DISABLE);
+        return result;
+    };
+    configure();
+    if(result&&gpu)result=gpu->draw(d,count,triangles,states,configure);
     else if(result)check(d->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST,0,count,triangles,
         indices,D3DFMT_INDEX16,vertices,stride),"DrawIndexedPrimitiveUP");
     const auto restore=scoped.restore();

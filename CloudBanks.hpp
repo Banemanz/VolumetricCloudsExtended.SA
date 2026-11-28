@@ -551,22 +551,23 @@ inline bool planeCandidate(Vec closest,Vec deltaLo,Vec deltaHi,float axisDelta,f
     }
     return false;
 }
+inline void clearSourceMesh(Mesh& m) {
+    m.vertices.clear();m.indices.clear();m.slices=0;
+}
+inline void clearSourceMesh(GpuMesh& m) {
+    m.vertices.clear();m.spans.clear();m.slices=0;m.geometryCached=false;
+}
 template<bool Fast=true,class MeshType>
 inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range& r,
                       const canopy::Drift& drift,float wx,float wy,const Volume* volume=nullptr,
                       float weather=0.f,bool billboardAvailable=true,bool tighten=true,bool precise=true,const Lod* sharedLod=nullptr) {
     using OutputVertex=typename decltype(m.vertices)::value_type;
     constexpr bool gpu=std::is_same_v<OutputVertex,GpuVertex>;
-    const auto clearOutput=[&] {
-        m.vertices.clear();
-        if constexpr(gpu){m.spans.clear();m.geometryCached=false;}else m.indices.clear();
-        m.slices=0;
-    };
     const float band=s.maxSpawnZ-s.minSpawnZ;
     if(!s.hybridClouds||!s.targetProcClouds||r.end<5.f||band<1.f||
-       !std::isfinite(wx)||!std::isfinite(wy)||wx<=0||wy<=0||wx>10.f||wy>10.f){clearOutput();return;}
+       !std::isfinite(wx)||!std::isfinite(wy)||wx<=0||wy<=0||wx>10.f||wy>10.f){clearSourceMesh(m);return;}
     const auto levels=sharedLod?*sharedLod:lod(s,r,billboardAvailable,view.pos.z-(s.minSpawnZ+s.maxSpawnZ)*.5f);
-    if(view.pos.z<s.minSpawnZ-levels.end||view.pos.z>s.maxSpawnZ+levels.end){clearOutput();return;}
+    if(view.pos.z<s.minSpawnZ-levels.end||view.pos.z>s.maxSpawnZ+levels.end){clearSourceMesh(m);return;}
     const float base=s.cumulusDetail?16.f:20.f;
     const int nz=verticalSteps(s);
     const Vec step=latticeSpacing(s),origin{0,0,s.minSpawnZ};
@@ -657,7 +658,7 @@ inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range
             ++m.geometryHits;return;
         }
     }
-    clearOutput();
+    clearSourceMesh(m);
     const auto rootEntry=[&](const Brick& b)->RootSupport* {
         if constexpr(!Fast)return nullptr;
         if(!cacheValid||b.last[0]-b.first[0]!=BrickSteps||b.last[1]-b.first[1]!=BrickSteps||

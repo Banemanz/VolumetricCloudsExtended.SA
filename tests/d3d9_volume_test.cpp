@@ -462,14 +462,16 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
             if(mean>6.f||large>desc.Width*desc.Height/12)return fail("Hardware vertex visual parity");
             // Compare actual clip-range submissions with the old full two
             // passes, including a short map clip and an extended modded clip.
-            const auto renderHardware=[&](d3d9::GpuPasses& selected)->bool {
+            const auto renderHardware=[&](d3d9::GpuPasses& selected,bool group=false)->bool {
                 if(FAILED(device->Clear(0,nullptr,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER,0xFF000000,1.f,0)))return false;
                 if(FAILED(device->Clear(1,&sentinel,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER,0xFF008000,.5f,0)))return false;
                 if(FAILED(device->BeginScene()))return false;
+                d3d9::StateScope scope;d3d9::DrawState states;
+                if(group&&!scope.capture(device))return false;
                 const auto result=d3d9::drawRaw(device,{textures[0],textures[1]},opts,gm.vertices.data(),UINT(gm.vertices.size()),
                     sizeof(banks::GpuVertex),0,nullptr,UINT(gm.triangleCount()),coverage,opts.vertexFog,true,false,
-                    D3DCOLOR_XRGB(90,120,160),nullptr,nullptr,true,&selected);
-                return SUCCEEDED(device->EndScene())&&bool(result);
+                    D3DCOLOR_XRGB(90,120,160),nullptr,nullptr,!group,&selected,group?&states:nullptr);
+                return bool(scope.restore())&&SUCCEEDED(device->EndScene())&&bool(result);
             };
             if(!referenceHw.available()||!referenceHw.upload(gm))return fail("Reference shader upload");
             std::size_t saved=0;
@@ -513,6 +515,17 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
                     if(!renderHardware(trimmed))return fail("Half-resolution distant draw");
                     if(trimmed.usedFarLayer) {
                         std::vector<DWORD> reduced;if(!capture(reduced))return fail("Half-resolution readback");
+                        if(!renderHardware(trimmed,true)||!exact("Group-owned half-resolution volume",reduced))
+                            return fail("Volume state rebind visual parity");
+                        if(!trimmed.usedFarLayer)return fail("Group-owned volume unexpectedly changed path");
+                        // Exercise the far-only branch separately: no
+                        // shader/stream rebind before the outer restore.
+                        const auto nativeRange=trimmed.ranges[1];trimmed.ranges[1]={};
+                        std::vector<DWORD> farOnly;
+                        if(!renderHardware(trimmed)||!capture(farOnly)||!trimmed.usedFarLayer||
+                           !renderHardware(trimmed,true)||!trimmed.usedFarLayer||!exact("Group-owned far-only volume",farOnly))
+                            return fail("Far-only state ownership visual parity");
+                        trimmed.ranges[1]=nativeRange;
                         std::uint64_t total=0;unsigned large=0;
                         for(UINT y=0;y<desc.Height;++y)for(UINT x=0;x<desc.Width;++x) {
                             const auto i=std::size_t(y)*desc.Width+x;

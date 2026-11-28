@@ -147,7 +147,7 @@ inline int benchmark(IDirect3DDevice9* device,const D3DCAPS9& caps,bool half=fal
                 for(const auto& v:card.vertices)pa.clip.push_back(clipVertex(v.pos,v.u,v.v,v.w,v.alpha*(atlasOpts.vertexFog?1.f:v.fog),v.fog,transform));
                 projectMesh<Fast>(pa,vp,light,directional?canopyVolume::canopyWeight(column):1.f,card.indices.data(),card.indices.size());
             }
-            GpuPasses passes;passes.stream=&hw;if(half)passes.farLayer=&farLayer;
+            GpuPasses passes;passes.stream=&hw;passes.nestedScope=!Fast;if(half)passes.farLayer=&farLayer;
             const bool useGpu=hardware&&passes.prepare(s,cam,range,drift,farReady,bankOpts.vertexFog,1.f,light,transform,projection,vp,sharedLod);
             UINT n=0,nt=0;
             if(useGpu) {

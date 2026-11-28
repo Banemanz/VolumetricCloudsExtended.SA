@@ -1408,7 +1408,11 @@ unchanged.
   accumulates using the existing group state cache without an extra
   full stateblock Capture/Apply. All state setters tracked, invalidate
   on uncertainty; explicit RT/depth/viewport restoration remains. The
-  volume half-res inner scope remains intact for the following VS2 pass.
+  volume half-res path now also uses the group-owned state cache when
+  available: on far-only draw skip intermediate state restoration; on
+  mixed near/far draw or recoverable failure reconfigure cloud state
+  and rebind shader, stream, indices, textures and required constants
+  before the native pass. Standalone calls retain their nested scope.
   Device capability lookup cached only within the resource lifetime.
 
 A/B: g++ -std=c++17 -O3, same executable/reference switch, pinned to one
@@ -1443,18 +1447,26 @@ entry 020647c749207ea04cb5db0aace81418b87cabe94415f0032793a9f7960e3240;
 flight aa18fe34b38b662fff2ae6c4a353356199c9657c701c05d275151be42a392081.
 Native CI adds 87,360 randomized clipped triangles byte parity and full
 RGB comparison of nested vs group-owned proxy draws, including a
-following native draw. It also runs reference and optimized half-res
+following native draw, plus mixed and far-only volume state ownership. It also runs reference and optimized half-res
 workloads at 640x480. Tracked setter counts exclude setters in the old
 nested state scope; do not compare those counts as total API calls.
 
 Research: Direct3D 9 performance guidance on avoiding redundant state
 and buffer updates; GPU Gems, Graphics Pipeline Performance and
 Geometry Clipmaps (incremental reuse of quantized world lattices).
-Future worthwhile work, subject to parity tests: avoid inner volume
-snapshot via a selective proof of restoration; persistent per-brick
+Future worthwhile work, subject to parity tests: persistent per-brick
 support across individual phase changes; further fixed-function blend
 fill reductions using exact footprint support. Do not unify two
 half-resolution compositions blindly: premultiplied filtering and
 rounding can change their output. No visual tweaks are bundled in this
 CPU-only revision; residual directional projection/handover errors in
 the previous revision still require in-game confirmation.
+
+Additional verification: 300 custom-profile Linux frames (two density
+resolutions, three seeds, altered spawn bands, draw ranges and size scales,
+same-address rebakes) also had exact source vertices/indices/spans and
+198 stable-geometry hits. ASan/UBSan core test ran clean with leak
+detection disabled (LeakSanitizer is unsupported in the container).
+First Windows build exposed MSVC C2131 on a constexpr variable inside
+a lambda; explicit clearSourceMesh overloads remove that construct
+without changing the renderer.

@@ -834,7 +834,10 @@ Directional atlas support unions and source-cell masks are derived during
 bake/load. CPU fallback avoids redundant saturated fades, dominant-axis
 weights and repeated UV evaluation. The D3D9 projected path uses ping-pong
 clipping scratch, packs constant RGB once, and shares its existing group
-state cache with the far proxy accumulation/composite. The outer game-state
+state cache with far proxy and volume accumulation/composite. A far-only
+volume needs no intermediate state restore; mixed volumes rebind only the
+required state, shaders, stream and textures before the native tail.
+The outer game-state
 snapshot and explicit RT/depth/viewport restoration remain.
 
 Reproduce the portable A/B workload:
