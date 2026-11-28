@@ -1335,3 +1335,28 @@ Code map:
   comparison. Source research: GPU Gems 2004 chapter 39 on empty-space
   proxy geometry, Harris/Lastra 2001 on optical cloud impostors, Microsoft
   D3D9 linear sampling/texture addressing and fog documentation.
+
+### Post-benchmark silhouette validation and zenith-specific LOD
+
+Added repeatable `tests/cloud_silhouette_compare.py` plus full-volume and
+alpha-only flags to the preview driver. At 640x360 with alpha >0.1,
+old/new IoU: ground .5489/.7123, Z443 .7788/.9853, Z535 .9936/.9971.
+Missing coverage at Z443 8.78%→0%; ordinary ground 19.39%→1.52%,
+but extras rise to 16.12% at ground (vs 1.81%). Don't claim perfect
+sync, the atlas still has perspective/angular error. Uncorrected zenith
+had MAE .188 vs old .065 and was rejected. Added `banks::columnShare`:
+blend back to same-volume exact column optical integration only at
+very low altitude and high camera pitch, C1 ramps 58–79 degrees and
+56.25–112.5 world units in default config. It is zero by the time
+nearby volume grows; never used in Z handover. At the zenith reference,
+corrected MAE .067, IoU .9504, 230400 fragments instead of 973930.
+No uniform alpha-power correction shipped; power sweeps traded fewer
+false-positive cloud pixels for more missing clouds.
+
+Native run 46098854615 on the initial directional commit passed 6/6
+Win32 and 5/5 portable, real D3D9 ground reduced path used, RGB average
+difference .946/255, four >32 pixels, depth guard preserved. Same-run
+640x480 WARP median GPU intervals for full versus half mixed: Z30
+10.382→5.903ms, Z443 40.065→26.079ms, Z635 111.316→84.409ms.
+Those are not hardware or GTA FPS. Subsequent zenith changes should
+be built and tested in the same workflow.

@@ -41,12 +41,13 @@ void run(const Settings& s,const banks::Volume& volume,const billboards::Atlas& 
             const auto local=directional?full:canopyVolume::volumeRange(s,full,z,blend);
             const auto lod=banks::hybridLod(s,full,z,v.pos.z);
             const auto* sharedLod=directional?&lod:nullptr;
+            const float column=directional?banks::columnShare(s,v,z):1.f;
             const bool distant=directional||billboards::eligible(s,local);
             drift.update(s,{.2f,.1f,0},.016f);
             const auto start=Clock::now();
-            if(directional)canopy.indices.clear();else canopyVolume::mesh(canopy,relief,s,v,full,drift,.94f,.53f,blend,&local);
+            if(column<=1.f/255.f)canopy.indices.clear();else canopyVolume::mesh(canopy,relief,s,v,full,drift,.94f,.53f,blend,directional?nullptr:&local);
             banks::buildMesh(bankMesh,s,v,local,drift,.94f,.53f,&volume,weather,distant,tighten,true,sharedLod);
-            if(distant)billboards::buildMesh(cards,s,v,local,drift,atlas,.94f,.53f,weather,sharedLod);
+            if(distant&&(!directional||column<1.f-1.f/255.f))billboards::buildMesh(cards,s,v,local,drift,atlas,.94f,.53f,weather,sharedLod);
             else cards.indices.clear();
             times.push_back(std::chrono::duration<double,std::milli>(Clock::now()-start).count());
             sheet+=canopy.indices.size()/3;volumeTris+=bankMesh.vertices.size()/2;cardTris+=cards.indices.size()/3;

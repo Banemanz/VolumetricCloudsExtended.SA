@@ -65,7 +65,7 @@ def draw(canvas,tex,v,indices,layer,weather,fog,depth_split=None,far=False):
             alpha=(rgba[:,3]*attr[:,3])[:,None]
             fragments+=len(alpha)
             passing+=np.count_nonzero(alpha>0.5/255)
-            color=rgba[:,:3]*attr[:,4:7]*attr[:,7:8]+fog*(1-attr[:,7:8])
+            color=np.ones_like(rgba[:,:3]) if os.environ.get("VC_ALPHA") else rgba[:,:3]*attr[:,4:7]*attr[:,7:8]+fog*(1-attr[:,7:8])
             canvas[y,x,:3]=canvas[y,x,:3]*(1-alpha)+color*alpha
             if canvas.shape[2]==4:canvas[y,x,3:4]=canvas[y,x,3:4]*(1-alpha)+alpha
     return fragments,passing
@@ -102,7 +102,7 @@ def proxy_prefix(v,indices):
 def render(scene,exe):
     with tempfile.TemporaryDirectory() as tmp:
         path=pathlib.Path(tmp)/"cloud"
-        raw=subprocess.check_output([exe,scene,str(path)]+(["legacy"] if os.environ.get("VC_LEGACY") else ["no-trim"] if os.environ.get("VC_NO_TRIM") else []),text=True)
+        raw=subprocess.check_output([exe,scene,str(path)]+(["full-volume"] if os.environ.get("VC_FULL_VOLUME") else ["legacy"] if os.environ.get("VC_LEGACY") else ["no-trim"] if os.environ.get("VC_NO_TRIM") else []),text=True)
         tex=[np.fromfile(str(path)+suffix,dtype=np.uint8).reshape(shape).astype(np.float32)/255
              for suffix,shape in [(".canopy",(512,512,4)),(".extra",(512,512,4)),(".clear3d",(32,128,128,4)),(".wet3d",(32,128,128,4))]]
         if pathlib.Path(str(path)+".atlas0").exists():
@@ -113,6 +113,7 @@ def render(scene,exe):
     rows=iter(raw.splitlines())
     p=np.array(next(rows).split(),float);t=np.linspace(0,1,H)[:,None,None]
     canvas=np.broadcast_to((p[:3]*(1-t)+p[3:6]*t)/255,(H,W,3)).copy()
+    if os.environ.get("VC_ALPHA"):canvas.fill(0)
     for line in rows:
         cols=line.split(); layer,nv,nt=map(int,cols[:3])
         weather=float(cols[3]) if layer in (2,3,4) else 0

@@ -103,13 +103,14 @@ inline int benchmark(IDirect3DDevice9* device,const D3DCAPS9& caps,bool half=fal
     // Fixed and moving camera samples; two clear/mixed-weather scenarios.
     // Use a short scene clip and a depth occluder, simulating sky visible
     // between buildings without loading a proprietary world.
-    for(float height:{30.f,443.f,535.f,635.f,1000.f})for(float coverage:{0.f,.5f}) {
+    for(const auto& pose:std::array<std::pair<float,float>,6>{{{30.f,.65f},{30.f,1.4f},{443.f,-.24f},{535.f,-.24f},{635.f,-.24f},{1000.f,-.24f}}})for(float coverage:{0.f,.5f}) {
+        const float height=pose.first,basePitch=pose.second;
         std::vector<double> prep,submit,complete,gpuTime,passed;
         std::size_t input=0,submitted=0,bytes=0,skipped=0,tri=0,halfFrames=0;
         canopy::Drift drift;
         for(int frame=0;frame<warm+frames;++frame) {
             const int moving=std::max(0,frame-warm-7);
-            const float yaw=.7f+moving*.19f,pitch=height<440.f?.65f:-.24f+moving*.012f;
+            const float yaw=.7f+moving*.19f,pitch=height<440.f?basePitch:basePitch+moving*.012f;
             const Vec f=unit(Vec{std::cos(yaw)*std::cos(pitch),std::sin(yaw)*std::cos(pitch),std::sin(pitch)});
             const Vec right=unit(cross(f,{0,0,1})),up=cross(right,f);
             const Vec pos{2239.f+moving*3.f,-1262.f-moving*.8f,height};
@@ -121,6 +122,7 @@ inline int benchmark(IDirect3DDevice9* device,const D3DCAPS9& caps,bool half=fal
             const auto range=directional?full:canopyVolume::volumeRange(s,full,height,blend);
             const auto lod=banks::hybridLod(s,full,height,cam.pos.z);
             const auto* sharedLod=directional?&lod:nullptr;
+            const float column=directional?banks::columnShare(s,cam,height):1.f;
             const bool farReady=directional||billboards::eligible(s,range);
             auto view=identity();
             view._11=right.x;view._21=right.y;view._31=right.z;view._41=-dot(pos,right);
@@ -129,18 +131,18 @@ inline int benchmark(IDirect3DDevice9* device,const D3DCAPS9& caps,bool half=fal
             D3DMATRIX projection{};projection._11=1.f/wx;projection._22=1.f/wy;
             projection._33=450.f/449.f;projection._34=1;projection._43=-projection._33;
             const auto transform=multiply(view,projection);
-            if(directional){proxy.vertices.clear();proxy.indices.clear();}else canopyVolume::mesh(proxy,relief,s,cam,full,drift,wx,wy,blend,&range);
+            if(column<=1.f/255.f){proxy.vertices.clear();proxy.indices.clear();}else canopyVolume::mesh(proxy,relief,s,cam,full,drift,wx,wy,blend,directional?nullptr:&range);
             ps.clip.clear();
             for(const auto& v:proxy.vertices) {
                 const float fogWeight=cloudFogFactor(s,v.distance);
                 ps.clip.push_back(clipVertex(v.pos,v.u,v.v,0,v.alpha*(sheetOpts.vertexFog?1.f:fogWeight),fogWeight,transform));
             }
-            projectMesh(ps,vp,light,1.f,proxy.indices.data(),proxy.indices.size());
+            projectMesh(ps,vp,light,directional?canopyVolume::canopyWeight(1.f-column):1.f,proxy.indices.data(),proxy.indices.size());
             pa.clip.clear();pa.indices.clear();
-            if(farReady) {
+            if(farReady&&(!directional||column<1.f-1.f/255.f)) {
                 billboards::buildMesh(card,s,cam,range,drift,atlas,wx,wy,atlasOpts.dual?coverage:0.f,sharedLod);
                 for(const auto& v:card.vertices)pa.clip.push_back(clipVertex(v.pos,v.u,v.v,v.w,v.alpha*(atlasOpts.vertexFog?1.f:v.fog),v.fog,transform));
-                projectMesh(pa,vp,light,1.f,card.indices.data(),card.indices.size());
+                projectMesh(pa,vp,light,directional?canopyVolume::canopyWeight(column):1.f,card.indices.data(),card.indices.size());
             }
             GpuPasses passes;passes.stream=&hw;if(half)passes.farLayer=&farLayer;
             const bool useGpu=hardware&&passes.prepare(s,cam,range,drift,farReady,bankOpts.vertexFog,1.f,light,transform,projection,vp,sharedLod);
@@ -203,8 +205,8 @@ inline int benchmark(IDirect3DDevice9* device,const D3DCAPS9& caps,bool half=fal
                 tri+=ps.indices.size()/3+pa.indices.size()/3+(useGpu?(passes.ranges[0].count()+passes.ranges[1].count())/2:nt);
             }
         }
-        std::printf("Z=%4.0f weather=%.1f N=%d | CPU prep med/p95 %.3f/%.3f | submit %.3f/%.3f | completion %.3f/%.3f | GPU interval %.3f/%.3f (N=%zu) | avg verts %zu/%zu tris %zu, VB upload %zu B, reused %zu/%d, median passing samples %.0f, half-res frames %zu\n",
-            height,coverage,frames,percentile(prep,50),percentile(prep,95),percentile(submit,50),percentile(submit,95),
+        std::printf("Z=%4.0f pitch=%.2f weather=%.1f N=%d | CPU prep med/p95 %.3f/%.3f | submit %.3f/%.3f | completion %.3f/%.3f | GPU interval %.3f/%.3f (N=%zu) | avg verts %zu/%zu tris %zu, VB upload %zu B, reused %zu/%d, median passing samples %.0f, half-res frames %zu\n",
+            height,basePitch,coverage,frames,percentile(prep,50),percentile(prep,95),percentile(submit,50),percentile(submit,95),
             percentile(complete,50),percentile(complete,95),percentile(gpuTime,50),percentile(gpuTime,95),gpuTime.size(),
             input/frames,submitted/frames,tri/frames,bytes/frames,skipped,frames,percentile(passed,50),halfFrames);
     }

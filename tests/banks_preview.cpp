@@ -7,6 +7,7 @@ int main(int argc,char** argv) {
     if(argc<3||argc>4)return 1;
     const bool tighten=argc==3||std::string(argv[3])!="no-trim";
     const bool legacy=argc==4&&std::string(argv[3])=="legacy";
+    const bool reference=argc==4&&std::string(argv[3])=="full-volume";
     using namespace vc;
     const std::string name=argv[1],path=argv[2];
     const bool rain=name=="rain"||name=="rainflight",night=name=="night",dawn=name=="dawn"||name=="dawnmove";
@@ -17,7 +18,7 @@ int main(int argc,char** argv) {
     if(name=="canopy")s.hybridClouds=false;
     if(name=="short")s.cloudDrawDistance=1800;
     if(name=="long")s.cloudDrawDistance=12000;
-    if(name=="nobillboard")s.farBillboards=false;
+    if(name=="nobillboard"||reference)s.farBillboards=false;
     const auto climate=weather::sample({rain?8:1,rain?8:1,0,rain?1.f:0.f,0,0,0,0,false,false});
     const float pitch=name=="ground"||name=="canopy"||name=="night"||name=="rain"?.38f:
         name=="above"?-.25f:name=="zenith"?1.4f:-.04f;
@@ -47,9 +48,10 @@ int main(int argc,char** argv) {
     const bool directional=!legacy&&s.hybridClouds&&billboards::eligible(s,r);
     const auto lod=banks::hybridLod(s,r,view.pos.z,view.pos.z);
     const auto* sharedLod=directional?&lod:nullptr;
-    const auto local=directional?r:canopyVolume::volumeRange(s,r,view.pos.z,blend);
+    const float column=directional?banks::columnShare(s,view,view.pos.z):1.f;
+    const auto local=directional||reference?r:canopyVolume::volumeRange(s,r,view.pos.z,blend);
     canopyVolume::Mesh canopyMesh;
-    if(relief.ready)canopyVolume::mesh(canopyMesh,relief,s,view,r,{},480.f/510.f,270.f/510.f,blend,&local);
+    if(relief.ready)canopyVolume::mesh(canopyMesh,relief,s,view,r,{},480.f/510.f,270.f/510.f,blend,directional?nullptr:&local);
     else {
         const auto flat=canopy::mesh(s,view,r,{},blend);
         canopyMesh.vertices.assign(flat.vertices.begin(),flat.vertices.end());
@@ -68,8 +70,8 @@ int main(int argc,char** argv) {
         for(std::size_t i=0;i<canopyMesh.indices.size();i+=3)std::cout<<canopyMesh.indices[i]<<' '<<canopyMesh.indices[i+1]<<' '<<canopyMesh.indices[i+2]<<'\n';
     };
     auto lw=canopy::layerWeights(s,climate);
-    if(directional){}
-    else if(relief.ready)emit(4,lw.base);
+    if(reference||column<=1.f/255.f){}
+    else if(relief.ready)emit(4,lw.base*(directional?canopyVolume::canopyWeight(1.f-column):1.f));
     else {
         if(lw.base>1.f/255.f)emit(0,lw.base);
         if(lw.extra>1.f/255.f)emit(1,lw.extra);
@@ -77,14 +79,14 @@ int main(int argc,char** argv) {
     if(s.hybridClouds){
         const auto bankLight=banks::bankLight(light,climate);
         banks::Mesh silhouettes;
-        if(directional||billboards::eligible(s,local)) {
+        if((directional&&column<1.f-1.f/255.f)||(!directional&&billboards::eligible(s,local))) {
             billboards::Atlas atlas;atlas.build(s,volume);
             save(atlas.pixels[0],".atlas0");save(atlas.pixels[1],".atlas1");
             billboards::buildMesh(silhouettes,s,view,local,{},atlas,480.f/510.f,270.f/510.f,climate.coverage,sharedLod);
             std::cout<<3<<' '<<silhouettes.vertices.size()<<' '<<silhouettes.indices.size()/3<<' '<<climate.coverage<<'\n';
             for(const auto& v:silhouettes.vertices) {
                 const auto d=v.pos-view.pos;
-                std::cout<<dot(d,view.right)<<' '<<dot(d,view.up)<<' '<<dot(d,view.forward)<<' '<<v.u<<' '<<v.v<<' '<<v.w<<' '<<v.alpha*weather::visibility(climate)*weather::clearOpacity(climate)
+                std::cout<<dot(d,view.right)<<' '<<dot(d,view.up)<<' '<<dot(d,view.forward)<<' '<<v.u<<' '<<v.v<<' '<<v.w<<' '<<v.alpha*weather::visibility(climate)*weather::clearOpacity(climate)*(directional?canopyVolume::canopyWeight(column):1.f)
                     <<' '<<bankLight.r/255.f<<' '<<bankLight.g/255.f<<' '<<bankLight.b/255.f<<' '<<v.fog<<'\n';
             }
             for(std::size_t i=0;i<silhouettes.indices.size();i+=3)std::cout<<silhouettes.indices[i]<<' '<<silhouettes.indices[i+1]<<' '<<silhouettes.indices[i+2]<<'\n';

@@ -209,8 +209,9 @@ and [pure-device GetViewport documentation](https://learn.microsoft.com/en-us/wi
   climbs it gives way to nearby actual volume. The radial transition
   grows from 70% to 100% (442.4–632m); both representations use the
   same radial LOD and complement, including the proxy vertex fades.
-  At default flight height this is 5200–6000m. There is no independent
-  relief sheet in this path. Camera yaw does not move the world cells.
+  At default flight height this is 5200–6000m. No independent density
+  sheet is used; near the zenith on the ground an exact vertical column
+  integration of the same density is a cheaper view-dependent LOD. Camera yaw does not move the world cells.
   If atlas or volume support is unavailable, use the previous relief
   canopy and conservative volume fallback. `HybridClouds=0` retains
   the cheap standalone curved 2D sheet.
@@ -693,7 +694,7 @@ field. Even with identical XY density, a ray through a curved 2D height
 surface does not necessarily encounter the same cloud that a ray through a
 3D volume encounters. Rather than further tuning a global fade, this path
 uses the existing volumetric density itself to bake the directional canopy
-and reuses that atlas at every altitude. No independently spawned cloud can
+and reuses that atlas through the altitude handover. No independently spawned cloud can
 appear merely because the representation changes. The optical proxy is
 approximate and limited by its cell/elevation resolution; in-game silhouette
 alignment is not claimed to be exact.
@@ -756,3 +757,52 @@ benchmark (same-host sequential run) median at Z635: GPU input
 0.237→0.174ms; CPU mesh 0.900→0.607ms. At ground the GPU input
 preparation rose from 0.017 to 0.049ms, a tradeoff for the directional
 projection. No GPU execution time or in-game frame rate is implied.
+
+
+#### Optical coverage diagnostic
+
+Run a repeatable A/B/C comparison of the old relief canopy, the directional
+hybrid and the same volume rendered without any canopy or far proxy:
+
+```sh
+g++ -std=c++17 -O3 tests/banks_preview.cpp -o banks_preview
+VC_PREVIEW_SIZE=640x360 python tests/cloud_silhouette_compare.py ./banks_preview out
+```
+
+This renders alpha only so differences in sky color, lighting and fog
+cannot hide silhouette discrepancies. The full-volume sliced renderer
+is the reference, not a raymarch ground truth. The table reports mask
+intersection-over-union and percentage of all tested sky pixels above
+alpha 0.1 but missing from the hybrid. Extra coverage is reported too.
+
+| Pose | Old IoU | New IoU | Old missing | New missing | Old extra | New extra |
+|---|---:|---:|---:|---:|---:|---:|
+| Ground, ordinary upward gaze | 54.89% | 71.23% | 19.39% | 1.52% | 1.81% | 16.12% |
+| Z443, handover beginning | 77.88% | 98.53% | 8.78% | 0.00% | 0.01% | 0.59% |
+| Z535, mid handover | 99.36% | 99.71% | 0.27% | 0.00% | 0.00% | 0.12% |
+| Zenith (after column LOD correction) | 95.57% | 95.04% | 1.75% | 1.99% | 1.69% | 1.88% |
+
+The wider directional projection initially regressed zenith opacity
+(alpha MAE 0.188 vs 0.065 old). Below 25% of MinSpawnZ, a smooth
+pitch-gated choice of the **same actual volume's vertical optical
+column** corrects that case (MAE 0.067). Its share is zero before
+nearby volume begins growing, and at all handover altitudes. At Z30,
+looking nearly straight overhead, the corrected full-resolution
+column path draws 230,400 fragments rather than 973,930 for the
+directional atlas or 474,343 for the previous column+near-volume
+combination. A single projected mask is more appropriate there than
+multiple orthographic impostors. The 58–79° pitch crossfade is smooth
+but not mathematically identical to arbitrary-angle volume rendering.
+Normal ground look still overestimates coverage; an uncalibrated
+global alpha bias reduced extra coverage at the expense of missing
+clouds, so it was deliberately not shipped.
+
+Initial native Win32 validation of the directional implementation
+(run 46098854615, before the zenith-specific refinement): 6/6 tests
+passed, real D3D9 reduced proxy path activated. Mean RGB deviation
+0.946/255 with four pixels exceeding 32; original depth sentinel
+preserved. At 640×480, same-run WARP GPU intervals full→half:
+Z30 mixed 10.382→5.903ms, Z443 mixed 40.065→26.079ms, Z635 mixed
+111.316→84.409ms. These are paired **WARP** measurements, not 2006
+hardware or GTA frame times; a prior runner's absolute timings are
+not directly comparable.

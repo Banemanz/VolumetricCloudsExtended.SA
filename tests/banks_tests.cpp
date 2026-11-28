@@ -502,6 +502,11 @@ int main() {
             CHECK(std::abs(adaptive.volume(d)+adaptive.billboard(d)-1.f)<.00001f);
     }
     CHECK(previousStart==5200.f&&previousEnd==6000.f);
+    auto zenith=ground;zenith.forward={0,0,1};zenith.pos.z=30;
+    CHECK(banks::columnShare(s,zenith,30.f)==1.f);
+    CHECK(banks::columnShare(s,zenith,canopy::altitude(s)*canopy::HandoverRatio)==0.f);
+    zenith.forward={0,1,0};
+    CHECK(banks::columnShare(s,zenith,30.f)==0.f);
     const auto groundLod=banks::hybridLod(s,r,ground.pos.z,ground.pos.z);
     banks::buildMesh(raw,s,ground,r,{},.94f,.53f,&b,.5f,true,true,true,&groundLod);
     CHECK(raw.indices.empty());

@@ -120,6 +120,16 @@ inline Lod hybridLod(const Settings& s,const Range& r,float playerZ,float camera
     const float groundEnd=std::min(r.end,groundStart+mix(220.f,std::max(500.f,cell*.9f),climb));
     return {mix(groundStart,flight.start,blend),mix(groundEnd,flight.end,blend)};
 }
+// Far below the deck and nearly straight up, the exact vertical
+// column integration is a better/cheaper directional approximation than
+// nearby orthographic impostors. Fade it out BEFORE nearby 3D grows;
+// never insert the old relief surface into the actual altitude handover.
+inline float columnShare(const Settings& s,const View& view,float playerZ) {
+    const float stop=s.minSpawnZ*.25f,start=stop*.5f;
+    if(stop<=1.f)return 0.f;
+    const float ground=1.f-smooth((std::max(playerZ,view.pos.z)-start)/std::max(1.f,stop-start));
+    return ground*smooth((view.forward.z-.85f)/.13f);
+}
 // Long optical paths accumulate many surfaces; a squared edge taper makes
 // the distant bank gradually dissolve instead of terminating in a bright ring.
 inline float rangeWeight(const Range& r,float d) {const float f=distanceAlpha(r,d);return f*f;}
