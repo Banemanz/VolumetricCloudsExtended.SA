@@ -1,0 +1,11 @@
+/build/
+/dist/
+/plugin-sdk/
+*.asi
+*.pdb
+*.zip
+*.log
+VolumetricCloudsExtended.ini
+VolumetricCloudsExtended.cache*
+
+__pycache__/

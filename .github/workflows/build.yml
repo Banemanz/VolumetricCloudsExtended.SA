@@ -1,0 +1,84 @@
+name: Build SA 1.0 US ASI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  portable-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and run core regression tests
+        run: |
+          cmake -S . -B build -DBUILD_ASI=OFF -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
+          ctest --test-dir build --output-on-failure
+
+  win32:
+    runs-on: windows-2022
+    env:
+      PLUGIN_SDK_DIR: ${{ github.workspace }}\plugin-sdk
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout Plugin-SDK (2025-10-25)
+        uses: actions/checkout@v4
+        with:
+          repository: DK22Pac/plugin-sdk
+          ref: 624a6a49265fd7a6fc63bda1611013ceabeacb8a
+          path: plugin-sdk
+          submodules: recursive
+          persist-credentials: false
+      - uses: microsoft/setup-msbuild@v2
+      - name: Build the pinned SA SDK
+        shell: pwsh
+        working-directory: plugin-sdk
+        run: |
+          & .\tools\premake\premake5.exe vs2022 --file="$env:PLUGIN_SDK_DIR\tools\premake\premake5.lua"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          msbuild plugin.sln /p:Configuration=Release '/p:Platform=Mixed Platforms' /t:plugin_sa /m
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (!(Test-Path output/lib/plugin.lib)) { throw "Plugin-SDK Release library missing" }
+      - name: Build ASI and run regression tests (Win32)
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A Win32 -DBUILD_ASI=ON
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (!(Test-Path build/generated/CloudBankVS.hpp)) { throw "Hardware cloud vertex bytecode was not built" }
+          ctest --test-dir build -C Release --verbose
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Synthetic D3D9 cloud workload (not target hardware)
+        shell: pwsh
+        run: |
+          & build/Release/d3d9_volume_test.exe --benchmark 640 480
+          if ($LASTEXITCODE -notin @(0,77)) { exit $LASTEXITCODE }
+          & build/Release/d3d9_volume_test.exe --benchmark 1024 768
+          if ($LASTEXITCODE -notin @(0,77)) { exit $LASTEXITCODE }
+          & build/Release/d3d9_volume_test.exe --benchmark-half-reference 640 480
+          if ($LASTEXITCODE -notin @(0,77)) { exit $LASTEXITCODE }
+          & build/Release/d3d9_volume_test.exe --benchmark-half 640 480
+          if ($LASTEXITCODE -notin @(0,77)) { exit $LASTEXITCODE }
+      - name: Package Win32 plugin
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item build/Release/VolumetricCloudsExtended.asi dist/
+          Copy-Item build/Release/VolumetricCloudsExtended.pdb dist/
+          Copy-Item README.md dist/
+          Copy-Item VolumetricCloudsExtended.defaults.ini dist/
+          & build/Release/cloud_bake_cache.exe dist/VolumetricCloudsExtended.cache
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item 'new chat' dist/ -Recurse
+          Copy-Item docs dist/ -Recurse
+          Compress-Archive -Path dist/* -DestinationPath VolumetricCloudsExtended.SA-Win32.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VolumetricCloudsExtended.SA-Win32
+          path: VolumetricCloudsExtended.SA-Win32.zip
+          if-no-files-found: error
