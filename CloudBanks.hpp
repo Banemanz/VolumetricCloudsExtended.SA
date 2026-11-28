@@ -151,7 +151,9 @@ struct Volume {
             // Lower, wide bases and rounded crowns instead of pillars.
             const float tower=smooth((broad-std::min(clearThreshold,wetThreshold)+.012f)/.20f);
             const float floor=base-.24f+.045f*(n1-.5f)+.035f*(1.f-tower);
-            const float ceiling=base+.045f+.39f*tower+.18f*(n1-.5f)+.060f*(n2-.5f);
+            // Correlated strong coverage has deeper crowns, while the
+            // low-coverage formations retain the smaller-scale silhouette.
+            const float ceiling=base+.035f+.46f*tower+.18f*(n1-.5f)+.060f*(n2-.5f);
             const float vertical=smooth((h-floor)/.075f)*smooth((ceiling-h)/.075f);
             const float topTaper=.065f*smooth((h-base+.01f)/.27f);
             // Erode weak edges with a billow-shaped detail octave instead

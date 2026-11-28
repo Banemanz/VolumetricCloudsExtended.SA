@@ -3,6 +3,8 @@
 // no usable D3D9 device, CTest marks it skipped (not passed).
 #include "../CloudD3D9.hpp"
 #include "../CloudBillboards.hpp"
+#include "../CloudCanopyVolume.hpp"
+#include "../CloudProfiler.hpp"
 #include <windows.h>
 #include <cstdio>
 #include <cmath>
@@ -274,6 +276,75 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
         (creation.BehaviorFlags&D3DCREATE_HARDWARE_VERTEXPROCESSING);
     if(expectHardware&&!hw.create(device,caps,creation.BehaviorFlags))return fail("VS2 hardware stream creation");
 #endif
+    // Ground and climb: render the actual shared-density canopy and its
+    // limited nearby 3D complement with a short scene far clip.
+    canopyVolume::MaskPair underside;
+    canopyVolume::project(settings,volume,canopy::textureSize(settings),underside);
+    canopyVolume::Relief relief;relief.build(settings,volume);
+    std::array<Com<IDirect3DTexture9>,2> undersideTextures;
+    for(int i=0;i<2;++i) {
+        const auto result=d3d9::uploadCanopy(device,underside[i],canopy::textureSize(settings),&undersideTextures[i].p,false,true);
+        if(!result)return fail(result.operation,result.hr);
+    }
+    auto undersideOpts=canopyOpts;undersideOpts.dual=opts.dual;
+    for(float height:{30.f,317.f,400.f}) {
+        const Vec pos{2239,-1262,height},f=unit(Vec{.55f,.7f,.4f}),rt=unit(cross(f,{0,0,1})),u=cross(rt,f);
+        const View cam{pos,rt,u,f,450,1};
+        auto view=d3d9::identity();
+        view._11=rt.x;view._21=rt.y;view._31=rt.z;view._41=-dot(pos,rt);
+        view._12=u.x;view._22=u.y;view._32=u.z;view._42=-dot(pos,u);
+        view._13=f.x;view._23=f.y;view._33=f.z;view._43=-dot(pos,f);
+        D3DMATRIX pr{};
+        pr._11=1.f/wx;pr._22=1.f/wy;pr._33=cam.farClip/(cam.farClip-cam.nearClip);
+        pr._34=1.f;pr._43=-cam.nearClip*pr._33;
+        const auto matrix=d3d9::multiply(view,pr);
+        const auto full=cloudRange(settings);
+        const float handover=canopy::handover(settings,height);
+        const auto local=canopyVolume::volumeRange(settings,full,height,handover);
+        canopyVolume::Mesh proxy;
+        canopyVolume::mesh(proxy,relief,settings,cam,full,{},wx,wy,handover,&local);
+        d3d9::ProjectedMesh sheet;
+        for(const auto& v:proxy.vertices) {
+            const float fog=cloudFogFactor(settings,v.distance);
+            sheet.clip.push_back(d3d9::clipVertex(v.pos,v.u,v.v,0.f,v.alpha*(undersideOpts.vertexFog?1.f:fog),fog,matrix));
+        }
+        d3d9::projectMesh(sheet,viewport,{208,208,208},1.f,proxy.indices.data(),proxy.indices.size());
+        std::vector<DWORD> clear;
+        const D3DRECT depthSentinel{0,0,LONG(desc.Width/4),LONG(desc.Height/4)};
+        for(float coverage:{0.f,1.f}) {
+            banks::Mesh close;
+            banks::buildMesh(close,settings,cam,local,{},wx,wy,&volume,coverage,false);
+            d3d9::ProjectedMesh nearBatch;
+            for(const auto& v:close.vertices)
+                nearBatch.clip.push_back(d3d9::clipVertex(v.pos,v.u,v.v,v.w,v.alpha*(opts.vertexFog?1.f:v.fog),v.fog,matrix));
+            d3d9::projectMesh(nearBatch,viewport,{208,208,208},1.f,close.indices.data(),close.indices.size());
+            if(FAILED(hr=device->Clear(0,nullptr,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER,0xFF000000,1.f,0)))return fail("Shared canopy clear",hr);
+            if(FAILED(hr=device->Clear(1,&depthSentinel,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER,0xFF008000,.0001f,0)))return fail("Shared canopy depth",hr);
+            if(FAILED(hr=device->BeginScene()))return fail("Shared canopy begin",hr);
+            d3d9::StateScope scope;if(!scope.capture(device))return fail("Shared canopy capture");
+            d3d9::DrawState states;
+            const auto c=d3d9::drawProjected(device,{undersideTextures[0].p,undersideTextures[1].p},undersideOpts,
+                sheet,coverage,false,{90,120,160},true,false,&states);
+            const auto b=d3d9::drawProjected(device,{compactVolume[0],compactVolume[1]},opts,
+                nearBatch,coverage,true,{90,120,160},true,false,&states);
+            if(!scope.restore())return fail("Shared canopy restore");
+            if(FAILED(hr=device->EndScene()))return fail("Shared canopy end",hr);
+            if(!c||!b)return fail("Shared canopy draw");
+            std::vector<DWORD> actual;if(!capture(actual))return fail("Shared canopy readback");
+            unsigned visible=0;
+            for(UINT y=0;y<desc.Height;++y)for(UINT x=0;x<desc.Width;++x) {
+                const auto pixel=actual[std::size_t(y)*desc.Width+x]&0xFFFFFFu;
+                if(x<desc.Width/4&&y<desc.Height/4) {
+                    if(pixel!=0x008000u)return fail("Shared canopy covers foreground");
+                } else visible+=(pixel&255)>3;
+            }
+            if(visible<16)return fail("Shared canopy/near volume not visible");
+            if(coverage==0)clear=std::move(actual);
+            else if(clear==actual)return fail("Shared canopy weather endpoints are identical");
+            std::printf("Shared canopy Z %.0f coverage %.0f: %zu canopy triangles, %zu near volume triangles, %u visible RGB pixels\n",
+                height,coverage,proxy.indices.size()/3,close.indices.size()/3,visible);
+        }
+    }
     for(const Vec pos:{Vec{2164,-1265,673},Vec{2255,-1341,672.7f},Vec{2266,-1271,490}}) {
         View camera{pos,right,up,forward,450,1};
         auto view=d3d9::identity();

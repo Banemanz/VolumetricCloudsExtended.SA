@@ -46,6 +46,9 @@ def draw(canvas,tex,v,indices,layer,weather,fog):
             elif layer==3:
                 rgba=sample2(tex[4],attr[:,:2])
                 if weather>0:rgba=rgba*(1-weather)+sample2(tex[5],attr[:,:2])*weather
+            elif layer==4:
+                rgba=sample2(tex[0],attr[:,:2])
+                if weather>0:rgba=rgba*(1-weather)+sample2(tex[1],attr[:,:2])*weather
             else:rgba=sample2(tex[layer],attr[:,:2])
             alpha=(rgba[:,3]*attr[:,3])[:,None]
             color=rgba[:,:3]*attr[:,4:7]*attr[:,7:8]+fog*(1-attr[:,7:8])
@@ -64,7 +67,7 @@ def render(scene,exe):
     canvas=np.broadcast_to((p[:3]*(1-t)+p[3:6]*t)/255,(H,W,3)).copy()
     for line in rows:
         cols=line.split(); layer,nv,nt=map(int,cols[:3])
-        weather=float(cols[3]) if layer in (2,3) else 0
+        weather=float(cols[3]) if layer in (2,3,4) else 0
         v=np.array([next(rows).split() for _ in range(nv)],float)
         indices=np.array([next(rows).split() for _ in range(nt)],int)
         if nt:draw(canvas,tex,v,indices,layer,weather,(.8*p[3:6]+.2*p[:3])/255)

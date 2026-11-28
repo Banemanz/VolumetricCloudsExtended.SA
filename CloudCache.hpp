@@ -1,5 +1,6 @@
 #pragma once
 #include "CloudBillboards.hpp"
+#include "CloudCanopyVolume.hpp"
 #include <istream>
 #include <ostream>
 #include <cstring>
@@ -7,8 +8,7 @@
 // The periodic world schematic is immutable. Weather changes blend its two
 // baked endpoints and wind shifts coordinates; neither requires disk writes.
 namespace vc::cache {
-constexpr std::uint32_t Version=2; // v2 stores exact luminance + opacity; v1 is RGBA
-constexpr std::uint32_t LegacyVersion=1;
+constexpr std::uint32_t Version=3; // new shared density and underside projection
 static_assert(sizeof(canopy::Pixel)==4);
 struct Hash {
     std::uint64_t value=14695981039346656037ull;
@@ -41,14 +41,14 @@ inline bool transfer(std::ostream& out,const void* p,std::size_t n,Hash& h) {
 }
 inline bool load(std::istream& in,const Settings& s,int size,Masks& masks,banks::Volume& volume,billboards::Atlas& atlas) {
     Header header{};Hash h;
-    if(!transfer(in,&header,sizeof(header),h)||header.magic!=Magic||(header.version!=Version&&header.version!=LegacyVersion)||
+    if(!transfer(in,&header,sizeof(header),h)||header.magic!=Magic||header.version!=Version||
        header.signature!=key(s,size,header.version)||header.size!=std::uint32_t(size))return false;
     // File lengths are never used as allocation sizes. Even malformed input
     // only allocates the exact dimensions already validated in the INI.
     Masks m; banks::Volume v;billboards::Atlas a;
     const auto readPixels=[&](auto& p,std::size_t n){
         p.resize(n);
-        if(header.version==LegacyVersion)return transfer(in,p.data(),n*sizeof(canopy::Pixel),h);
+
         // A bounded sequential read on HDD, then expand losslessly for CPU
         // sampling and devices that lack native luminance texture support.
         std::array<std::uint8_t,32768> packed{};
@@ -83,12 +83,12 @@ inline bool load(std::istream& in,const Settings& s,int size,Masks& masks,banks:
     return true;
 }
 inline bool save(std::ostream& out,const Settings& s,int size,const Masks& masks,const banks::Volume& volume,const billboards::Atlas& atlas,std::uint32_t version=Version) {
-    if(version!=Version&&version!=LegacyVersion)return false;
+    if(version!=Version)return false;
     const Header header{Magic,key(s,size,version),version,std::uint32_t(size)};
     Hash h;if(!transfer(out,&header,sizeof(header),h))return false;
     const auto writePixels=[&](const auto& p,std::size_t n){
         if(p.size()!=n)return false;
-        if(version==LegacyVersion)return transfer(out,p.data(),n*sizeof(canopy::Pixel),h);
+
         std::array<std::uint8_t,32768> packed{};
         for(std::size_t start=0;start<n;) {
             const auto count=std::min(n-start,packed.size()/2);

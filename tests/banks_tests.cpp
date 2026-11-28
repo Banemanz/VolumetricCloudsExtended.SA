@@ -1,4 +1,5 @@
 #include "../CloudBillboards.hpp"
+#include "../CloudCanopyVolume.hpp"
 #include <iostream>
 #include <chrono>
 #include <cstring>
@@ -102,8 +103,60 @@ int main() {
             CHECK(b.potentiallyOccupied(u0,v0,w0,u1,v1,w1,weather)==expected);
         }
     }
+    // Actual underneath projection of the volume: test source-resolution
+    // optical integration against an independent product of transmittance.
+    canopyVolume::MaskPair projection;
+    canopyVolume::project(s,b,b.width,projection);
+    float variedShade=0.f;std::size_t visibleColumns=0;
+    const float path=(s.maxSpawnZ-s.minSpawnZ)/b.depth/banks::ReferenceStep;
+    for(int y=0;y<b.width;++y)for(int x=0;x<b.width;++x)for(int layer=0;layer<2;++layer) {
+        double trans=1.,shade=0.;
+        for(int z=0;z<b.depth;++z) {
+            const auto p=b.pixels[layer][b.index(x,y,z)];
+            const double t=std::pow(1.-p.a/255.,path);
+            shade+=trans*(1.-t)*p.r;trans*=t;
+        }
+        const auto pixel=projection[layer][std::size_t(y)*b.width+x];
+        CHECK(std::abs(pixel.a-canopy::byte(float(1.-trans)*255.f))<=1);
+        if(pixel.a>12) {
+            CHECK(std::abs(pixel.r-canopy::byte(float(shade/(1.-trans))))<=1);
+            ++visibleColumns;variedShade+=255-pixel.r;
+        }
+        CHECK(pixel.r==pixel.g&&pixel.r==pixel.b);
+    }
+    CHECK(visibleColumns>1000&&variedShade/visibleColumns>10);
+    canopyVolume::Relief relief;relief.build(s,b);
+    CHECK(relief.ready&&relief.high-relief.low>5.f&&relief.low>=s.minSpawnZ&&relief.high<=s.maxSpawnZ);
+    for(int y=-8;y<8;++y)for(int x=-8;x<8;++x)
+        CHECK(relief.at(x,y)==relief.at(x+8,y-8));
+    const auto full=cloudRange(s);float previousRange=0.f;
+    for(int z=0;z<=1000;++z) {
+        const auto local=canopyVolume::volumeRange(s,full,float(z),canopy::handover(s,float(z)));
+        CHECK(local.end>=previousRange&&local.end<=full.end&&local.begin<local.end);
+        previousRange=local.end;
+    }
+    CHECK(previousRange==full.end);
+    std::cout<<"PASS: canopy shares exact column optical density, fixed periodic relief and continuous player-altitude local volume range\n";
     const View ground{{2266,-1271,30},{1,0,0},{0,0,1},{0,1,0},2200,1};
     const auto r=cloudRange(s);
+    canopyVolume::Mesh reliefMesh,turnedRelief;
+    const auto local=canopyVolume::volumeRange(s,r,ground.pos.z,0.f);
+    canopyVolume::mesh(reliefMesh,relief,s,ground,r,{},.94f,.53f,0.f,&local);
+    auto rotated=ground;rotated.forward=unit(Vec{.2f,1,.3f});
+    rotated.right=unit(cross(rotated.forward,{0,0,1}));rotated.up=cross(rotated.right,rotated.forward);
+    canopyVolume::mesh(turnedRelief,relief,s,rotated,r,{},.94f,.53f,0.f,&local);
+    CHECK(!reliefMesh.indices.empty()&&!turnedRelief.indices.empty());
+    std::size_t shared=0;
+    for(const auto& vertex:reliefMesh.vertices) {
+        CHECK(finite(vertex.pos)&&vertex.alpha>=0&&vertex.alpha<=1);
+        CHECK(vertex.pos.z>=relief.low&&vertex.pos.z<=relief.high);
+        for(const auto& v:turnedRelief.vertices)if(length(vertex.pos-v.pos)<.001f) {
+            CHECK(vertex.pos.z==v.pos.z&&vertex.u==v.u&&vertex.v==v.v&&vertex.alpha==v.alpha);
+            ++shared;break;
+        }
+    }
+    CHECK(shared>10);
+    for(const auto ind:reliefMesh.indices)CHECK(ind<reliefMesh.vertices.size());
     banks::Mesh raw,culled;
     for(int detail:{0,1})for(float alt:{30.f,300.f,523.f,673.f,690.f,1600.f})for(float pitch:{-.7f,0.f,.5f,1.5f})
        for(float az:{0.f,1.57f,3.14f}) {

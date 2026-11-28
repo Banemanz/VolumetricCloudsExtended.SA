@@ -41,10 +41,13 @@ inline float billows(float u,float v,int period,std::uint32_t seed) {
     }
     return 1.f-sat(std::sqrt(closest));
 }
-inline float shape(float u,float v,std::uint32_t seed) {
+inline float shape(float u,float v,std::uint32_t seed,float regionMean=.5f) {
     const float x=u+.09f*(noise(u,v,5,seed+91)-.5f);
     const float y=v+.09f*(noise(u,v,5,seed+92)-.5f);
-    const float macro=.58f*noise(x,y,7,seed+1)+.42f*noise(x,y,13,seed+2);
+    // Let some regional cells gather into larger banks while retaining the
+    // original smaller billows and detail octaves. No extra runtime noise.
+    const float region=noise(x,y,4,seed+101);
+    const float macro=sat(.58f*noise(x,y,7,seed+1)+.42f*noise(x,y,13,seed+2)+.34f*(region-regionMean));
     const float medium=.62f*billows(x,y,22,seed+3)+.38f*billows(x,y,38,seed+4);
     const float detail=.50f*billows(x,y,55,seed+5)+.35f*noise(x,y,96,seed+6)+.15f*noise(x,y,185,seed+7);
     // The broad correlated field controls gaps; smaller billows erode and
@@ -130,8 +133,14 @@ public:
         field.resize(std::size_t(n)*n);
         pixels.resize(field.size());
         // One deterministic bake per RW lifetime, no game RNG or external assets.
+        // The mean of periodic value noise is the mean of its lattice
+        // values. Center the regional bias per seed, once, so a new seed
+        // doesn't inadvertently change the configured average coverage.
+        float regionMean=0.f;
+        for(int y=0;y<4;++y)for(int x=0;x<4;++x)regionMean+=random(x,y,4,seed+101);
+        regionMean*=1.f/16.f;
         for(int y=0;y<n;++y) for(int x=0;x<n;++x)
-            field[std::size_t(y)*n+x]=shape((x+.5f)/n,(y+.5f)/n,seed);
+            field[std::size_t(y)*n+x]=shape((x+.5f)/n,(y+.5f)/n,seed,regionMean);
     }
     // Reference single-map bake for endpoint tests and historical previews.
     void shade(const Light& l,int first,int last) {

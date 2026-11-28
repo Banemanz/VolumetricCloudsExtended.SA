@@ -15,6 +15,7 @@
 #include "CloudD3D9.hpp"
 #include "CloudBillboards.hpp"
 #include "CloudCache.hpp"
+#include "CloudProfiler.hpp"
 #include <cstdio>
 #include <new>
 
@@ -37,7 +38,10 @@ IDirect3DDevice9* canopyDevice=nullptr; // borrowed
 int canopySize=0;
 std::array<bool,2> canopyHasPixels{};
 vc::d3d9::Options canopyOptions;
+vc::d3d9::CloudProfiler cloudProfiler;
 vc::d3d9::ProjectedMesh canopyProjected,bankProjected;
+vc::canopyVolume::Relief canopyRelief;
+vc::canopyVolume::Mesh canopyReliefMesh;
 vc::billboards::Atlas billboardAtlas;
 vc::banks::Mesh billboardMesh;
 vc::d3d9::ProjectedMesh billboardProjected;
@@ -116,12 +120,13 @@ void LoadIni() {
 }
 
 void ReleaseCanopyTextures() {
+    cloudProfiler.release();
     for(auto& texture:canopyTextures){if(texture)texture->Release();texture=nullptr;}
     canopyDevice=nullptr;canopyUploadFailed=false;
 }
 void ReleaseCanopy() {
     ReleaseCanopyTextures();
-    canopyPixels={};canopyProjected={};canopySize=0;
+    canopyPixels={};canopyProjected={};canopyRelief={};canopyReliefMesh={};canopySize=0;
     canopyReady=false;canopyAttempted=false;
     ReleaseBanks();
 }
@@ -142,7 +147,6 @@ bool PrepareSchematic() {
                     Log("Cloud schematic cache hit (static masks, volume, occupancy and far atlas).");
                 } else {
                 vc::canopy::Map map;map.build(size,std::uint32_t(settings.seed));
-                map.shadeWeatherLayers(settings);
                 if(settings.hybridClouds) {
                     try {bankVolume.build(settings,map);bankPrepared=true;
                         if(vc::billboards::eligible(settings,vc::cloudRange(settings))) {
@@ -152,7 +156,11 @@ bool PrepareSchematic() {
                     }
                     catch(const std::bad_alloc&) {ReleaseBanks();bankFailed=true;Log("3D density allocation failed; using canopy.");}
                 }
-                canopyPixels[0]=std::move(map.pixels);canopyPixels[1]=std::move(map.extraPixels);
+                if(bankPrepared)vc::canopyVolume::project(settings,bankVolume,size,canopyPixels);
+                else {
+                    map.shadeWeatherLayers(settings);
+                    canopyPixels[0]=std::move(map.pixels);canopyPixels[1]=std::move(map.extraPixels);
+                }
                 // Never publish partially generated data or replace an existing
                 // valid cache unless the complete replacement was written.
                 if(!settings.hybridClouds||(bankPrepared&&(!vc::billboards::eligible(settings,vc::cloudRange(settings))||billboardPrepared))) {
@@ -168,6 +176,7 @@ bool PrepareSchematic() {
                     else {std::error_code ec;std::filesystem::remove(tmp,ec);}
                 }
                 }
+                if(bankPrepared)canopyRelief.build(settings,bankVolume);
                 canopySize=size;
                 for(int i=0;i<2;++i)canopyHasPixels[i]=std::any_of(canopyPixels[i].begin(),canopyPixels[i].end(),[](const auto& p){return p.a!=0;});
                 return true;
@@ -176,7 +185,8 @@ bool PrepareSchematic() {
         const int requested=vc::canopy::textureSize(settings);
         canopyReady=build(requested);
         if(!canopyReady&&requested!=vc::canopy::EconomySize)canopyReady=build(vc::canopy::EconomySize);
-        if(canopyReady)Log("Canopy: static weather masks ready (live coverage).");
+        if(canopyReady)Log(canopyRelief.ready?"Canopy: shared volume underside + world-fixed relief (live coverage).":
+            "Canopy: static weather masks ready (live coverage).");
     }
     return canopyReady;
 }
@@ -189,7 +199,7 @@ bool EnsureCanopy() {
     if(!PrepareSchematic())return false;
     D3DCAPS9 caps{};
     if(FAILED(device->GetDeviceCaps(&caps)))return false;
-    canopyOptions=vc::d3d9::options(caps);canopyOptions.dual=false;
+    canopyOptions=vc::d3d9::options(caps);if(!canopyRelief.ready)canopyOptions.dual=false;
     const DWORD linear=D3DPTFILTERCAPS_MINFLINEAR|D3DPTFILTERCAPS_MAGFLINEAR;
     canopyOptions.filter=(caps.TextureFilterCaps&linear)==linear?D3DTEXF_LINEAR:D3DTEXF_POINT;
     canopyOptions.mip=(caps.TextureFilterCaps&D3DPTFILTERCAPS_MIPFLINEAR)!=0;
@@ -437,8 +447,30 @@ static_assert(sizeof(RwImVertexIndex)==sizeof(std::uint16_t));
 // depth for nearby geometry; only distant Z is clamped. Fog is independent.
 bool DrawCanopy(const vc::View& view,const vc::Range& range,float hybridFade,
                 const vc::weather::State& weather,const vc::canopy::Light& light,
-                const D3DMATRIX& transform,const D3DVIEWPORT9& viewport,vc::RGB fog,vc::d3d9::DrawState& states) {
+                const D3DMATRIX& transform,const D3DVIEWPORT9& viewport,vc::RGB fog,float wx,float wy,
+                const vc::Range* volumeRange,vc::d3d9::DrawState& states) {
     if(settings.opacity<=0.f||settings.cumulusDensity<=0.f||!settings.targetProcClouds)return true;
+    if(canopyRelief.ready) {
+        const float visibility=vc::weather::visibility(weather)*vc::weather::clearOpacity(weather);
+        const float coverage=canopyOptions.dual?weather.coverage:weather.coverage>=.5f?1.f:0.f;
+        if(visibility<=1.f/255.f||
+           !((coverage<.999f&&canopyHasPixels[0])||(coverage>.001f&&canopyHasPixels[1])))return true;
+        vc::canopyVolume::mesh(canopyReliefMesh,canopyRelief,settings,view,range,canopyDrift,wx,wy,hybridFade,volumeRange);
+        if(canopyReliefMesh.indices.empty())return true;
+        canopyProjected.clip.clear();canopyProjected.clip.reserve(canopyReliefMesh.vertices.size());
+        for(const auto& v:canopyReliefMesh.vertices) {
+            const float f=vc::cloudFogFactor(settings,v.distance);
+            canopyProjected.clip.push_back(vc::d3d9::clipVertex(v.pos,v.u,v.v,0.f,v.alpha*(canopyOptions.vertexFog?1.f:f),f,transform));
+        }
+        // Same endpoint interpolation, luminance and fog as the actual
+        // volume. One fixed-function draw even during mixed weather.
+        vc::d3d9::projectMesh(canopyProjected,viewport,vc::banks::bankLight(light,weather),visibility,
+            canopyReliefMesh.indices.data(),canopyReliefMesh.indices.size());
+        const auto result=vc::d3d9::drawProjected(canopyDevice,{canopyTextures[0],canopyTextures[1]},
+            canopyOptions,canopyProjected,coverage,false,fog,true,false,volumeRange?&states:nullptr);
+        if(!result){LogD3DFailure("volume underside canopy draw",result);return false;}
+        return true;
+    }
     const auto weights=vc::canopy::layerWeights(settings,weather);
     const bool base=canopyTextures[0]&&canopyHasPixels[0]&&weights.base>1.f/255.f;
     const bool extra=canopyTextures[1]&&canopyHasPixels[1]&&weights.extra>1.f/255.f;
@@ -503,13 +535,13 @@ bool DrawBanks(RwCamera* camera,const vc::View& view,const vc::Range& range,
     const auto* offset=RwCameraGetViewOffset(camera);
     const float wx=window->x+(offset?std::abs(offset->x):0.f),
                 wy=window->y+(offset?std::abs(offset->y):0.f);
-    // Alpha accumulates through many volume planes. Ease in per-plane
-    // extinction to prevent a dense cloud appearing almost fully opaque
-    // the instant the altitude blend begins. Atlas cards are pre-integrated.
-    const float handoverVisibility=vc::weather::visibility(climate)*vc::weather::clearOpacity(climate)*handover;
+    // The canopy now approximates the same optical column as the volume.
+    // Blend the actual slice opacity against that projection rather than
+    // introducing a second unrelated density field in the transition.
+    const float handoverVisibility=vc::weather::visibility(climate)*vc::weather::clearOpacity(climate)*(canopyRelief.ready?1.f:handover);
     if(handoverVisibility<=1.f/255.f)return true;
-    const float visibility=handoverVisibility*handover;
-    bool farReady=EnsureBillboards();
+    const float visibility=canopyRelief.ready?handoverVisibility:handoverVisibility*handover;
+    bool farReady=vc::billboards::eligible(settings,range)&&EnsureBillboards();
     const auto bankLight=vc::banks::bankLight(light,climate);
     vc::d3d9::GpuPasses passes;
     passes.stream=&bankGpu;
@@ -517,7 +549,7 @@ bool DrawBanks(RwCamera* camera,const vc::View& view,const vc::Range& range,
     const auto weather=bankOptions.dual?climate.coverage:(climate.coverage>=.5f?1.f:0.f);
     const auto* occupancy=bankDownsampled?nullptr:&bankVolume;
     try {
-        if(farReady)farReady=DrawBillboards(view,range,climate,light,transform,viewport,fog,wx,wy,handover,states);
+        if(farReady)farReady=DrawBillboards(view,range,climate,light,transform,viewport,fog,wx,wy,canopyRelief.ready?1.f:handover,states);
         if(visibility<=1.f/255.f)return true;
         useGpu=bankGpu.available()&&passes.prepare(settings,view,range,canopyDrift,farReady,
             bankOptions.vertexFog,visibility,bankLight,transform,projection,viewport);
@@ -660,8 +692,11 @@ void __cdecl RenderClouds() {
             const auto* player=FindPlayerEntity();
             const float playerZ=player?player->GetPosition().z:0.f;
             const float requestedBlend=player?vc::canopy::handover(settings,playerZ):0.f;
-            const float volumeBlend=requestedBlend>1.f/255.f&&EnsureBanks()?requestedBlend:0.f;
+            const bool volumeReady=settings.hybridClouds&&(canopyRelief.ready||requestedBlend>1.f/255.f)&&EnsureBanks();
+            const float volumeBlend=volumeReady?requestedBlend:0.f;
             const auto independent=vc::cloudRange(settings);
+            const auto localVolume=canopyRelief.ready?vc::canopyVolume::volumeRange(settings,independent,playerZ,volumeBlend):independent;
+            const auto* nearVolume=volumeReady&&canopyRelief.ready?&localVolume:nullptr;
             const auto& viewMatrix=*reinterpret_cast<const D3DMATRIX*>(0xC9BC80);
             const auto& projection=*reinterpret_cast<const D3DMATRIX*>(0x8E2458);
             const auto transform=vc::d3d9::multiply(viewMatrix,projection);
@@ -671,6 +706,7 @@ void __cdecl RenderClouds() {
             auto* device=canopyDevice;
             if(device&&SUCCEEDED(device->GetViewport(&viewport))) {
                 plugin::Call<0x7FC200>(); // flush RW pending state before snapshot
+                const bool profiled=cloudProfiler.begin(device,Log);
                 vc::d3d9::StateScope state;
                 const auto captured=state.capture(device);
                 if(captured) {
@@ -678,15 +714,20 @@ void __cdecl RenderClouds() {
                     try {
                         const auto fog=vc::canopy::fogColour(palette);
                         vc::d3d9::DrawState states;
-                        drawn=DrawCanopy(view,independent,volumeBlend,climate,light,transform,viewport,fog,states);
-                        if(drawn&&volumeBlend>0.f&&!DrawBanks(camera,view,independent,climate,light,transform,projection,viewport,fog,volumeBlend,playerZ,states)) {
+                        const auto* window=RwCameraGetViewWindow(camera);
+                        const auto* offset=RwCameraGetViewOffset(camera);
+                        const float wx=window?window->x+(offset?std::abs(offset->x):0.f):1.f,
+                            wy=window?window->y+(offset?std::abs(offset->y):0.f):1.f;
+                        drawn=DrawCanopy(view,independent,volumeBlend,climate,light,transform,viewport,fog,wx,wy,nearVolume,states);
+                        if(drawn&&volumeReady&&!DrawBanks(camera,view,localVolume,climate,light,transform,projection,viewport,fog,volumeBlend,playerZ,states)) {
                             bankFailed=true;Log("3D cloud draw failed; retaining full canopy from next frame.");
                         }
                     } catch(const std::bad_alloc&) {Log("Cloud projection allocation failed.");}
                     const auto restored=state.restore();
+                    cloudProfiler.end(profiled,drawn&&bool(restored),playerZ,climate.coverage,volumeReady?localVolume.end:0.f,Log);
                     if(!restored){LogD3DFailure("restore",restored);return;}
                     if(drawn) {haveFrame=true;lastFrame=frameId;return;}
-                }
+                } else cloudProfiler.end(profiled,false,playerZ,climate.coverage,0.f,Log);
             }
         }
         // Resource failure uses the classic native geometry, without
@@ -761,6 +802,9 @@ public:
             Log("Volumetric cloud call does not target 0x716380; left untouched.");
             return;
         }
+        std::error_code profileError;
+        cloudProfiler.enabled=std::filesystem::exists(ModulePath()/L"VolumetricCloudsExtended.profile",profileError);
+        if(cloudProfiler.enabled)Log("Cloud profile enabled: sampled CPU and GPU times (nonblocking).");
         ResetField();
         plugin::patch::RedirectCall(CloudCall,RenderClouds);
         plugin::Events::initRwEvent += PreloadClouds;
@@ -773,7 +817,7 @@ public:
         plugin::Events::d3dLostEvent += ReleaseCanopyTextures;
         plugin::Events::d3dResetEvent += ReleaseBankTextures;
         plugin::Events::d3dResetEvent += ReleaseCanopyTextures;
-        Log(settings.renderMode==2 ? "Procedural volumetric cloud renderer installed (SA 1.0 US, radial D3D9 volume banks, far cloud LOD, independent cloud atmosphere, pure-device compatible)." : settings.lightingMode==0
+        Log(settings.renderMode==2 ? "Procedural volumetric cloud renderer installed (SA 1.0 US, world-fixed D3D9 volume banks, shared-density canopy, far cloud LOD, independent cloud atmosphere, pure-device compatible)." : settings.lightingMode==0
             ? "Procedural volumetric cloud renderer installed (SA 1.0 US, native lighting)."
             : "Procedural volumetric cloud renderer installed (SA 1.0 US, custom lighting).");
     }

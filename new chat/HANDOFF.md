@@ -1086,3 +1086,63 @@ remained a credible source of the swimming seen in flight.
   boundary tests. No changes to textures, shader, draw states, altitude
   handover, default INI, draw distance, or cache payload. Actual Celeron
   frame times and in-game screenshots require the target game/hardware.
+
+## Shared-density canopy, mixed-scale banks and potato workload diagnostics
+
+User video gta_sa_yBf9E3179I.mp4 (17.2s, 2560x1440, 30fps): at
+317m the old canopy is a bright unrelated flat sheet; 463m reveals
+darker full 3D banks, 570m and 1262m show actual cloud volume. Descent
+near 17.6m abruptly returns to the sheet. This iteration intentionally
+changes cloud artwork and transition rather than claiming byte parity
+with the old art. Preserve all earlier exact source-mesh optimizations.
+
+- Regional 4x4 noise bias, mean-centered per seed, supplements existing
+  7/13 macro, medium and detail noise; stronger strong-coverage crowns
+  (0.46 rather than 0.39 vertical tower factor). Original texture sizes,
+  optical transport, color modulation and world lattice remain.
+- CloudCanopyVolume.hpp: bake underside from actual volume alpha using
+  reference 90m optical path and front-to-back weighted luminance.
+  Premultiplied resampling retains 512/1024 output mask sizes. Sequential
+  contiguous slice scan and precomputed upsample taps avoid expensive
+  strided reads/repeated divisions. Same weather endpoint LERP and
+  bankLight; one texture draw even in mixed weather. 8x8 centroid relief
+  from both endpoints computed via contiguous integer accumulations
+  once after load or bake; no extra cache data. Fixed world/wind grid,
+  shared indexed vertices, bounded geometry, AABB/frustum/radial rejects,
+  distance-stable sort. Four subdivisions per tile when real volume is
+  available, eight when fallback. Extreme tiny size falls back to original
+  radial mesh using the same projected pixels.
+- Real nearby volume at ground: 630m range by default (fade from 72%),
+  expands to 1200m by old 85% altitude threshold, then full configured
+  range by nominal canopy height. The player Z controls range growth;
+  no globally fading-in unrelated formations. Canopy is attenuated
+  inside the matching volume range, retaining original distant underlay
+  in full flight. Existing fog isolation, fixed-function pixels and VS2
+  path unchanged. No new user INI option; HybridClouds=0 still canopy-only.
+  Added local 3D costs some GPU work compared with the old completely
+  flat ground path; actual device profiling is needed.
+- Version 3 cache deliberately invalidates v1/v2 art; exact compressed
+  layout/size 4,237,892 bytes unchanged. Build distributes v3 cache;
+  custom settings regenerate once, disk never touched on camera/weather.
+  Skip old standalone mask bake when shared volume succeeds.
+- Linux local single-core benchmark, -march=x86-64 -mtune=sandybridge,
+  actual source generation for 480 camera poses per altitude, simulated
+  same-core scene-culling competitor (not GTA or an emulation). GPU-source
+  median/p95 ms 30m .033/.061; 317m .082/.191; 400m .129/.240;
+  523m .212/.803; 1000m .129/.244. CPU fallback worst p95 5.011ms.
+  Mean 30m workload 282 canopy + 364 volume triangles, 523m 201+5788+119.
+  Ground 3D is new work; no actual HD2000 timings from Linux.
+- Optional marker file VolumetricCloudsExtended.profile enables sampling
+  cloud pass CPU wall time every 60 calls and asynchronous GPU timestamp
+  interval when supported. Nonblocking GetData(0 flags), discard disjoint,
+  no query timing in ordinary gameplay, release on device loss/reset.
+  Marker is deliberately not packaged. Timing includes cloud pass
+  submission/driver, not full GTA frame; GPU interval can include queue
+  gaps due to CPU submission. Delete marker to disable.
+- Bench script tests/cloud_workload_benchmark.cpp with --scene-load;
+  tests/banks_preview.cpp/.py now use actual new canopy and range
+  logic. Software previews in docs/previews/new_* are diagnostic only.
+  Native D3D9 test includes combined real canopy and volume draw at
+  30/317/400m both endpoints, visibility and foreground depth sentinel.
+  Portable tests include independent optical product and fixed world
+  vertex parity across camera rotation, monotonic local range, v3 cache.

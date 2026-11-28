@@ -1,4 +1,5 @@
 #include "../CloudBillboards.hpp"
+#include "../CloudCanopyVolume.hpp"
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -32,42 +33,61 @@ int main(int argc,char** argv) {
         std::ofstream file(path+suffix,std::ios::binary);
         file.write(reinterpret_cast<const char*>(pixels.data()),pixels.size()*sizeof(canopy::Pixel));
     };
-    save(map.pixels,".canopy");save(map.extraPixels,".extra");save(volume.pixels[0],".clear3d");save(volume.pixels[1],".wet3d");
+    canopyVolume::MaskPair masks{std::move(map.pixels),std::move(map.extraPixels)};
+    canopyVolume::Relief relief;
+    if(s.hybridClouds) {
+        canopyVolume::project(s,volume,canopy::textureSize(s),masks);
+        relief.build(s,volume);
+    }
+    save(masks[0],".canopy");save(masks[1],".extra");save(volume.pixels[0],".clear3d");save(volume.pixels[1],".wet3d");
     std::cout<<p.skyTop.r<<' '<<p.skyTop.g<<' '<<p.skyTop.b<<' '<<p.skyBottom.r<<' '<<p.skyBottom.g<<' '<<p.skyBottom.b<<'\n';
     const float blend=canopy::handover(s,view.pos.z);
-    const auto canopyMesh=canopy::mesh(s,view,r,{},blend);
+    const auto local=canopyVolume::volumeRange(s,r,view.pos.z,blend);
+    canopyVolume::Mesh canopyMesh;
+    if(relief.ready)canopyVolume::mesh(canopyMesh,relief,s,view,r,{},480.f/510.f,270.f/510.f,blend,&local);
+    else {
+        const auto flat=canopy::mesh(s,view,r,{},blend);
+        canopyMesh.vertices.assign(flat.vertices.begin(),flat.vertices.end());
+        canopyMesh.indices.assign(flat.indices.begin(),flat.indices.end());
+    }
     const auto emit=[&](int layer,float opacity){
-        std::cout<<layer<<' '<<canopyMesh.vertices.size()<<' '<<canopyMesh.indices.size()/3<<'\n';
+        const auto colour=relief.ready?banks::bankLight(light,climate):light.bright;
+        std::cout<<layer<<' '<<canopyMesh.vertices.size()<<' '<<canopyMesh.indices.size()/3;
+        if(layer==4)std::cout<<' '<<climate.coverage;
+        std::cout<<'\n';
         for(const auto& v:canopyMesh.vertices) {
             const auto d=v.pos-view.pos;
             std::cout<<dot(d,view.right)<<' '<<dot(d,view.up)<<' '<<dot(d,view.forward)<<' '<<v.u<<' '<<v.v<<' '<<0.f<<' '<<v.alpha*opacity
-              <<' '<<light.bright.r/255.f<<' '<<light.bright.g/255.f<<' '<<light.bright.b/255.f<<' '<<cloudFogFactor(s,length(d))<<'\n';
+              <<' '<<colour.r/255.f<<' '<<colour.g/255.f<<' '<<colour.b/255.f<<' '<<cloudFogFactor(s,length(d))<<'\n';
         }
         for(std::size_t i=0;i<canopyMesh.indices.size();i+=3)std::cout<<canopyMesh.indices[i]<<' '<<canopyMesh.indices[i+1]<<' '<<canopyMesh.indices[i+2]<<'\n';
     };
     auto lw=canopy::layerWeights(s,climate);
-    if(lw.base>1.f/255.f)emit(0,lw.base);
-    if(lw.extra>1.f/255.f)emit(1,lw.extra);
-    if(blend>0.f){
+    if(relief.ready)emit(4,lw.base);
+    else {
+        if(lw.base>1.f/255.f)emit(0,lw.base);
+        if(lw.extra>1.f/255.f)emit(1,lw.extra);
+    }
+    if(s.hybridClouds){
         const auto bankLight=banks::bankLight(light,climate);
         banks::Mesh silhouettes;
-        if(billboards::eligible(s,r)) {
+        if(billboards::eligible(s,local)) {
             billboards::Atlas atlas;atlas.build(s,volume);
             save(atlas.pixels[0],".atlas0");save(atlas.pixels[1],".atlas1");
-            billboards::buildMesh(silhouettes,s,view,r,{},atlas,480.f/510.f,270.f/510.f,climate.coverage);
+            billboards::buildMesh(silhouettes,s,view,local,{},atlas,480.f/510.f,270.f/510.f,climate.coverage);
             std::cout<<3<<' '<<silhouettes.vertices.size()<<' '<<silhouettes.indices.size()/3<<' '<<climate.coverage<<'\n';
             for(const auto& v:silhouettes.vertices) {
                 const auto d=v.pos-view.pos;
-                std::cout<<dot(d,view.right)<<' '<<dot(d,view.up)<<' '<<dot(d,view.forward)<<' '<<v.u<<' '<<v.v<<' '<<v.w<<' '<<v.alpha*weather::visibility(climate)*weather::clearOpacity(climate)*blend
+                std::cout<<dot(d,view.right)<<' '<<dot(d,view.up)<<' '<<dot(d,view.forward)<<' '<<v.u<<' '<<v.v<<' '<<v.w<<' '<<v.alpha*weather::visibility(climate)*weather::clearOpacity(climate)
                     <<' '<<bankLight.r/255.f<<' '<<bankLight.g/255.f<<' '<<bankLight.b/255.f<<' '<<v.fog<<'\n';
             }
             for(std::size_t i=0;i<silhouettes.indices.size();i+=3)std::cout<<silhouettes.indices[i]<<' '<<silhouettes.indices[i+1]<<' '<<silhouettes.indices[i+2]<<'\n';
         }
-        banks::Mesh mesh;banks::buildMesh(mesh,s,view,r,{},480.f/510.f,270.f/510.f,&volume,climate.coverage,billboards::eligible(s,r));
+        banks::Mesh mesh;banks::buildMesh(mesh,s,view,local,{},480.f/510.f,270.f/510.f,&volume,climate.coverage,billboards::eligible(s,local));
         std::cout<<2<<' '<<mesh.vertices.size()<<' '<<mesh.indices.size()/3<<' '<<climate.coverage<<'\n';
         for(const auto& v:mesh.vertices){
             const auto d=v.pos-view.pos;
-            std::cout<<dot(d,view.right)<<' '<<dot(d,view.up)<<' '<<dot(d,view.forward)<<' '<<v.u<<' '<<v.v<<' '<<v.w<<' '<<v.alpha*weather::visibility(climate)*weather::clearOpacity(climate)*blend*blend
+            std::cout<<dot(d,view.right)<<' '<<dot(d,view.up)<<' '<<dot(d,view.forward)<<' '<<v.u<<' '<<v.v<<' '<<v.w<<' '<<v.alpha*weather::visibility(climate)*weather::clearOpacity(climate)
               <<' '<<bankLight.r/255.f<<' '<<bankLight.g/255.f<<' '<<bankLight.b/255.f<<' '<<v.fog<<'\n';
         }
         for(std::size_t i=0;i<mesh.indices.size();i+=3)std::cout<<mesh.indices[i]<<' '<<mesh.indices[i+1]<<' '<<mesh.indices[i+2]<<'\n';

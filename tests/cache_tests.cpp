@@ -11,6 +11,7 @@ int main(){
     vc::billboards::Atlas a;
     if(vc::billboards::eligible(s,vc::cloudRange(s)))a.build(s,v);
     vc::cache::Masks m{map.pixels,map.extraPixels},loaded;
+    vc::canopyVolume::project(s,v,size,m);
     std::stringstream f(std::ios::in|std::ios::out|std::ios::binary);
     CHECK(vc::cache::save(f,s,size,m,v,a));
     const auto bytes=f.str();vc::banks::Volume lv;vc::billboards::Atlas la;
@@ -18,18 +19,20 @@ int main(){
     const auto equal=[](const auto& x,const auto& y){return x.size()==y.size()&&(x.empty()||!std::memcmp(x.data(),y.data(),x.size()*sizeof(vc::canopy::Pixel)));};
     for(int i=0;i<2;++i){CHECK(equal(m[i],loaded[i]));CHECK(equal(v.pixels[i],lv.pixels[i]));CHECK(equal(a.pixels[i],la.pixels[i]));}
     CHECK(v.occupied==lv.occupied&&v.occupiedPrefix==lv.occupiedPrefix&&a.occupied==la.occupied);
-    // Backward compatibility: existing v1 files remain usable without
-    // re-baking, and v2 halves pixel bytes without changing any bake.
-    std::stringstream legacy(std::ios::in|std::ios::out|std::ios::binary);
-    CHECK(vc::cache::save(legacy,s,size,m,v,a,vc::cache::LegacyVersion));
-    CHECK(legacy.str().size()>bytes.size()&&bytes.size()<legacy.str().size()*0.51);
-    loaded={};lv={};la={};
-    CHECK(vc::cache::load(legacy,s,size,loaded,lv,la));
-    for(int i=0;i<2;++i){CHECK(equal(m[i],loaded[i]));CHECK(equal(v.pixels[i],lv.pixels[i]));CHECK(equal(a.pixels[i],la.pixels[i]));}
-    CHECK(v.occupied==lv.occupied&&v.occupiedPrefix==lv.occupiedPrefix&&a.occupied==la.occupied);
+    // The compressed layout is unchanged, but the art is different.
+    // Reject older versions even if they have the same dimensions.
+    for(std::uint32_t version:{1u,2u}) {
+        auto old=bytes;
+        std::memcpy(old.data()+offsetof(vc::cache::Header,version),&version,sizeof(version));
+        std::istringstream stale(old);
+        CHECK(!vc::cache::load(stale,s,size,loaded,lv,la));
+    }
+    vc::canopyVolume::Relief aRelief,bRelief;
+    aRelief.build(s,v);bRelief.build(s,lv);
+    CHECK(aRelief.ready&&bRelief.ready&&aRelief.heights==bRelief.heights);
     auto invalid=m;invalid[0][0]={1,2,3,4};std::ostringstream colour;
     CHECK(!vc::cache::save(colour,s,size,invalid,v,a));
-    std::cout<<"Legacy cache "<<legacy.str().size()<<" bytes; compact "<<bytes.size()<<" bytes.\n";
+    std::cout<<"Version 3 shared-density compact cache "<<bytes.size()<<" bytes; old art rejected.\n";
     auto wrong=s;wrong.seed++;std::istringstream badKey(bytes);
     CHECK(!vc::cache::load(badKey,wrong,size,loaded,lv,la));
     auto corrupt=bytes;corrupt[corrupt.size()/2]^=1;std::istringstream badData(corrupt);
