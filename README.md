@@ -1,9 +1,9 @@
 # VolumetricCloudsExtended.SA
 
 A procedural replacement for GTA San Andreas' stock intersecting-card volumetric clouds.
-The default renderer uses a cheap world-fixed canopy derived from the
-actual 3D density, with a small nearby volume zone even on the ground.
-The volume draw radius grows smoothly to its full range in flight. It uses hardware-filtered volume texture slices and
+The default renderer uses a world-anchored directional optical canopy projected
+from the actual 3D density, with no independent cloud field. The nearby true
+volume grows smoothly as the player climbs toward the cloud deck. It uses hardware-filtered volume texture slices and
 fixed-function blending, not a per-pixel raymarch shader. It only
 replaces the volumetric cloud call in the original 3D effects pass. The sky background,
 low clouds, moving fog, rain and other effects remain native.
@@ -39,8 +39,9 @@ pipeline may still need compatibility testing.
   tops, flatter bases, and soft erosion. The nearby field is sampled by
   fixed-world-axis slice patches with absolute world XYZ texture coordinates.
   Neither rotating nor translating the camera moves the density-sampling
-  planes. The nearby volume is always available; its range expands toward
-  the full draw distance from 70% of the canopy height to the canopy,
+  planes. The directional canopy represents the same cells from below, the side
+  and above. The nearby true volume grows as the player approaches the deck,
+  expanding toward the full draw distance from 70% of the canopy height to the canopy,
   based on actual player or occupied vehicle Z, not camera orientation.
   `HybridClouds=0` selects the inexpensive original canopy-only renderer.
 - Frustum rejection, independent mode 2 cloud range, smooth range and near fades,
@@ -62,7 +63,7 @@ old draw and fog distances, and any explicit UseAdditionalTextures setting.
 | RenderMode | 2 | 2 = continuous volume banks + distant layer; 1 = clustered classic cards; 0 = crossed classic cards |
 | HybridClouds | 1 | Mode 2: nearby 3D plus shared-density canopy; full 3D range expands at 70% of canopy height; 0 keeps canopy everywhere |
 | CumulusDetail | 0 | Economy (recommended); 1 = larger textures and more samples |
-| FarHalfRes | 0 | Experimental: accumulate distant volume at half resolution, then composite at full scene depth. Enable manually to test. |
+| FarHalfRes | 1 | Guarded economy mode: accumulate far volume and sufficiently expensive directional canopy prefixes at half resolution; near geometry remains native. Set 0 for full resolution. |
 | TargetProcClouds | 120 | Sky coverage in mode 2; classic cloud group count otherwise; 0 disables |
 | BadWeatherDensityMultiplier | 1.4 | Cloud density in bad weather relative to clear (0–3) |
 | MinSpawnZ / MaxSpawnZ | 450 / 800 | Cloud layer height above sea level |
@@ -71,7 +72,7 @@ old draw and fog distances, and any explicit UseAdditionalTextures setting.
 | Opacity | 1 | Cloud thickness (0–2) |
 | Seed | 17321 | Repeatable cloud pattern |
 | CloudDrawDistance | 8000 | Independent 3D and distant cloud visibility (300–12000 world units) |
-| FarBillboards | 1 | Beyond the far threshold, transition to cheap volume-projected cards; 0 keeps the full volume |
+| FarBillboards | 1 | Enable volume-projected directional canopy and distant flight cards; 0 retains the legacy hybrid path |
 | BillboardStartDistance | 5000 | Minimum distance for the billboard transition (5000–12000) |
 | BillboardStartRatio | 0.65 | Also start no sooner than this fraction of CloudDrawDistance (0.5–0.95) |
 | CloudFogStart / CloudFogEnd | 1600 / 8000 | Cloud-only colour haze starts/ends here. Equal values disable colour fog. |
@@ -190,32 +191,29 @@ and [pure-device GetViewport documentation](https://learn.microsoft.com/en-us/wi
   3D up to 5200m, blended 3D/cards to 6000m, cards beyond. At 4200m,
   there are no billboards. The two geometric representations crossfade
   over distance, not camera height or heading.
-- **Far LOD:** the exact clear/wet volume is projected front-to-back
-  into two small 512² atlases, 16 overlapping periodic world cells ×
-  8 azimuths. Smooth partition-of-unity cell weights reduce seams;
-  the optical integration supplies real volume silhouette and shading,
-  not stock cloud sprites. Upright cards face the *camera position*
-  (not direction), with adjacent azimuth images alpha-crossfaded and
-  radially sorted. The transition is deferred at extreme flight height
-  rather than drawing edge-on upright cards from above. All cards share
-  a single batch. Guards prevent atlas
-  bleeding; no atlas mip chain is allocated. Far LOD is optional, and
-  volume remains active over the full range if the atlas cannot be
-  prepared/uploaded or if unusually tiny cells would require too many
-  cards. Directional blending and slab projection are approximations.
+- **Directional canopy and far LOD:** project the exact clear/wet volume
+  into two 1024² atlases, 25 overlapping periodic world cells × 8
+  azimuths × 5 elevations (-90° to +90°). The 32² tiles have guard texels;
+  there is no mip chain. Narrow partition-of-unity windows, triangular
+  angular interpolation (at most three projections) with smooth stable
+  angle bins, and fixed world-space zenith/nadir bases avoid unrelated
+  flat-sheet shapes. Cell position, wind, density, weather endpoints,
+  relief and lighting stay shared. Empty cells produce no projection.
+  Each tile is trimmed to conservative filtered-alpha bounds; large sparse
+  cards can use two disjoint rectangles instead of a large transparent quad.
+  This is still an orthographic optical approximation, not an exact
+  per-pixel representation of the volume.
 - **Altitude handover:** nominal canopy height is
   `MinSpawnZ + 0.52 * (MaxSpawnZ - MinSpawnZ)` (632m for 450–800m).
-  A small true-volume zone (600m default at street level) grows to
-  1200m before 70% of that height, then expands to the full range from
-  70% to 100% (442.4–632m). The shared-density canopy fades with the
-  complement of the actual radial volume weight, using an optical-depth
-  approximation to reduce the midpoint opacity dip. Where the volume
-  fully contributes, the canopy emits no visible triangles. The transition changes distance,
-  not the density or opacity of nearby clouds. The actual player or
-  vehicle Z controls it, not camera pitch. Both rendering paths sample
-  the same period, wind, weather endpoints and baked luminance.
-  If the volume fails, keep the full relief canopy; `HybridClouds=0`
-  retains a standalone inexpensive curved 2D sheet.
+  At street level the directional layer covers the sky; as the player
+  climbs it gives way to nearby actual volume. The radial transition
+  grows from 70% to 100% (442.4–632m); both representations use the
+  same radial LOD and complement, including the proxy vertex fades.
+  At default flight height this is 5200–6000m. There is no independent
+  relief sheet in this path. Camera yaw does not move the world cells.
+  If atlas or volume support is unavailable, use the previous relief
+  canopy and conservative volume fallback. `HybridClouds=0` retains
+  the cheap standalone curved 2D sheet.
 - **Cost (potato hardware):** mode 2 keeps the identical world-density,
   sampling lattice, weather, optical weights and far atlas. VS 2.0 hardware
   vertex processing replaces CPU per-corner square roots, fades, projection
@@ -224,8 +222,8 @@ and [pure-device GetViewport documentation](https://learn.microsoft.com/en-us/wi
   draw clouds beyond the map far plane. Hardware clipping, not a flattened
   entire triangle, preserves occlusion. Both draw passes reuse one
   DISCARD-streamed vertex buffer and a static reversed quad index buffer.
-  The canopy and far LOD remain fixed-function. No pixel shader, ray
-  marcher, new render target or additional texture fetch is introduced.
+  The canopy and far LOD remain fixed-function. No pixel shader or ray
+  marcher is introduced. The guarded distant-only RT is optional.
   Pure/software/unsupported devices have the original CPU path; hardware
   failures switch to that path rather than disabling 3D. No runtime shader
   compiler or external DLL is needed (FXC runs at build time).
@@ -279,13 +277,15 @@ and [pure-device GetViewport documentation](https://learn.microsoft.com/en-us/wi
   luminance + opacity rather than duplicate RGB channels: the default
   economy file shrinks from 8,432,196 to 4,237,892 bytes (~4.04 MiB)
   without altering a texel. Version 3 retains the compressed byte layout
-  but invalidates v1/v2 because the new shared-density artwork differs.
+  but invalidates v1/v2 because the shared-density artwork differs. Version
+  4 rebuilds the expanded directional atlas and derives its exact alpha
+  bounds and fine slice support from source texels on load.
   The release ZIP includes a pre-baked default cache. Keep it beside the
   ASI. During RenderWare initialization a single sequential read validates
   the version, relevant bake settings, expected lengths and checksum.
   Missing, stale or corrupted files rebuild automatically. Replacement is
   atomic; an unwritable folder simply uses generated data. CPU data stays
-  resident (~8.04 MiB expanded default schematic), including across game
+  resident (larger than v3 due to the directional atlas), including across game
   restarts within the same process and D3D9 device loss/reset. GPU textures
   are preloaded during startup; late ASI loaders retain the lazy fallback.
   Reset recovery reuploads from RAM without reopening the cache.
@@ -626,7 +626,7 @@ complementary, not an emulation of the Celeron 847/Intel HD Graphics,
 RenderWare world rendering, or shared-memory contention on that system.
 Do not convert their timings into an alleged in-game FPS for that hardware.
 
-### Wider cloud formations, optical handover and fill-rate work
+### Previous iteration: wider cloud formations, optical handover and fill-rate work
 
 Fresh defaults: 450–800m cloud band, 120 coverage units instead of 160,
 horizontal scale 1.5 instead of 1.0. The size of the periodic tile is
@@ -683,4 +683,76 @@ and supports a same-scene split at 450m camera depth. It does not simulate
 a particular GPU, filtering hardware or GTA depth buffer. Windows CI also
 runs paired `--benchmark 640 480` and `--benchmark-half 640 480` using the
 real backend, and checks the depth sentinel, RGB deviation and state
-restoration. The half-res path is deliberately optional.
+restoration. The half-res path was initially deliberately opt-in; see the current iteration below.
+
+
+### Current iteration: a single directional cloud field and exact fill rejection
+
+The old relief canopy was a geometrically mismatched representation of the
+field. Even with identical XY density, a ray through a curved 2D height
+surface does not necessarily encounter the same cloud that a ray through a
+3D volume encounters. Rather than further tuning a global fade, this path
+uses the existing volumetric density itself to bake the directional canopy
+and reuses that atlas at every altitude. No independently spawned cloud can
+appear merely because the representation changes. The optical proxy is
+approximate and limited by its cell/elevation resolution; in-game silhouette
+alignment is not claimed to be exact.
+
+- Five elevation samples include overhead and above-cloud views, eight
+  azimuths, world-anchored overlapping cells, clear and wet endpoints.
+  Angular interpolation is continuous and uses at most three cards; no
+  new runtime texture lookup or pixel shader for the angle blend.
+- The exact source alpha support of each slice is precomputed once from
+  both endpoints. A conservative filtering halo rejects provably empty
+  rectangles even when coarse occupancy reports a possible hit. Geometry
+  and ordering of surviving patches are byte-identical to the same mesh
+  built without the fine rejection. Atlas alpha-support trimming likewise
+  removes strictly zero-alpha support including the bilinear halo.
+- Reuse the optional premultiplied far target for an expensive far-only
+  prefix of the sorted impostors. Gate on actual projected area and number
+  of triangles, composite only its padded screen rectangle at original
+  scene depth, then draw the remaining near tail in its original order.
+  Formats/MSAA/MRT/depth/capability checks preserve native rendering on
+  unsupported targets. `FarHalfRes=1` is the fresh economy default; explicit
+  existing INI values remain unchanged and `CumulusDetail=1` stays full-res.
+- Cache v4 carries the expanded atlas; occupancy and trim bounds are
+  derived from loaded texels. Existing caches are rebuilt. GPU texture
+  residency increases (two 1024² A8L8 atlases rather than two 512²).
+- Strictly lossless empty-support optimizations and approximate distant
+  resolution reduction are separate; reduced-resolution rendering is not
+  mathematically pixel-identical. Ground views are more costly than the
+  previous single sheet, but now use the same representation as flight.
+  Neither WARP nor the Linux software rasterizer proves 2006 GPU FPS.
+
+The synthetic screenshot strip below uses actual source density, projection,
+and LOD mesh, not a GTA capture. The five handover poses share an identical
+horizontal camera location and heading; the street view is a separate pose.
+For the original and derived geometry tests, see `tests/banks_tests.cpp`;
+for native depth/colour/state regression see `tests/d3d9_volume_test.cpp`.
+
+![Directional canopy and altitude handover](docs/previews/directional_handover.jpg)
+
+![Directional flight](docs/previews/directional_flight.jpg)
+![Directional above deck](docs/previews/directional_above.jpg)
+
+640×360 software diagnostic, fixed reference poses; fragment counts include
+covered pixel centers before alpha rejection and estimated composite work.
+The original v3 full-resolution path is the comparison baseline.
+
+| Pose | v3 full-res | v4 full-res | v4 guarded half-res |
+|---|---:|---:|---:|
+| Street | 185,328 | 1,366,210 | 536,172 |
+| Z535 entry | 6,977,747 | 6,305,820 | 4,392,265 |
+| Flight | 8,638,339 | 8,373,931 | 6,238,415 |
+| Above deck | 6,044,913 | 5,807,824 | 3,599,599 |
+| Rain flight | 8,674,682 | 8,512,322 | 6,300,076 |
+
+Full-vs-half v4 mean absolute RGB delta (0–255): street 0.273, entry
+0.102, flight 0.008, above 0.321, rain flight 0.001. Above-deck had
+0.016% of pixels with any channel differing by more than 32; other
+listed poses had none. This compares only reducing resolution, not
+the intentional change of canopy representation. Source-only Linux
+benchmark (same-host sequential run) median at Z635: GPU input
+0.237→0.174ms; CPU mesh 0.900→0.607ms. At ground the GPU input
+preparation rose from 0.017 to 0.049ms, a tradeoff for the directional
+projection. No GPU execution time or in-game frame rate is implied.

@@ -8,7 +8,7 @@
 // The periodic world schematic is immutable. Weather changes blend its two
 // baked endpoints and wind shifts coordinates; neither requires disk writes.
 namespace vc::cache {
-constexpr std::uint32_t Version=3; // new shared density and underside projection
+constexpr std::uint32_t Version=4; // elevation-aware cell atlas
 static_assert(sizeof(canopy::Pixel)==4);
 struct Hash {
     std::uint64_t value=14695981039346656037ull;
@@ -79,7 +79,7 @@ inline bool load(std::istream& in,const Settings& s,int size,Masks& masks,banks:
     std::uint64_t check=0;
     if(!in.read(reinterpret_cast<char*>(&check),sizeof(check))||check!=h.value||
        in.peek()!=std::char_traits<char>::eof())return false;
-    if(s.hybridClouds)v.buildRectangleMasks();
+    if(s.hybridClouds){v.buildRectangleMasks();v.buildPlaneSupport();if(!a.pixels[0].empty())a.buildBounds();}
     masks=std::move(m);volume=std::move(v);atlas=std::move(a);
     return true;
 }

@@ -463,6 +463,22 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
                 if(!renderHardware(trimmed))return fail("Full two-pass reference");
                 std::vector<DWORD> full;if(!capture(full))return fail("Full two-pass capture");
                 trimmed.restrictTo(gm);
+                if(sceneDistance==450.f) {
+                    banks::GpuMesh coarse;
+                    banks::buildMesh(coarse,settings,camera,cloudRange(settings),{},wx,wy,
+                        uploadWidth==volume.width&&uploadDepth==volume.depth?&volume:nullptr,coverage,true,true,false);
+                    if(!hw.upload(coarse))return fail("Coarse occupancy reference upload");
+                    auto old=trimmed;old.restrictedCount=0;
+                    if(FAILED(device->Clear(0,nullptr,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER,0xFF000000,1.f,0)))return fail("Coarse occupancy clear");
+                    if(FAILED(device->Clear(1,&sentinel,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER,0xFF008000,.5f,0)))return fail("Coarse occupancy sentinel");
+                    if(FAILED(device->BeginScene()))return fail("Coarse occupancy begin");
+                    const auto oldDraw=d3d9::drawRaw(device,{textures[0],textures[1]},opts,nullptr,UINT(coarse.vertices.size()),
+                        sizeof(banks::GpuVertex),0,nullptr,UINT(coarse.triangleCount()),coverage,opts.vertexFog,true,false,
+                        D3DCOLOR_XRGB(90,120,160),nullptr,nullptr,true,&old);
+                    if(FAILED(device->EndScene())||!oldDraw)return fail("Coarse occupancy draw");
+                    if(!exact("Precise occupancy GPU readback",full))return fail("Precise occupancy altered visible pixels");
+                    if(!hw.upload(gm))return fail("Restore precise occupancy VB");
+                }
                 const auto submitted=trimmed.ranges[0].count()+trimmed.ranges[1].count();
                 saved+=2*gm.vertices.size()-submitted;
                 if(!renderHardware(trimmed))return fail("Range-trimmed draw");
@@ -570,6 +586,52 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
         if(FAILED(hr=device->EndScene()))return fail("Compact atlas end",hr);
         if(!result)return fail(result.operation,result.hr);
         if(!compare("Distant cloud atlas",reference))return fail("Compact atlas visual parity");
+    }
+    {
+        const Vec f=unit(Vec{0,1,.38f}),right=unit(cross(f,{0,0,1})),up=cross(right,f);
+        const View ground{{2266,-1271,30},right,up,f,450,1};
+        const auto r=cloudRange(settings);
+        const auto lod=banks::hybridLod(settings,r,ground.pos.z,ground.pos.z);
+        banks::Mesh groundCards;
+        billboards::buildMesh(groundCards,settings,ground,r,{},atlas,wx,wy,.5f,&lod);
+        auto camera=d3d9::identity();
+        camera._11=right.x;camera._21=right.y;camera._31=right.z;camera._41=-dot(ground.pos,right);
+        camera._12=up.x;camera._22=up.y;camera._32=up.z;camera._42=-dot(ground.pos,up);
+        camera._13=f.x;camera._23=f.y;camera._33=f.z;camera._43=-dot(ground.pos,f);
+        const auto mat=d3d9::multiply(camera,proj);
+        d3d9::ProjectedMesh batch;
+        for(const auto& p:groundCards.vertices)batch.clip.push_back(d3d9::clipVertex(p.pos,p.u,p.v,p.w,p.alpha,p.fog,mat));
+        d3d9::projectMesh(batch,viewport,{240,240,240},1.f,groundCards.indices.data(),groundCards.indices.size());
+        if(batch.indices.empty())return fail("No directional ground canopy");
+        const D3DRECT sentinel{0,0,LONG(desc.Width/4),LONG(desc.Height/4)};
+        d3d9::StateScope scope;d3d9::FarLayer layer;
+        std::vector<DWORD> full;
+        for(int half=0;half<2;++half) {
+            if(FAILED(device->Clear(0,nullptr,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER,0xFF50779F,1.f,0)))return fail("Directional ground clear");
+            if(FAILED(device->Clear(1,&sentinel,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER,0xFF008000,.1f,0)))return fail("Directional ground sentinel");
+            if(FAILED(device->BeginScene())||!scope.capture(device))return fail("Directional ground begin");
+            bool used=false;d3d9::DrawState cache;
+            const auto result=d3d9::drawFarProjected(device,{compactFar[0],compactFar[1]},atlasOpts,batch,.5f,
+                {90,120,160},viewport,half?&layer:nullptr,&cache,&used);
+            if(!scope.restore()||FAILED(device->EndScene())||!result)return fail("Directional ground draw");
+            std::vector<DWORD> pixels;if(!capture(pixels))return fail("Directional ground capture");
+            if(!half){full=std::move(pixels);continue;}
+            unsigned large=0;std::uint64_t error=0;
+            for(UINT y=0;y<desc.Height;++y)for(UINT x=0;x<desc.Width;++x) {
+                const auto i=std::size_t(y)*desc.Width+x;
+                if(x<desc.Width/4&&y<desc.Height/4&&(pixels[i]&0xFFFFFFu)!=(full[i]&0xFFFFFFu))
+                    return fail("Reduced directional proxy crossed foreground depth");
+                int maximum=0;
+                for(int shift:{0,8,16}) {
+                    const int e=std::abs(int((pixels[i]>>shift)&255)-int((full[i]>>shift)&255));
+                    error+=e;maximum=std::max(maximum,e);
+                }
+                large+=maximum>32;
+            }
+            const double mean=double(error)/(3*pixels.size());
+            std::printf("Directional canopy half-res: used=%d, mean RGB delta %.3f/255, %u pixels >32; native depth preserved\n",int(used),mean,large);
+            if((used&&(mean>5.||large>pixels.size()/16))||(!used&&error))return fail("Directional proxy visual deviation");
+        }
     }
     // Compare a complete mixed sequence with and without the within-scope
     // state cache. Includes stage 1/2 enable/disable, filter/fog toggles,

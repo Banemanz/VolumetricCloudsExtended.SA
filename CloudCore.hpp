@@ -41,7 +41,7 @@ struct Settings {
     float spawnRadiusMin = 300.f, spawnRadiusMax = 2200.f;
     float renderMaxDist = 2200.f, respawnMaxDist = 2800.f; // legacy cards only
     float cloudDrawDistance = 8000.f, cloudFogStart = 1600.f, cloudFogEnd = 8000.f; // mode 2 independent atmosphere
-    bool farHalfRes = false; // experimental distant-only premultiplied half-resolution pass
+    bool farHalfRes = true; // guarded distant-only premultiplied half-resolution pass
     bool farBillboards = true; // distant volume-projected impostors
     float billboardStartDistance = 5000.f, billboardStartRatio = .65f;
     float windMoveScale = .9f, minSpacing2D = 45.f, spawnFadeInSpeed = .02f;
@@ -157,8 +157,8 @@ inline void write(std::ostream& out, const Settings& c) {
 #define FIELD(name,member,comment) out << "; " comment "\n" #name "=" << c.member << "\n";
     out << "[Renderer]\n";
     FIELD(RenderMode,renderMode,"2 = 3D cloud banks (recommended), 1 = clustered classic clouds, 0 = classic crossed clouds.")
-    FIELD(HybridClouds,hybridClouds,"Mode 2: 1 = nearby 3D clouds + distant canopy; full 3D distance expands above 70% of canopy height. 0 = canopy only.")
-    FIELD(FarHalfRes,farHalfRes,"Experimental: half-resolution distant volume beyond scene far clip (economy mode, compatible targets only).")
+    FIELD(HybridClouds,hybridClouds,"Mode 2: 1 = directional canopy + nearby 3D; flight range expands from 70% of canopy height. 0 = inexpensive flat canopy.")
+    FIELD(FarHalfRes,farHalfRes,"Economy: half-resolution distant clouds beyond scene far clip (compatible targets only).")
     FIELD(CumulusDetail,cumulusDetail,"Mode 2: 0 = economy (recommended); 1 = finer textures and more samples.")
     out << "\n[Clouds]\n";
     FIELD(TargetProcClouds,targetProcClouds,"How much of the sky is covered (0-512; 0 disables all custom clouds). Classic modes use this as the group count.")
@@ -171,7 +171,7 @@ inline void write(std::ostream& out, const Settings& c) {
     FIELD(Seed,seed,"Change this number for a different repeatable cloud pattern.")
     out << "\n[Atmosphere]\n";
     FIELD(CloudDrawDistance,cloudDrawDistance,"Mode 2: visibility of 3D clouds and distant layers, independent of the world.")
-    FIELD(FarBillboards,farBillboards,"Mode 2: replace very distant 3D clouds with baked cloud images (1 = recommended; 0 = full volume).")
+    FIELD(FarBillboards,farBillboards,"Mode 2: enable directional cloud canopy and far 3D impostors (1 = recommended; 0 = legacy hybrid).")
     FIELD(BillboardStartDistance,billboardStartDistance,"Minimum distance before the far billboard transition may start (at least 5000).")
     FIELD(BillboardStartRatio,billboardStartRatio,"Also start no sooner than this fraction of CloudDrawDistance (0.65 = 65%).")
     FIELD(CloudFogStart,cloudFogStart,"Mode 2: distance where clouds begin to blend into the sky.")

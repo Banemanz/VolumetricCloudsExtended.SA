@@ -99,6 +99,27 @@ inline Lod lod(const Settings& s,const Range& r,bool available=true,float altitu
     if(start>=r.end-1.f)return {r.end,r.end};
     return {start,std::min(r.end,start+std::max(350.f,r.end*.10f))};
 }
+// On the normal hybrid path the distant representation is an actual
+// directional projection of the density, not an unrelated canopy plane.
+// Player altitude changes the fidelity radius, never the cloud field.
+inline Lod hybridLod(const Settings& s,const Range& r,float playerZ,float cameraZ) {
+    const float offset=cameraZ-(s.minSpawnZ+s.maxSpawnZ)*.5f;
+    const auto flight=lod(s,r,true,offset);
+    if(flight.start>=flight.end)return flight;
+    const float blend=canopy::handover(s,playerZ);
+    // Five atlas cells per tile: keep close rays in the actual volume.
+    const float cell=canopy::tileWorldSize(s)/5.f;
+    // Below the cloud deck the directional canopy already represents
+    // every cloud, including overhead projections. Avoid rendering a
+    // second volume across the whole sky. Grow a nearby volume only as
+    // the player approaches the deck; 70% still begins the flight LOD.
+    const float startHeight=s.minSpawnZ*.25f,finishHeight=canopy::altitude(s)*canopy::HandoverRatio;
+    const float climb=smooth((playerZ-startHeight)/std::max(1.f,finishHeight-startHeight));
+    const float airborne=std::max(600.f,cell*.9f);
+    const float groundStart=std::min(flight.start,airborne*climb);
+    const float groundEnd=std::min(r.end,groundStart+mix(220.f,std::max(500.f,cell*.9f),climb));
+    return {mix(groundStart,flight.start,blend),mix(groundEnd,flight.end,blend)};
+}
 // Long optical paths accumulate many surfaces; a squared edge taper makes
 // the distant bank gradually dissolve instead of terminating in a bright ring.
 inline float rangeWeight(const Range& r,float d) {const float f=distanceAlpha(r,d);return f*f;}
@@ -164,6 +185,50 @@ struct Volume {
                     table[rectangleIndex(x,y,w,h)]=std::uint8_t(m);
                 }
             }
+        }
+    }
+    // Slice-level support, finer along the sampled axis than the 16x16x8
+    // brick grid. Each texel plane has a row of bitmasks over the other
+    // two coarse axes. Include the adjacent texels and the orthogonal
+    // cell halo; zero is a proof that the whole filtered quad is empty.
+    // This table is derived RAM, never part of the disk schematic.
+    std::array<std::array<std::vector<std::uint16_t>,3>,2> planeSupport;
+    bool planeClearSubset{};
+    static constexpr int axisCells(int axis) {return axis==2?OccupancyZ:OccupancyXY;}
+    int axisTexels(int axis) const {return axis==2?depth:width;}
+    void buildPlaneSupport() {
+        planeClearSubset=false;
+        for(auto& layer:planeSupport)for(auto& table:layer)table.clear();
+        if(width<OccupancyXY||depth<OccupancyZ||width%OccupancyXY||depth%OccupancyZ||
+           pixels[0].size()!=std::size_t(width)*width*depth||pixels[1].size()!=pixels[0].size())return;
+        try {
+            for(int layer=0;layer<2;++layer)for(int a=0;a<3;++a) {
+                const int j=(a+1)%3,k=(a+2)%3,na=axisTexels(a),nj=axisTexels(j),nk=axisTexels(k),
+                    rows=axisCells(j),cols=axisCells(k),sj=nj/rows,sk=nk/cols;
+                auto& table=planeSupport[layer][a];
+                std::vector<std::uint16_t> exact(std::size_t(na)*rows);
+                for(int i=0;i<na;++i)for(int r=0;r<rows;++r)for(int c=0;c<cols;++c) {
+                    int pos[3]{};pos[a]=i;bool found=false;
+                    for(int u=r*sj-1;u<=(r+1)*sj&&!found;++u) {
+                        pos[j]=u;
+                        for(int v=c*sk-1;v<=(c+1)*sk;++v) {
+                            pos[k]=v;
+                            if(pixels[layer][index(pos[0],pos[1],pos[2])].a){found=true;break;}
+                        }
+                    }
+                    if(found)exact[std::size_t(i)*rows+r]|=std::uint16_t(1u<<c);
+                }
+                table.resize(exact.size());
+                const auto addressed=[&](int i){return a==2?std::clamp(i,0,na-1):canopy::wrap(i,na);};
+                for(int i=0;i<na;++i)for(int r=0;r<rows;++r)
+                    table[std::size_t(i)*rows+r]=exact[std::size_t(addressed(i-1))*rows+r]|
+                        exact[std::size_t(i)*rows+r]|exact[std::size_t(addressed(i+1))*rows+r];
+            }
+            planeClearSubset=true;
+            for(int a=0;a<3;++a)for(std::size_t i=0;i<planeSupport[0][a].size();++i)
+                if(planeSupport[0][a][i]&~planeSupport[1][a][i])planeClearSubset=false;
+        } catch(const std::bad_alloc&) {
+            for(auto& layer:planeSupport)for(auto& table:layer)std::vector<std::uint16_t>().swap(table);
         }
     }
     static std::size_t prefixIndex(int x,int y,int z) {
@@ -286,6 +351,7 @@ struct Volume {
             }
         }
         buildRectangleMasks();
+        buildPlaneSupport();
     }
     struct CellRange {int first,last;}; // half-open, wrapped XY / clamped Z
     struct CellBox {std::array<CellRange,3> axis;};
@@ -295,6 +361,26 @@ struct Volume {
         if(axis==2)return {std::clamp(a,0,n-1),std::clamp(b,0,n-1)+1};
         const int count=std::min(b-a+1,n);
         a=canopy::wrap(a,n);return {a,a+count};
+    }
+    // Query after coarse rejection, using the actual plane coordinate
+    // rather than all texels in its coarse-axis cell. The three-slice
+    // union covers linear or point filtering, including rounding at seams.
+    bool planeOccupied(int a,float uv,const CellBox& box,float weather) const {
+        if(planeSupport[0][a].empty()||planeSupport[1][a].empty())return true;
+        const int j=(a+1)%3,k=(a+2)%3,n=axisTexels(a),rows=axisCells(j),cols=axisCells(k);
+        const int texel=int(std::floor(uv*n)),i=a==2?std::clamp(texel,0,n-1):canopy::wrap(texel,n);
+        const auto [ja,jb]=box.axis[j];const auto [ka,kb]=box.axis[k];
+        const unsigned bits=(1u<<(kb-ka))-1u;
+        const unsigned shifted=bits<<ka,mask=(shifted|(shifted>>cols))&((1u<<cols)-1u);
+        const auto offset=std::size_t(i)*rows;
+        const auto* clear=planeSupport[0][a].data()+offset;
+        const auto* wet=planeSupport[1][a].data()+offset;
+        const auto scan=[&](const std::uint16_t* data) {
+            for(int r=ja;r<jb;++r)if(data[r&(rows-1)]&mask)return true;
+            return false;
+        };
+        const bool useWet=weather>.001f;
+        return (weather<.999f&&(!useWet||!planeClearSubset)&&scan(clear))||(useWet&&scan(wet));
     }
     // 0..255: conservative occupied Z cells; 256: allocation fallback.
     // The same lookup that rejects an empty slice also supplies its vertical
@@ -439,14 +525,14 @@ inline bool planeCandidate(Vec closest,Vec deltaLo,Vec deltaHi,float axisDelta,f
 template<class MeshType>
 inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range& r,
                       const canopy::Drift& drift,float wx,float wy,const Volume* volume=nullptr,
-                      float weather=0.f,bool billboardAvailable=true,bool tighten=true) {
+                      float weather=0.f,bool billboardAvailable=true,bool tighten=true,bool precise=true,const Lod* sharedLod=nullptr) {
     using OutputVertex=typename decltype(m.vertices)::value_type;
     constexpr bool gpu=std::is_same_v<OutputVertex,GpuVertex>;
     m.vertices.clear();if constexpr(gpu)m.spans.clear();else m.indices.clear();m.slices=0;
     const float band=s.maxSpawnZ-s.minSpawnZ;
     if(!s.hybridClouds||!s.targetProcClouds||r.end<5.f||band<1.f||
        !std::isfinite(wx)||!std::isfinite(wy)||wx<=0||wy<=0||wx>10.f||wy>10.f)return;
-    const auto levels=lod(s,r,billboardAvailable,view.pos.z-(s.minSpawnZ+s.maxSpawnZ)*.5f);
+    const auto levels=sharedLod?*sharedLod:lod(s,r,billboardAvailable,view.pos.z-(s.minSpawnZ+s.maxSpawnZ)*.5f);
     if(view.pos.z<s.minSpawnZ-levels.end||view.pos.z>s.maxSpawnZ+levels.end)return;
     const float base=s.cumulusDetail?16.f:20.f;
     const int nz=verticalSteps(s);
@@ -576,7 +662,7 @@ inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range
             int i=b.first[a];const int rem=((i%stride)+stride)%stride;if(rem)i+=stride-rem;
             // Adjacent world planes often land in the same baked occupancy cell.
             // Other dimensions and active weather endpoints are constant here.
-            int lastCell=-1;bool lastOccupied=false;unsigned lastBits=256;
+            int lastCell=-1,lastTexel=std::numeric_limits<int>::min();bool lastOccupied=false,lastFine=true;unsigned lastBits=256;
             for(;i<b.last[a];i+=stride) {
                 // A single lattice plane at the center of its finest cell.
                 // Neither its position nor the density UV depends on the eye.
@@ -595,6 +681,15 @@ inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range
                 }
                 const float limitSq=i%4==0?outerLimitSq:i%2==0?middleLimitSq:innerLimitSq;
                 if(planeCandidate<a>(closest,deltaLo,deltaHi,plane-eyeAxis,minAngularDistance,limitSq)) {
+                    if(precise&&volume) {
+                        const float uv=uvCoord(plane,a);
+                        const int texel=int(std::floor(uv*volume->axisTexels(a)));
+                        if(lastTexel!=texel) {
+                            lastFine=volume->planeOccupied(a,uv,box,weather);
+                            lastTexel=texel;
+                        }
+                        if(!lastFine)continue;
+                    }
                     Vec middle=center;
                     // Retain the original (lo+hi)*.5 expression for exact depth ordering.
                     setComponent(middle,a,(plane+plane)*.5f-eyeAxis);

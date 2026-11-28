@@ -87,6 +87,39 @@ int main() {
         if(a.a>0)CHECK(b.potentiallyOccupied(u,v,w,u,v,w,0.f));
     }
     CHECK(b.sample(0,.5f,.5f,-3).a==0 && b.sample(1,.5f,.5f,6).a==0);
+    // Independently enumerate the exact texel support of arbitrary
+    // rectangular slices. Negative/wrapped UVs, all axes, endpoints
+    // and mixed weather; skipped quads must have no contributing texel.
+    unsigned fineRejected=0;
+    for(int sample=0;sample<30000;++sample) {
+        const int a=sample%3,j=(a+1)%3,k=(a+2)%3;
+        std::array<float,3> lo{},hi{};
+        for(int axis=0;axis<3;++axis) {
+            lo[axis]=axis==2?random():random()*4.f-2.f;
+            hi[axis]=lo[axis]+(axis==a?0.f:random()*.20f);
+            if(axis==2)hi[axis]=std::min(hi[axis],1.f);
+        }
+        banks::Volume::CellBox box{};
+        for(int axis=0;axis<3;++axis)box.axis[axis]=banks::Volume::cells(lo[axis],hi[axis],axis);
+        const float weather=float(sample%7)/6.f;
+        if(b.planeOccupied(a,lo[a],box,weather))continue;
+        ++fineRejected;
+        int first[3],last[3];
+        for(int axis=0;axis<3;++axis) {
+            const int n=b.axisTexels(axis);
+            first[axis]=int(std::floor(lo[axis]*n-.5f));
+            last[axis]=int(std::floor(hi[axis]*n-.5f))+1;
+        }
+        int pos[3]{};
+        for(int z=first[a];z<=last[a];++z)for(int y=first[j];y<=last[j];++y)for(int x=first[k];x<=last[k];++x) {
+            pos[a]=z;pos[j]=y;pos[k]=x;
+            const auto i=b.index(pos[0],pos[1],pos[2]);
+            CHECK(weather>=.999f||b.pixels[0][i].a==0);
+            CHECK(weather<=.001f||b.pixels[1][i].a==0);
+        }
+    }
+    CHECK(fineRejected>1000);
+    std::cout<<"PASS: "<<fineRejected<<" rejected precise slice rectangles have strictly zero filtered support\n";
     // Prefix lookup must be identical to a conservative block scan, even
     // for negative coordinates, multiple periods and weather endpoints.
     for(int i=0;i<240;++i) {
@@ -384,6 +417,23 @@ int main() {
     }
     std::cout<<"PASS: CPU and hardware source lattice and order are identical in 12 altitude/weather combinations\n";
 
+    std::size_t removedPatches=0;
+    for(float z:{30.f,443.f,535.f,635.f,860.f})for(float weather:{0.f,.5f,1.f}) {
+        auto cam=flight;cam.pos.z=z;
+        const auto local=canopyVolume::volumeRange(s,r,z,canopy::handover(s,z));
+        banks::GpuMesh before,after;
+        banks::buildMesh(before,s,cam,local,wind,.94f,.53f,&b,weather,true,true,false);
+        banks::buildMesh(after,s,cam,local,wind,.94f,.53f,&b,weather,true,true,true);
+        CHECK(before.vertices.size()<banks::MaxVertices);
+        std::size_t i=0;
+        for(std::size_t j=0;j<after.vertices.size();j+=4) {
+            while(i<before.vertices.size()&&std::memcmp(&before.vertices[i],&after.vertices[j],4*sizeof(banks::GpuVertex)))i+=4;
+            CHECK(i<before.vertices.size());i+=4;
+        }
+        removedPatches+=(before.vertices.size()-after.vertices.size())/4;
+    }
+    CHECK(removedPatches>0);
+    std::cout<<"PASS: "<<removedPatches<<" fully transparent patches removed; retained GPU vertices/orders byte-exact\n";
     // Range must actually control volumetric geometry, not just the canopy.
     const auto farthest=[&](const banks::Mesh& mesh) {
         float d=0;for(const auto& p:mesh.vertices)if(p.alpha>0.f)d=std::max(d,length(p.pos-flight.pos));return d;
@@ -406,13 +456,64 @@ int main() {
     for(float d:{5200.f,5300.f,5600.f,5900.f,6000.f})CHECK(std::abs(lod.volume(d)+lod.billboard(d)-1.f)<.0001f);
     for(float x=.25f;x<=.75f;x+=.01f)CHECK(std::abs(billboards::window(x)+billboards::window(1.f-x)-1.f)<.0001f);
     billboards::Atlas atlas;atlas.build(s,b);
-    CHECK(atlas.pixels[0].size()==512*512 && atlas.pixels[1].size()==512*512);
+    CHECK(atlas.pixels[0].size()==billboards::AtlasSize*billboards::AtlasSize && atlas.pixels[1].size()==billboards::AtlasSize*billboards::AtlasSize);
+    // Validate the baked cell support independent of mesh output: every
+    // nonzero texel's bilinear support survives whole or split trimming.
+    std::size_t supportChecks=0;
+    const auto contains=[](billboards::Atlas::Bounds b,float x,float y) {
+        return b.x1&&x>=b.x0&&x<=b.x1&&y>=b.y0&&y<=b.y1;
+    };
+    for(int layer=0;layer<2;++layer)for(unsigned slot=0;slot<billboards::SlotCount;++slot) {
+        const auto region=atlas.support(int(slot),float(layer));
+        const int ox=int(slot)%(billboards::AtlasSize/billboards::TileW)*billboards::TileW,
+                  oy=int(slot)/(billboards::AtlasSize/billboards::TileW)*billboards::TileH;
+        for(int y=billboards::Guard;y<billboards::TileH-billboards::Guard;++y)
+            for(int x=billboards::Guard;x<billboards::TileW-billboards::Guard;++x) {
+                const auto p=atlas.pixels[layer][std::size_t(oy+y)*billboards::AtlasSize+ox+x];
+                if(!p.a)continue;
+                CHECK(atlas.any(int(slot),float(layer)));
+                for(float dy:{-.49f,.5f,1.49f})for(float dx:{-.49f,.5f,1.49f}) {
+                    const float tx=clamp(x+dx,float(billboards::Guard),float(billboards::TileW-billboards::Guard)),
+                        ty=clamp(y+dy,float(billboards::Guard),float(billboards::TileH-billboards::Guard));
+                    CHECK(contains(region[0],tx,ty));
+                    CHECK(contains(region[1],tx,ty)||contains(region[2],tx,ty));
+                    CHECK(contains(region[3],tx,ty)||contains(region[4],tx,ty));
+                    ++supportChecks;
+                }
+            }
+    }
+    CHECK(supportChecks>10000);
+    std::cout<<"PASS: "<<supportChecks<<" atlas-filter support samples preserved after sparse sprite trimming\n";
+    for(float az=0;az<8;az+=.013f)for(float elev=-Pi*.5f;elev<=Pi*.5f;elev+=.05f) {
+        const auto angular=billboards::angularSamples(az,elev);
+        float sum=0;
+        for(const auto& a:angular) {
+            CHECK(a.weight>=0.f&&a.weight<=1.f&&a.elevation>=0&&a.elevation<billboards::Elevations);
+            sum+=a.weight;
+        }
+        CHECK(std::abs(sum-1.f)<.00001f);
+    }
+    float previousStart=0,previousEnd=0;
+    for(int z=0;z<=1000;++z) {
+        const auto adaptive=banks::hybridLod(s,r,float(z),float(z));
+        CHECK(adaptive.start>=previousStart&&adaptive.end>=previousEnd&&adaptive.start<adaptive.end&&adaptive.end<=r.end);
+        previousStart=adaptive.start;previousEnd=adaptive.end;
+        for(float d:{adaptive.start,(adaptive.start+adaptive.end)*.5f,adaptive.end})
+            CHECK(std::abs(adaptive.volume(d)+adaptive.billboard(d)-1.f)<.00001f);
+    }
+    CHECK(previousStart==5200.f&&previousEnd==6000.f);
+    const auto groundLod=banks::hybridLod(s,r,ground.pos.z,ground.pos.z);
+    banks::buildMesh(raw,s,ground,r,{},.94f,.53f,&b,.5f,true,true,true,&groundLod);
+    CHECK(raw.indices.empty());
+    billboards::buildMesh(culled,s,ground,r,{},atlas,.94f,.53f,.5f,&groundLod);
+    CHECK(!culled.indices.empty());
+    std::cout<<"PASS: directional canopy at street level; continuous complementary LOD through the 70% player-Z handover\n";
     std::size_t countAlpha[2]{};
     for(int i=0;i<2;++i)for(auto p:atlas.pixels[i])countAlpha[i]+=p.a;
     CHECK(countAlpha[1]>countAlpha[0]&&countAlpha[0]>0);
     billboards::buildMesh(culled,s,flight,cloudRange(s),{},atlas,.94f,.53f,0);
     CHECK(culled.vertices.size()>0 && culled.vertices.size()<=billboards::MaxCards*4);
-    for(const auto& p:culled.vertices)CHECK(p.u>=0.f&&p.u<=1.f&&p.v>=0.f&&p.v<=1.f&&p.alpha>0.f&&p.alpha<=1.f);
+    for(const auto& p:culled.vertices)CHECK(p.u>=0.f&&p.u<=1.f&&p.v>=0.f&&p.v<=1.f&&p.alpha>=0.f&&p.alpha<=1.f);
     const auto spriteCount=culled.vertices.size()/4;
     s.cloudDrawDistance=4200;
     billboards::buildMesh(culled,s,flight,cloudRange(s),{},atlas,.94f,.53f,0);

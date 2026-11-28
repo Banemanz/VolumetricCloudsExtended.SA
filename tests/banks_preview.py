@@ -70,14 +70,46 @@ def draw(canvas,tex,v,indices,layer,weather,fog,depth_split=None,far=False):
             if canvas.shape[2]==4:canvas[y,x,3:4]=canvas[y,x,3:4]*(1-alpha)+alpha
     return fragments,passing
 
+def proxy_prefix(v,indices):
+    # Approximate native clipped far-depth prefix and area gate using the
+    # same projection. Near tail is never downsampled.
+    focal=510*W/960;wx=W/(2*focal);wy=H/(2*focal)
+    area=0;lo=np.array([W,H],float);hi=np.zeros(2)
+    def cut(poly,coeff):
+        result=[]
+        if not len(poly):return result
+        for a,b in zip(poly,np.roll(poly,-1,axis=0)):
+            d,e=np.dot(a[:3],coeff),np.dot(b[:3],coeff)
+            if d>=0:result.append(a)
+            if (d>=0)!=(e>=0):result.append(a+(b-a)*d/(d-e))
+        return result
+    for i,tri in enumerate(indices):
+        poly=clip(v[tri])
+        for coeff in ([1,0,wx],[-1,0,wx],[0,1,wy],[0,-1,wy]):
+            poly=cut(poly,coeff)
+        if len(poly)<3:continue
+        p=np.array(poly)
+        if np.any(p[:,2]<450):break
+        xy=p[:,:2]/p[:,2,None]*focal*[1,-1]+[W/2,H/2]
+        area+=abs(np.sum(xy[:,0]*np.roll(xy[:,1],-1)-xy[:,1]*np.roll(xy[:,0],-1)))*.5
+        lo=np.minimum(lo,xy.min(0));hi=np.maximum(hi,xy.max(0))
+    else:i=len(indices)
+    lo=np.maximum(0,np.floor(lo)-3).astype(int);hi=np.minimum([W,H],np.ceil(hi)+3).astype(int)
+    pixels=np.prod(hi-lo)
+    if i<32 or np.any(hi<=lo) or area<1.8*pixels:return 0,lo,hi
+    return i,lo,hi
+
 def render(scene,exe):
     with tempfile.TemporaryDirectory() as tmp:
         path=pathlib.Path(tmp)/"cloud"
-        raw=subprocess.check_output([exe,scene,str(path)]+(["no-trim"] if os.environ.get("VC_NO_TRIM") else []),text=True)
+        raw=subprocess.check_output([exe,scene,str(path)]+(["legacy"] if os.environ.get("VC_LEGACY") else ["no-trim"] if os.environ.get("VC_NO_TRIM") else []),text=True)
         tex=[np.fromfile(str(path)+suffix,dtype=np.uint8).reshape(shape).astype(np.float32)/255
              for suffix,shape in [(".canopy",(512,512,4)),(".extra",(512,512,4)),(".clear3d",(32,128,128,4)),(".wet3d",(32,128,128,4))]]
         if pathlib.Path(str(path)+".atlas0").exists():
-            tex+= [np.fromfile(str(path)+suffix,dtype=np.uint8).reshape(512,512,4).astype(np.float32)/255 for suffix in [".atlas0",".atlas1"]]
+            for suffix in [".atlas0",".atlas1"]:
+                data=np.fromfile(str(path)+suffix,dtype=np.uint8)
+                side=int(np.sqrt(data.size/4))
+                tex.append(data.reshape(side,side,4).astype(np.float32)/255)
     rows=iter(raw.splitlines())
     p=np.array(next(rows).split(),float);t=np.linspace(0,1,H)[:,None,None]
     canvas=np.broadcast_to((p[:3]*(1-t)+p[3:6]*t)/255,(H,W,3)).copy()
@@ -88,7 +120,18 @@ def render(scene,exe):
         indices=np.array([next(rows).split() for _ in range(nt)],int)
         if nt:
             fog=(.8*p[3:6]+.2*p[:3])/255
-            if layer==2 and os.environ.get("VC_HALF_RES"):
+            prefix,lo,hi=proxy_prefix(v,indices) if layer==3 and os.environ.get("VC_HALF_RES") else (0,None,None)
+            if prefix:
+                reduced=np.zeros(((H+1)//2,(W+1)//2,4),dtype=np.float32)
+                far_frag,far_pass=draw(reduced,tex,v,indices[:prefix],layer,weather,fog)
+                up=np.stack([np.array(Image.fromarray(reduced[:,:,i]).resize((W,H),Image.Resampling.BILINEAR)) for i in range(4)],axis=2)
+                box=np.s_[lo[1]:hi[1],lo[0]:hi[0]]
+                canvas[box]=canvas[box]*(1-up[box][:,:,3:])+up[box][:,:,:3]
+                near_frag,near_pass=draw(canvas,tex,v,indices[prefix:],layer,weather,fog)
+                composite=int(np.prod(hi-lo))
+                fragments=far_frag+near_frag+composite;passing=far_pass+near_pass
+                print(f"{scene} proxy half {far_frag}, near tail {near_frag}, bounded composite {composite}",flush=True)
+            elif layer==2 and os.environ.get("VC_HALF_RES"):
                 reduced=np.zeros(((H+1)//2,(W+1)//2,4),dtype=np.float32)
                 far_frag,far_pass=draw(reduced,tex,v,indices,layer,weather,fog,450,True)
                 up=np.stack([np.array(Image.fromarray(reduced[:,:,i]).resize((W,H),Image.Resampling.BILINEAR)) for i in range(4)],axis=2)

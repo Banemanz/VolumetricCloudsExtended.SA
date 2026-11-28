@@ -19,10 +19,10 @@ int main(){
     const auto equal=[](const auto& x,const auto& y){return x.size()==y.size()&&(x.empty()||!std::memcmp(x.data(),y.data(),x.size()*sizeof(vc::canopy::Pixel)));};
     for(int i=0;i<2;++i){CHECK(equal(m[i],loaded[i]));CHECK(equal(v.pixels[i],lv.pixels[i]));CHECK(equal(a.pixels[i],la.pixels[i]));}
     CHECK(v.occupied==lv.occupied&&v.occupiedPrefix==lv.occupiedPrefix&&a.occupied==la.occupied);
-    CHECK(v.rectangleMask==lv.rectangleMask);
+    CHECK(v.rectangleMask==lv.rectangleMask&&v.planeSupport==lv.planeSupport);
     // The compressed layout is unchanged, but the art is different.
     // Reject older versions even if they have the same dimensions.
-    for(std::uint32_t version:{1u,2u}) {
+    for(std::uint32_t version:{1u,2u,3u}) {
         auto old=bytes;
         std::memcpy(old.data()+offsetof(vc::cache::Header,version),&version,sizeof(version));
         std::istringstream stale(old);
@@ -33,7 +33,7 @@ int main(){
     CHECK(aRelief.ready&&bRelief.ready&&aRelief.heights==bRelief.heights);
     auto invalid=m;invalid[0][0]={1,2,3,4};std::ostringstream colour;
     CHECK(!vc::cache::save(colour,s,size,invalid,v,a));
-    std::cout<<"Version 3 shared-density compact cache "<<bytes.size()<<" bytes; old art rejected.\n";
+    std::cout<<"Version 4 directional compact cache "<<bytes.size()<<" bytes; old art rejected.\n";
     auto wrong=s;wrong.seed++;std::istringstream badKey(bytes);
     CHECK(!vc::cache::load(badKey,wrong,size,loaded,lv,la));
     auto corrupt=bytes;corrupt[corrupt.size()/2]^=1;std::istringstream badData(corrupt);

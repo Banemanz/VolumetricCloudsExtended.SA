@@ -26,7 +26,7 @@ void competingSceneWork() {
     }
 }
 template<class BankMesh>
-void run(const Settings& s,const banks::Volume& volume,const billboards::Atlas& atlas,const canopyVolume::Relief& relief,bool tighten) {
+void run(const Settings& s,const banks::Volume& volume,const billboards::Atlas& atlas,const canopyVolume::Relief& relief,bool tighten,bool legacy) {
     canopyVolume::Mesh canopy;banks::Mesh cards;BankMesh bankMesh;
     for(float z:{30.f,317.f,400.f,523.f,635.f,1000.f}) {
         std::vector<double> times;times.reserve(480);
@@ -36,13 +36,17 @@ void run(const Settings& s,const banks::Volume& volume,const billboards::Atlas& 
             const Vec f=unit(Vec{std::cos(yaw)*std::cos(pitch),std::sin(yaw)*std::cos(pitch),std::sin(pitch)});
             const Vec right=unit(cross(f,{0,0,1}));View v{{2239.f+frame*2.f,-1262.f-frame*.8f,z},right,cross(right,f),f,450,1};
             const float blend=canopy::handover(s,z),weather=float(frame%100)/100;
-            const auto full=cloudRange(s),local=canopyVolume::volumeRange(s,full,z,blend);
-            const bool distant=billboards::eligible(s,local);
+            const auto full=cloudRange(s);
+            const bool directional=!legacy&&billboards::eligible(s,full);
+            const auto local=directional?full:canopyVolume::volumeRange(s,full,z,blend);
+            const auto lod=banks::hybridLod(s,full,z,v.pos.z);
+            const auto* sharedLod=directional?&lod:nullptr;
+            const bool distant=directional||billboards::eligible(s,local);
             drift.update(s,{.2f,.1f,0},.016f);
             const auto start=Clock::now();
-            canopyVolume::mesh(canopy,relief,s,v,full,drift,.94f,.53f,blend,&local);
-            banks::buildMesh(bankMesh,s,v,local,drift,.94f,.53f,&volume,weather,distant,tighten);
-            if(distant)billboards::buildMesh(cards,s,v,local,drift,atlas,.94f,.53f,weather);
+            if(directional)canopy.indices.clear();else canopyVolume::mesh(canopy,relief,s,v,full,drift,.94f,.53f,blend,&local);
+            banks::buildMesh(bankMesh,s,v,local,drift,.94f,.53f,&volume,weather,distant,tighten,true,sharedLod);
+            if(distant)billboards::buildMesh(cards,s,v,local,drift,atlas,.94f,.53f,weather,sharedLod);
             else cards.indices.clear();
             times.push_back(std::chrono::duration<double,std::milli>(Clock::now()-start).count());
             sheet+=canopy.indices.size()/3;volumeTris+=bankMesh.vertices.size()/2;cardTris+=cards.indices.size()/3;
@@ -60,6 +64,7 @@ int main(int argc,char** argv) {
     canopyVolume::Relief relief;relief.build(s,volume);
     std::cout<<"Cloud-only source preparation, no rasterization, no D3D driver or game timing\n";
     const bool tighten=argc<=1||std::string(argv[1])!="--no-trim";
-    run<banks::GpuMesh>(s,volume,atlas,relief,tighten);
-    run<banks::Mesh>(s,volume,atlas,relief,tighten);
+    const bool legacy=argc>1&&std::string(argv[1])=="--legacy";
+    run<banks::GpuMesh>(s,volume,atlas,relief,tighten,legacy);
+    run<banks::Mesh>(s,volume,atlas,relief,tighten,legacy);
 }

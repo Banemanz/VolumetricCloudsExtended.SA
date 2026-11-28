@@ -1283,3 +1283,55 @@ cost at those heights in exchange for the measured ~2% raster reduction.
 No comparative claim for actual GPU or full game FPS. All five portable
 native GCC tests passed with -Wall -Wextra -Werror and the legacy
 near/far macros; generated default INI matches checked-in template.
+
+## Directional canopy / synchronized handover follow-up — 2026-11-27
+
+User observed a visibly bad handover in the prior PR and 3D cloud silhouettes
+appearing where the ground canopy looked clear. The underlying mismatch
+was a relief-height sheet approximating a volume, not independent random
+spawn state. This iteration replaces that sheet in the supported hybrid
+path with an elevation-aware optical impostor atlas of the SAME volume,
+from ground through flight. No ASI hook/address or native sky changes.
+
+Code map:
+- `CloudBanks.hpp`: `hybridLod` joins ground directional canopy to nearby
+  true volume and flight range; 70% of nominal canopy height = 442.4m,
+  full flight LOD at 632m. Fine per-slice support from both alpha endpoint
+  volumes complements coarse occupancy and preserves moving/wrapped
+  filtered samples. `buildMesh(...,precise,sharedLod)` allows A/B proof.
+- `CloudBillboards.hpp`: 5x5 cells, 8 azimuths, 5 elevations, 32x32 guarded
+  tiles in 1024x1024 atlases. Optical integration in each world-anchored
+  cell, partition-of-unity support, continuous triangular angular sampling,
+  world-fixed top/bottom bases, per-vertex shared radial fade. Conservative
+  trim plus optional disjoint 2-rectangle footprint. 4096-quad budget.
+- `CloudCache.hpp`: v4, larger atlas; rebuild derived support after load.
+- `CloudD3D9.hpp`: shared LOD on CPU and VS2, exact quantized weather
+  endpoint single-texture path, guarded reduced RT for far-only sorted
+  impostor prefix with padded bounded composite; preserve original runs for
+  native fallback and near geometry. No additional pixel shader or game
+  depth sampling. Existing D3D9 pure-state and reset handling remains.
+- `main.cpp`: only supported hybrid + eligible atlas replaces both separate
+  canopy and upright far sprites. Legacy canopy retained for disabled
+  settings, short ranges and failure paths. `FarHalfRes=1` for new INIs;
+  never rewrite an explicit old INI. MinSpawnZ=450, MaxSpawnZ=800,
+  TargetProcClouds=120, SizeScale=1.5, independent 8000m range unchanged.
+- Exact CPU checks: 6752 rejected fine slice rectangles proved to have zero
+  filtered support out of 30k samples; 1081 fully transparent patches
+  removed, retained vertices/order byte-identical; 6,205,824 atlas samples
+  preserve conservative support. Existing 11,796,480 occupancy rectangle
+  evaluations and 83 world-ray invariance checks remain.
+- Native tests include lossless coarse-vs-fine RGB and directional
+  full-vs-half RGB, depth sentinel, pure device state restoration.
+  Native WARP is not a vintage GPU; full in-game/2006 hardware verification
+  remains outstanding. The street-level proxy necessarily costs more fill
+  than a single 2D sheet, even at half-res. A residual risk is directional
+  atlas parallax/cell contribution at intermediate angles; screenshots are
+  software diagnostics not a promise of perfectly seamless GTA rendering.
+- Repeatable Linux workload: compile tests with g++ -std=c++17 -O3
+  -Wall -Wextra -Werror, run all five portable tests, then
+  `VC_PREVIEW_SIZE=640x360 VC_HALF_RES=1 python tests/banks_preview.py
+  ./banks_preview out ground handover0 handover1 entry handover2
+  handover3 flight above`. Omit VC_HALF_RES for native-resolution software
+  comparison. Source research: GPU Gems 2004 chapter 39 on empty-space
+  proxy geometry, Harris/Lastra 2001 on optical cloud impostors, Microsoft
+  D3D9 linear sampling/texture addressing and fog documentation.

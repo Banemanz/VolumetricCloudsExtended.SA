@@ -331,6 +331,7 @@ struct FarLayer {
     UINT width{},height{};
     bool disabled{};
     StateScope snapshot;
+    std::vector<ScreenVertex> scaled; // reusable projected proxy scratch
     void release() {
         snapshot.release();
         if(surface)surface->Release();
@@ -349,7 +350,7 @@ struct FarLayer {
         width=w;height=h;return true;
     }
     template<class Draw>
-    Result render(IDirect3DDevice9* d,const D3DVIEWPORT9& vp,Draw&& draw,bool& used) {
+    Result render(IDirect3DDevice9* d,const D3DVIEWPORT9& vp,Draw&& draw,bool& used,const RECT* bounds=nullptr) {
         used=false;
         if(disabled||vp.Width<320||vp.Height<240)return {};
         D3DCAPS9 caps{};
@@ -416,8 +417,11 @@ struct FarLayer {
         ss(D3DSAMP_MINFILTER,D3DTEXF_LINEAR);ss(D3DSAMP_MAGFILTER,D3DTEXF_LINEAR);
         ss(D3DSAMP_MIPFILTER,D3DTEXF_NONE);
         struct QuadVertex {float x,y,z,rhw,u,v;};
-        const float x=float(vp.X)-.5f,y=float(vp.Y)-.5f,r=x+vp.Width,b=y+vp.Height,z=vp.MaxZ;
-        const QuadVertex quad[]={{x,y,z,1,0,0},{r,y,z,1,1,0},{x,b,z,1,0,1},{r,b,z,1,1,1}};
+        const float left=bounds?float(bounds->left):float(vp.X),top=bounds?float(bounds->top):float(vp.Y);
+        const float right=bounds?float(bounds->right):float(vp.X+vp.Width),bottom=bounds?float(bounds->bottom):float(vp.Y+vp.Height);
+        const float x=left-.5f,y=top-.5f,r=right-.5f,b=bottom-.5f,z=vp.MaxZ;
+        const float u0=(left-vp.X)/vp.Width,v0=(top-vp.Y)/vp.Height,u1=(right-vp.X)/vp.Width,v1=(bottom-vp.Y)/vp.Height;
+        const QuadVertex quad[]={{x,y,z,1,u0,v0},{r,y,z,1,u1,v0},{x,b,z,1,u0,v1},{r,b,z,1,u1,v1}};
         if(SUCCEEDED(hr)) {
             // Never repeat a potentially partial write into the game target.
             used=true;
@@ -525,7 +529,7 @@ struct GpuPasses {
     // remain identical, so clouds never move and near scene geometry wins.
     bool prepare(const Settings& s,const View& v,const Range& r,const canopy::Drift& drift,
                  bool farReady,bool vertexFog,float visibility,RGB color,const D3DMATRIX& transform,
-                 const D3DMATRIX& projection,const D3DVIEWPORT9& vp) {
+                 const D3DMATRIX& projection,const D3DVIEWPORT9& vp,const banks::Lod* sharedLod=nullptr) {
         if(std::abs(projection._34-1.f)>.0001f||std::abs(projection._44)>.0001f||
            projection._33<=1.f||projection._43>=0.f||std::abs(projection._13)>.0001f||std::abs(projection._23)>.0001f)return false;
         const float farClip=projection._43/(1.f-projection._33);
@@ -535,7 +539,7 @@ struct GpuPasses {
         const float a=extended/(extended-farClip),b=-a*farClip;
         distant._13=a*scene._14;distant._23=a*scene._24;distant._33=a*scene._34;distant._43=a*scene._44+b;
         const auto tex=banks::textureOrigin(s,v,drift);
-        const auto lod=banks::lod(s,r,farReady,v.pos.z-(s.minSpawnZ+s.maxSpawnZ)*.5f);
+        const auto lod=sharedLod?*sharedLod:banks::lod(s,r,farReady,v.pos.z-(s.minSpawnZ+s.maxSpawnZ)*.5f);
         constants[4]={v.pos.x,v.pos.y,v.pos.z,visibility};
         constants[5]={1.f/tex.tile,tex.u,tex.v,1.f/tex.band};
         constants[6]={v.nearClip,1.f/std::max(80.f,s.nearFadeDistance),s.interiorHaze*.22f,s.minSpawnZ};
@@ -629,7 +633,7 @@ inline Result drawRaw(IDirect3DDevice9* d,const std::array<IDirect3DBaseTexture9
                    const Options& opts,const void* vertices,UINT count,UINT stride,DWORD fvf,
                    const std::uint16_t* indices,UINT triangles,float coverage,bool fog,
                    bool projected,bool mipmaps,DWORD fogColor,
-                   const D3DMATRIX* view=nullptr,const D3DMATRIX* projection=nullptr,bool ownState=true,GpuPasses* gpu=nullptr,DrawState* states=nullptr) {
+                   const D3DMATRIX* view=nullptr,const D3DMATRIX* projection=nullptr,bool ownState=true,GpuPasses* gpu=nullptr,DrawState* states=nullptr,bool accumulate=false) {
     if(!count||!triangles)return {};
     StateScope scoped;
     if(ownState)states=nullptr; // a standalone scope may restore different states
@@ -658,18 +662,22 @@ inline Result drawRaw(IDirect3DDevice9* d,const std::array<IDirect3DBaseTexture9
         rs(D3DRS_FOGTABLEMODE,D3DFOG_NONE);rs(D3DRS_FOGVERTEXMODE,D3DFOG_NONE);
         rs(D3DRS_RANGEFOGENABLE,FALSE);rs(D3DRS_FOGCOLOR,fogColor);
     }
-    rs(D3DRS_ZENABLE,D3DZB_TRUE);rs(D3DRS_ZWRITEENABLE,FALSE);
+    rs(D3DRS_ZENABLE,accumulate?D3DZB_FALSE:D3DZB_TRUE);rs(D3DRS_ZWRITEENABLE,FALSE);
     rs(D3DRS_ZFUNC,D3DCMP_LESSEQUAL);rs(D3DRS_ALPHABLENDENABLE,TRUE);
     rs(D3DRS_ALPHATESTENABLE,TRUE);rs(D3DRS_ALPHAFUNC,D3DCMP_GREATER);rs(D3DRS_ALPHAREF,0);
     rs(D3DRS_SRCBLEND,D3DBLEND_SRCALPHA);rs(D3DRS_DESTBLEND,D3DBLEND_INVSRCALPHA);
-    rs(D3DRS_BLENDOP,D3DBLENDOP_ADD);rs(D3DRS_SEPARATEALPHABLENDENABLE,FALSE);
+    rs(D3DRS_BLENDOP,D3DBLENDOP_ADD);rs(D3DRS_SEPARATEALPHABLENDENABLE,accumulate?TRUE:FALSE);
+    if(accumulate) {
+        rs(D3DRS_SRCBLENDALPHA,D3DBLEND_ONE);rs(D3DRS_DESTBLENDALPHA,D3DBLEND_INVSRCALPHA);
+        rs(D3DRS_BLENDOPALPHA,D3DBLENDOP_ADD);
+    }
     rs(D3DRS_CULLMODE,D3DCULL_NONE);rs(D3DRS_SHADEMODE,D3DSHADE_GOURAUD);
     rs(D3DRS_COLORWRITEENABLE,0xF);rs(D3DRS_SRGBWRITEENABLE,FALSE);rs(D3DRS_STENCILENABLE,FALSE);
     rs(D3DRS_SCISSORTESTENABLE,FALSE);rs(D3DRS_CLIPPING,TRUE);
     rs(D3DRS_CLIPPLANEENABLE,0);rs(D3DRS_WRAP0,0);rs(D3DRS_WRAP1,0);
     const auto factor=byte(coverage*255.f);
     rs(D3DRS_TEXTUREFACTOR,D3DCOLOR_ARGB(factor,factor,factor,factor));
-    const bool blend=opts.dual&&coverage>.001f&&coverage<.999f;
+    const bool blend=opts.dual&&factor>0&&factor<255;
     const DWORD first=blend?0:coverage>=.5f?1:0;
     check(d->SetTexture(0,textures[first]),"SetTexture(volume0)");
     for(DWORD i=0;i<(blend?2u:1u);++i) {
@@ -720,5 +728,59 @@ inline Result drawProjected(IDirect3DDevice9* d,const std::array<IDirect3DBaseTe
         D3DFVF_XYZRHW|D3DFVF_DIFFUSE|D3DFVF_SPECULAR|D3DFVF_TEX1|D3DFVF_TEXCOORDSIZE3(0),
         mesh.indices.data(),UINT(mesh.indices.size()/3),coverage,fog&&opts.vertexFog,true,!volume&&opts.mip,
         D3DCOLOR_XRGB(byte(fogColor.r),byte(fogColor.g),byte(fogColor.b)),nullptr,nullptr,ownState,nullptr,states);
+}
+// Accelerate only a far-depth prefix of the already sorted directional
+// proxy. The remaining geometry is drawn at native resolution, in exactly
+// the original order. Never downsample/read the game depth buffer. A
+// projected-area estimate avoids a costly RT switch for a few small cards.
+inline Result drawFarProjected(IDirect3DDevice9* d,const std::array<IDirect3DBaseTexture9*,2>& textures,
+        const Options& opts,const ProjectedMesh& mesh,float coverage,RGB fogColor,
+        const D3DVIEWPORT9& vp,FarLayer* layer,DrawState* states=nullptr,bool* usedLayer=nullptr) {
+    if(usedLayer)*usedLayer=false;
+    if(!layer||mesh.indices.size()<96)
+        return drawProjected(d,textures,opts,mesh,coverage,false,fogColor,true,false,states);
+    std::size_t prefix=0;float area=0;
+    float minX=float(vp.X+vp.Width),minY=float(vp.Y+vp.Height),maxX=float(vp.X),maxY=float(vp.Y);
+    for(;prefix+2<mesh.indices.size();prefix+=3) {
+        const auto& a=mesh.vertices[mesh.indices[prefix]];
+        const auto& b=mesh.vertices[mesh.indices[prefix+1]];
+        const auto& c=mesh.vertices[mesh.indices[prefix+2]];
+        if(a.z!=vp.MaxZ||b.z!=vp.MaxZ||c.z!=vp.MaxZ)break;
+        area+=.5f*std::abs((b.x-a.x)*(c.y-a.y)-(b.y-a.y)*(c.x-a.x));
+        minX=std::min({minX,a.x,b.x,c.x});maxX=std::max({maxX,a.x,b.x,c.x});
+        minY=std::min({minY,a.y,b.y,c.y});maxY=std::max({maxY,a.y,b.y,c.y});
+    }
+    // Two native pixels of guard include the bilinear footprint of a
+    // half-size target. Constrain the compositing quad to its support.
+    const RECT bounds{std::max(LONG(vp.X),LONG(std::floor(minX))-3),
+        std::max(LONG(vp.Y),LONG(std::floor(minY))-3),
+        std::min(LONG(vp.X+vp.Width),LONG(std::ceil(maxX))+3),
+        std::min(LONG(vp.Y+vp.Height),LONG(std::ceil(maxY))+3)};
+    const float compositeArea=float(bounds.right-bounds.left)*float(bounds.bottom-bounds.top);
+    if(prefix<96||bounds.left>=bounds.right||bounds.top>=bounds.bottom||area<1.8f*compositeArea)
+        return drawProjected(d,textures,opts,mesh,coverage,false,fogColor,true,false,states);
+    constexpr DWORD fvf=D3DFVF_XYZRHW|D3DFVF_DIFFUSE|D3DFVF_SPECULAR|D3DFVF_TEX1|D3DFVF_TEXCOORDSIZE3(0);
+    const DWORD colour=D3DCOLOR_XRGB(byte(fogColor.r),byte(fogColor.g),byte(fogColor.b));
+    // Reuse a scratch copy, leaving the original projected mesh untouched
+    // for native fallback and the near tail. Allocation failure is harmless.
+    try {layer->scaled=mesh.vertices;}
+    catch(const std::bad_alloc&) {return drawProjected(d,textures,opts,mesh,coverage,false,fogColor,true,false,states);}
+    bool used=false;
+    const auto result=layer->render(d,vp,[&]{
+        const float sx=float(layer->width)/vp.Width,sy=float(layer->height)/vp.Height;
+        // Unreferenced vertices can remain stale; only actual prefix
+        // indices are consumed. Projected XY is affine in viewport size.
+        for(auto& v:layer->scaled){v.x=(v.x-vp.X)*sx;v.y=(v.y-vp.Y)*sy;v.z=1.f;}
+        return drawRaw(d,textures,opts,layer->scaled.data(),UINT(layer->scaled.size()),sizeof(ScreenVertex),fvf,
+            mesh.indices.data(),UINT(prefix/3),coverage,opts.vertexFog,true,false,colour,
+            nullptr,nullptr,false,nullptr,nullptr,true).hr;
+    },used,&bounds);
+    if(!result)return result;
+    if(!used)return drawProjected(d,textures,opts,mesh,coverage,false,fogColor,true,false,states);
+    if(usedLayer)*usedLayer=true;
+    if(prefix==mesh.indices.size())return {};
+    return drawRaw(d,textures,opts,mesh.vertices.data(),UINT(mesh.vertices.size()),sizeof(ScreenVertex),fvf,
+        mesh.indices.data()+prefix,UINT((mesh.indices.size()-prefix)/3),coverage,opts.vertexFog,true,false,colour,
+        nullptr,nullptr,false,nullptr,states);
 }
 } // namespace vc::d3d9

@@ -315,7 +315,7 @@ bool EnsureBillboards() {
         if(!result){LogD3DFailure("far billboard upload",result);throw std::bad_alloc();}
         Log(format==D3DFMT_A8L8?"Far cloud LOD: lossless A8L8 textures.":"Far cloud LOD: RGBA texture fallback.");
         const auto lod=vc::banks::lod(settings,vc::cloudRange(settings));
-        char msg[160];std::snprintf(msg,sizeof(msg),"Far cloud LOD ready: volume-projected billboards, transition %.0f-%.0f.",lod.start,lod.end);Log(msg);
+        char msg[160];std::snprintf(msg,sizeof(msg),"Directional cloud LOD ready: elevation-aware volume projections, full-altitude transition %.0f-%.0f.",lod.start,lod.end);Log(msg);
         return true;
     } catch(const std::bad_alloc&) {
         for(auto& t:billboardTextures){if(t)t->Release();t=nullptr;}
@@ -514,25 +514,26 @@ bool DrawCanopy(const vc::View& view,const vc::Range& range,float hybridFade,
 
 bool DrawBillboards(const vc::View& view,const vc::Range& range,const vc::weather::State& climate,
                     const vc::canopy::Light& light,const D3DMATRIX& transform,
-                    const D3DVIEWPORT9& viewport,vc::RGB fog,float wx,float wy,float handover,vc::d3d9::DrawState& states) {
+                    const D3DVIEWPORT9& viewport,vc::RGB fog,float wx,float wy,float handover,vc::d3d9::DrawState& states,const vc::banks::Lod* sharedLod=nullptr) {
     const float visibility=vc::weather::visibility(climate)*vc::weather::clearOpacity(climate)*handover;
     if(visibility<=1.f/255.f)return true;
     vc::billboards::buildMesh(billboardMesh,settings,view,range,canopyDrift,billboardAtlas,wx,wy,
-        billboardOptions.dual?climate.coverage:(climate.coverage>=.5f?1.f:0.f));
+        billboardOptions.dual?climate.coverage:(climate.coverage>=.5f?1.f:0.f),sharedLod);
     if(billboardMesh.indices.empty())return true;
     billboardProjected.clip.clear();billboardProjected.clip.reserve(billboardMesh.vertices.size());
     for(const auto& v:billboardMesh.vertices)billboardProjected.clip.push_back(vc::d3d9::clipVertex(
         v.pos,v.u,v.v,v.w,v.alpha*(billboardOptions.vertexFog?1.f:v.fog),v.fog,transform));
     vc::d3d9::projectMesh(billboardProjected,viewport,vc::banks::bankLight(light,climate),visibility,
         billboardMesh.indices.data(),billboardMesh.indices.size());
-    const auto result=vc::d3d9::drawProjected(bankDevice,{billboardTextures[0],billboardTextures[1]},billboardOptions,
-        billboardProjected,climate.coverage,false,fog,true,false,&states);
+    const auto result=vc::d3d9::drawFarProjected(bankDevice,{billboardTextures[0],billboardTextures[1]},billboardOptions,
+        billboardProjected,climate.coverage,fog,viewport,
+        settings.farHalfRes&&!settings.cumulusDetail?&bankFarLayer:nullptr,&states);
     if(!result){LogD3DFailure("far billboard draw",result);billboardFailed=true;return false;}
     return true;
 }
 bool DrawBanks(RwCamera* camera,const vc::View& view,const vc::Range& range,
                const vc::weather::State& climate,const vc::canopy::Light& light,
-               const D3DMATRIX& transform,const D3DMATRIX& projection,const D3DVIEWPORT9& viewport,vc::RGB fog,float handover,float playerZ,vc::d3d9::DrawState& states) {
+               const D3DMATRIX& transform,const D3DMATRIX& projection,const D3DVIEWPORT9& viewport,vc::RGB fog,float handover,float playerZ,vc::d3d9::DrawState& states,const vc::banks::Lod* sharedLod=nullptr) {
     if(!bankDevice||!bankTextures[0]||!bankTextures[1])return false;
     auto* window=RwCameraGetViewWindow(camera);
     if(!window)return false;
@@ -545,7 +546,7 @@ bool DrawBanks(RwCamera* camera,const vc::View& view,const vc::Range& range,
     const float handoverVisibility=vc::weather::visibility(climate)*vc::weather::clearOpacity(climate)*(canopyRelief.ready?1.f:handover);
     if(handoverVisibility<=1.f/255.f)return true;
     const float visibility=canopyRelief.ready?handoverVisibility:handoverVisibility*handover;
-    bool farReady=vc::billboards::eligible(settings,range)&&EnsureBillboards();
+    bool farReady=(sharedLod||vc::billboards::eligible(settings,range))&&EnsureBillboards();
     const auto bankLight=vc::banks::bankLight(light,climate);
     vc::d3d9::GpuPasses passes;
     passes.stream=&bankGpu;
@@ -555,12 +556,13 @@ bool DrawBanks(RwCamera* camera,const vc::View& view,const vc::Range& range,
     const auto weather=bankOptions.dual?climate.coverage:(climate.coverage>=.5f?1.f:0.f);
     const auto* occupancy=bankDownsampled?nullptr:&bankVolume;
     try {
-        if(farReady)farReady=DrawBillboards(view,range,climate,light,transform,viewport,fog,wx,wy,canopyRelief.ready?1.f:handover,states);
+        if(farReady)farReady=DrawBillboards(view,range,climate,light,transform,viewport,fog,wx,wy,canopyRelief.ready?1.f:handover,states,sharedLod);
+        if(!farReady)sharedLod=nullptr;
         if(visibility<=1.f/255.f)return true;
         useGpu=bankGpu.available()&&passes.prepare(settings,view,range,canopyDrift,farReady,
-            bankOptions.vertexFog,visibility,bankLight,transform,projection,viewport);
+            bankOptions.vertexFog,visibility,bankLight,transform,projection,viewport,sharedLod);
         if(useGpu) {
-            vc::banks::buildMesh(bankGpuMesh,settings,view,range,canopyDrift,wx,wy,occupancy,weather,farReady);
+            vc::banks::buildMesh(bankGpuMesh,settings,view,range,canopyDrift,wx,wy,occupancy,weather,farReady,true,true,sharedLod);
             if(bankGpuMesh.vertices.empty())return true;
             passes.restrictTo(bankGpuMesh);
             gpuCount=UINT(bankGpuMesh.vertices.size());
@@ -571,7 +573,7 @@ bool DrawBanks(RwCamera* camera,const vc::View& view,const vc::Range& range,
             }
         }
         if(!useGpu) {
-            vc::banks::buildMesh(bankMesh,settings,view,range,canopyDrift,wx,wy,occupancy,weather,farReady);
+            vc::banks::buildMesh(bankMesh,settings,view,range,canopyDrift,wx,wy,occupancy,weather,farReady,true,true,sharedLod);
             if(bankMesh.indices.empty())return true;
             bankProjected.clip.clear();bankProjected.clip.reserve(bankMesh.vertices.size());
             for(const auto& v:bankMesh.vertices)bankProjected.clip.push_back(vc::d3d9::clipVertex(
@@ -702,7 +704,13 @@ void __cdecl RenderClouds() {
             const bool volumeReady=settings.hybridClouds&&(canopyRelief.ready||requestedBlend>1.f/255.f)&&EnsureBanks();
             const float volumeBlend=volumeReady?requestedBlend:0.f;
             const auto independent=vc::cloudRange(settings);
-            const auto localVolume=canopyRelief.ready?vc::canopyVolume::volumeRange(settings,independent,playerZ,volumeBlend):independent;
+            // Directional proxy and nearby volume use one world field at
+            // all altitudes. The 70% player-Z curve now only changes LOD.
+            // Preserve the old sheet as a fallback if atlas upload fails.
+            const bool directional=volumeReady&&canopyRelief.ready&&vc::billboards::eligible(settings,independent)&&EnsureBillboards();
+            const auto directionalLod=vc::banks::hybridLod(settings,independent,playerZ,view.pos.z);
+            const auto* sharedLod=directional?&directionalLod:nullptr;
+            const auto localVolume=directional?independent:canopyRelief.ready?vc::canopyVolume::volumeRange(settings,independent,playerZ,volumeBlend):independent;
             const auto* nearVolume=volumeReady&&canopyRelief.ready?&localVolume:nullptr;
             const auto& viewMatrix=*reinterpret_cast<const D3DMATRIX*>(0xC9BC80);
             const auto& projection=*reinterpret_cast<const D3DMATRIX*>(0x8E2458);
@@ -724,8 +732,8 @@ void __cdecl RenderClouds() {
                         const auto* offset=RwCameraGetViewOffset(camera);
                         const float wx=window?window->x+(offset?std::abs(offset->x):0.f):1.f,
                             wy=window?window->y+(offset?std::abs(offset->y):0.f):1.f;
-                        drawn=DrawCanopy(view,independent,volumeBlend,climate,light,transform,viewport,fog,wx,wy,nearVolume,states);
-                        if(drawn&&volumeReady&&!DrawBanks(camera,view,localVolume,climate,light,transform,projection,viewport,fog,volumeBlend,playerZ,states)) {
+                        drawn=directional||DrawCanopy(view,independent,volumeBlend,climate,light,transform,viewport,fog,wx,wy,nearVolume,states);
+                        if(drawn&&volumeReady&&!DrawBanks(camera,view,localVolume,climate,light,transform,projection,viewport,fog,volumeBlend,playerZ,states,sharedLod)) {
                             bankFailed=true;Log("3D cloud draw failed; retaining full canopy from next frame.");
                         }
                     } catch(const std::bad_alloc&) {Log("Cloud projection allocation failed.");}

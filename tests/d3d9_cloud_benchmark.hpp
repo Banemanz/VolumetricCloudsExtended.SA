@@ -117,8 +117,11 @@ inline int benchmark(IDirect3DDevice9* device,const D3DCAPS9& caps,bool half=fal
             drift.update(s,{.2f,.1f,0},.016f);
             const auto begin=Clock::now();
             const auto blend=canopy::handover(s,height);
-            const auto range=canopyVolume::volumeRange(s,full,height,blend);
-            const bool farReady=billboards::eligible(s,range);
+            const bool directional=billboards::eligible(s,full);
+            const auto range=directional?full:canopyVolume::volumeRange(s,full,height,blend);
+            const auto lod=banks::hybridLod(s,full,height,cam.pos.z);
+            const auto* sharedLod=directional?&lod:nullptr;
+            const bool farReady=directional||billboards::eligible(s,range);
             auto view=identity();
             view._11=right.x;view._21=right.y;view._31=right.z;view._41=-dot(pos,right);
             view._12=up.x;view._22=up.y;view._32=up.z;view._42=-dot(pos,up);
@@ -126,7 +129,7 @@ inline int benchmark(IDirect3DDevice9* device,const D3DCAPS9& caps,bool half=fal
             D3DMATRIX projection{};projection._11=1.f/wx;projection._22=1.f/wy;
             projection._33=450.f/449.f;projection._34=1;projection._43=-projection._33;
             const auto transform=multiply(view,projection);
-            canopyVolume::mesh(proxy,relief,s,cam,full,drift,wx,wy,blend,&range);
+            if(directional){proxy.vertices.clear();proxy.indices.clear();}else canopyVolume::mesh(proxy,relief,s,cam,full,drift,wx,wy,blend,&range);
             ps.clip.clear();
             for(const auto& v:proxy.vertices) {
                 const float fogWeight=cloudFogFactor(s,v.distance);
@@ -135,19 +138,19 @@ inline int benchmark(IDirect3DDevice9* device,const D3DCAPS9& caps,bool half=fal
             projectMesh(ps,vp,light,1.f,proxy.indices.data(),proxy.indices.size());
             pa.clip.clear();pa.indices.clear();
             if(farReady) {
-                billboards::buildMesh(card,s,cam,range,drift,atlas,wx,wy,atlasOpts.dual?coverage:0.f);
+                billboards::buildMesh(card,s,cam,range,drift,atlas,wx,wy,atlasOpts.dual?coverage:0.f,sharedLod);
                 for(const auto& v:card.vertices)pa.clip.push_back(clipVertex(v.pos,v.u,v.v,v.w,v.alpha*(atlasOpts.vertexFog?1.f:v.fog),v.fog,transform));
                 projectMesh(pa,vp,light,1.f,card.indices.data(),card.indices.size());
             }
             GpuPasses passes;passes.stream=&hw;if(half)passes.farLayer=&farLayer;
-            const bool useGpu=hardware&&passes.prepare(s,cam,range,drift,farReady,bankOpts.vertexFog,1.f,light,transform,projection,vp);
+            const bool useGpu=hardware&&passes.prepare(s,cam,range,drift,farReady,bankOpts.vertexFog,1.f,light,transform,projection,vp,sharedLod);
             UINT n=0,nt=0;
             if(useGpu) {
-                banks::buildMesh(gpu,s,cam,range,drift,wx,wy,&volume,bankOpts.dual?coverage:0.f,farReady);
+                banks::buildMesh(gpu,s,cam,range,drift,wx,wy,&volume,bankOpts.dual?coverage:0.f,farReady,true,true,sharedLod);
                 n=UINT(gpu.vertices.size());nt=UINT(gpu.triangleCount());
                 passes.restrictTo(gpu);
             } else {
-                banks::buildMesh(cpu,s,cam,range,drift,wx,wy,&volume,bankOpts.dual?coverage:0.f,farReady);
+                banks::buildMesh(cpu,s,cam,range,drift,wx,wy,&volume,bankOpts.dual?coverage:0.f,farReady,true,true,sharedLod);
                 pb.clip.clear();
                 for(const auto& v:cpu.vertices)pb.clip.push_back(clipVertex(v.pos,v.u,v.v,v.w,v.alpha*(bankOpts.vertexFog?1.f:v.fog),v.fog,transform));
                 projectMesh(pb,vp,light,1.f,cpu.indices.data(),cpu.indices.size());
@@ -164,7 +167,8 @@ inline int benchmark(IDirect3DDevice9* device,const D3DCAPS9& caps,bool half=fal
             if(!scoped.capture(device))return 1;
             vc::d3d9::DrawState states;
             if(!drawProjected(device,{sheet[0],sheet[1]},sheetOpts,ps,coverage,false,fog,true,false,&states))return 1;
-            if(!drawProjected(device,{farAtlasTex[0],farAtlasTex[1]},atlasOpts,pa,coverage,false,fog,true,false,&states))return 1;
+            bool usedProxy=false;
+            if(!drawFarProjected(device,{farAtlasTex[0],farAtlasTex[1]},atlasOpts,pa,coverage,fog,vp,half?&farLayer:nullptr,&states,&usedProxy))return 1;
             bool reused=false;
             if(useGpu&&n) {
                 if(!hw.uploadReusable(gpu,&reused))return 1;
@@ -195,7 +199,7 @@ inline int benchmark(IDirect3DDevice9* device,const D3DCAPS9& caps,bool half=fal
                 if(gpuValid)gpuTime.push_back(1000.*double(end-start)/double(hz));
                 if(samples)passed.push_back(double(pixels));
                 input+=n;submitted+=useGpu?passes.ranges[0].count()+passes.ranges[1].count():n;
-                bytes+=useGpu&&!reused?n*sizeof(banks::GpuVertex):0;skipped+=reused;halfFrames+=passes.usedFarLayer;
+                bytes+=useGpu&&!reused?n*sizeof(banks::GpuVertex):0;skipped+=reused;halfFrames+=passes.usedFarLayer||usedProxy;
                 tri+=ps.indices.size()/3+pa.indices.size()/3+(useGpu?(passes.ranges[0].count()+passes.ranges[1].count())/2:nt);
             }
         }
