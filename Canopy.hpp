@@ -239,8 +239,8 @@ inline const auto& directions() {
 }
 // Player altitude, NOT camera height or pitch. Begin just below the
 // physical canopy and finish at the canopy; the same curve on descent.
-// At the defaults this is 368.9m -> 434m above sea level.
-constexpr float HandoverRatio=.85f;
+// At the defaults this is 442.4m -> 632m above sea level.
+constexpr float HandoverRatio=.70f;
 inline float handover(const Settings& s,float playerZ) {
     if(!s.hybridClouds||!std::isfinite(playerZ))return 0.f;
     const float height=altitude(s);

@@ -40,7 +40,7 @@ pipeline may still need compatibility testing.
   fixed-world-axis slice patches with absolute world XYZ texture coordinates.
   Neither rotating nor translating the camera moves the density-sampling
   planes. The nearby volume is always available; its range expands toward
-  the full draw distance from 85% of the canopy height to the canopy,
+  the full draw distance from 70% of the canopy height to the canopy,
   based on actual player or occupied vehicle Z, not camera orientation.
   `HybridClouds=0` selects the inexpensive original canopy-only renderer.
 - Frustum rejection, independent mode 2 cloud range, smooth range and near fades,
@@ -60,19 +60,20 @@ old draw and fog distances, and any explicit UseAdditionalTextures setting.
 | Setting | Default | Meaning |
 |---|---:|---|
 | RenderMode | 2 | 2 = continuous volume banks + distant layer; 1 = clustered classic cards; 0 = crossed classic cards |
-| HybridClouds | 1 | Mode 2: nearby 3D plus shared-density canopy; full 3D range expands at 85% of canopy height; 0 keeps canopy everywhere |
+| HybridClouds | 1 | Mode 2: nearby 3D plus shared-density canopy; full 3D range expands at 70% of canopy height; 0 keeps canopy everywhere |
 | CumulusDetail | 0 | Economy (recommended); 1 = larger textures and more samples |
-| TargetProcClouds | 160 | Sky coverage in mode 2; classic cloud group count otherwise; 0 disables |
+| FarHalfRes | 0 | Experimental: accumulate distant volume at half resolution, then composite at full scene depth. Enable manually to test. |
+| TargetProcClouds | 120 | Sky coverage in mode 2; classic cloud group count otherwise; 0 disables |
 | BadWeatherDensityMultiplier | 1.4 | Cloud density in bad weather relative to clear (0–3) |
-| MinSpawnZ / MaxSpawnZ | 200 / 650 | Cloud layer height above sea level |
-| SizeScale | 1 | Size of the cloud formations |
+| MinSpawnZ / MaxSpawnZ | 450 / 800 | Cloud layer height above sea level |
+| SizeScale | 1.5 | Horizontal cloud size; larger periodic formations and fewer repetitions |
 | WindMoveScale | 0.9 | Wind movement multiplier |
 | Opacity | 1 | Cloud thickness (0–2) |
 | Seed | 17321 | Repeatable cloud pattern |
 | CloudDrawDistance | 8000 | Independent 3D and distant cloud visibility (300–12000 world units) |
 | FarBillboards | 1 | Beyond the far threshold, transition to cheap volume-projected cards; 0 keeps the full volume |
 | BillboardStartDistance | 5000 | Minimum distance for the billboard transition (5000–12000) |
-| BillboardStartRatio | 0.8 | Also start no sooner than this fraction of CloudDrawDistance (0.5–0.95) |
+| BillboardStartRatio | 0.65 | Also start no sooner than this fraction of CloudDrawDistance (0.5–0.95) |
 | CloudFogStart / CloudFogEnd | 1600 / 8000 | Cloud-only colour haze starts/ends here. Equal values disable colour fog. |
 | CumulusContrast | 0.65 | Strength of baked cloud relief (0–1) |
 | CumulusNightLight | 1 | Cloud night brightness (0–2) |
@@ -183,10 +184,10 @@ and [pure-device GetViewport documentation](https://learn.microsoft.com/en-us/wi
   The previous 1400m radius and tile-size-dependent limit are removed.
   With billboards off, fixed slices extend to the configured range (with
   squared distance opacity taper beginning at 75%). With far billboards
-  on, the first transition distance is max(5000m, 0.8 × CloudDrawDistance)
+  on, the first transition distance is max(5000m, 0.65 × CloudDrawDistance)
   by default; the transition ends 10% of the draw distance later
   (at least 350m, not beyond draw distance). At 8000m, that means full
-  3D up to 6400m, blended 3D/cards to 7200m, cards beyond. At 4200m,
+  3D up to 5200m, blended 3D/cards to 6000m, cards beyond. At 4200m,
   there are no billboards. The two geometric representations crossfade
   over distance, not camera height or heading.
 - **Far LOD:** the exact clear/wet volume is projected front-to-back
@@ -203,12 +204,13 @@ and [pure-device GetViewport documentation](https://learn.microsoft.com/en-us/wi
   prepared/uploaded or if unusually tiny cells would require too many
   cards. Directional blending and slab projection are approximations.
 - **Altitude handover:** nominal canopy height is
-  `MinSpawnZ + 0.52 * (MaxSpawnZ - MinSpawnZ)` (434m for 200–650m).
-  A small true-volume zone (630m default at street level) grows to
-  1200m before 85% of that height, then expands to the full range from
-  85% to 100% (~368.9–434m). The cheap distant canopy fades where the
-  nearby volume contributes and retains the previous faint distant
-  underlay at full flight altitude. The transition changes distance,
+  `MinSpawnZ + 0.52 * (MaxSpawnZ - MinSpawnZ)` (632m for 450–800m).
+  A small true-volume zone (600m default at street level) grows to
+  1200m before 70% of that height, then expands to the full range from
+  70% to 100% (442.4–632m). The shared-density canopy fades with the
+  complement of the actual radial volume weight, using an optical-depth
+  approximation to reduce the midpoint opacity dip. Where the volume
+  fully contributes, the canopy emits no visible triangles. The transition changes distance,
   not the density or opacity of nearby clouds. The actual player or
   vehicle Z controls it, not camera pitch. Both rendering paths sample
   the same period, wind, weather endpoints and baked luminance.
@@ -363,7 +365,7 @@ send the new log lines including HRESULT, not only the canopy screenshot.
 
 ### Historical Linux software diagnostics — density/mesh only
 
-| Below 85% canopy height | Mid-handover (412m) |
+| Historical below 85% canopy height | Historical mid-handover (412m) |
 |---|---|
 | ![Canopy on the ground](docs/previews/banks_ground.jpg) | ![Entry](docs/previews/banks_entry.jpg) |
 | ![Flight](docs/previews/banks_flight.jpg) | ![Above](docs/previews/banks_above.jpg) |
@@ -623,3 +625,62 @@ The Linux same-core stress benchmark and D3D9 synthetic yardstick are
 complementary, not an emulation of the Celeron 847/Intel HD Graphics,
 RenderWare world rendering, or shared-memory contention on that system.
 Do not convert their timings into an alleged in-game FPS for that hardware.
+
+### Wider cloud formations, optical handover and fill-rate work
+
+Fresh defaults: 450–800m cloud band, 120 coverage units instead of 160,
+horizontal scale 1.5 instead of 1.0. The size of the periodic tile is
+3300m rather than 2200m, so across the same world area the tile repeats
+about 44% as often. This is not a literal spawned cloud count in mode 2.
+Economy XY lattice spacing can increase by at most 12.5% for larger
+formations; vertical spacing remains tied to band height and detail mode
+keeps its smaller XY spacing. The independent 8000m range is unchanged.
+Far volume-to-atlas crossover starts at max(5000m, 65% of range);
+at the default 8000m it is 5200–6000m. Explicit old INI values still work.
+
+Handover starts at 70% of canopy height (442.4m) and completes at 632m.
+The canopy and volume no longer apply unrelated global fades. Canopy
+opacity follows the complement of the *local* volume range with a cheap
+quadratic optical-weight correction, exact at both endpoints, tested
+against Beer–Lambert splitting at a reference opacity of 0.6.
+Remove fully zero-alpha canopy triangles and conservatively reject all
+cells entirely inside the fully represented volume range.
+
+Distant dominant-axis vertical slice patches may tighten in Z using the
+same byte-sized occupancy query already used to reject an empty slice.
+The occupancy mask includes the texture filtering halo; no extra lookup
+table or pixel shader, no extra vertices or draw calls. Near and diagonal
+slices and detail mode remain unchanged. The fixed lattice planes and
+density sample positions do not move; reinterpolating distant patch
+corner weights can cause small RGB differences. The support test covers
+both weather endpoints, mixed weather and translated seams.
+
+Experimental `FarHalfRes=1`: accumulate just the volume beyond the native
+scene far clip into a half-width/half-height A8R8G8B8 render target
+using separate alpha blending (premultiplied accumulated RGB), then
+bilinearly composite at the original maximum viewport depth using ONE /
+INVSRCALPHA against the original colour and depth. Near clouds and
+geometry occlusion remain native-resolution; the original scene depth
+buffer is never read, copied, cleared or scaled. Only VS2 economy devices
+with suitable capabilities, X8R8G8B8 non-MSAA colour target, one bound
+render target and a valid scene depth buffer are considered. Unsupported
+formats, failed allocation or a failed offscreen draw fall back to full
+resolution. The small RT and cached state block are released on device
+loss/reset. This is opt-in until native device and in-game compatibility
+are verified; no general SkyGfx/deferred compatibility claim.
+
+References: GPU Gems (2004), [Volume Rendering Techniques](https://developer.nvidia.com/gpugems/gpugems/part-vi-beyond-triangles/chapter-39-volume-rendering-techniques)
+(empty-space proxy geometry); Harris/Lastra (2001),
+[Real-Time Cloud Rendering](https://techreports.cs.unc.edu/papers/01-005.pdf)
+(impostor and fill-rate reduction); Microsoft D3D9
+[Alpha Testing State](https://learn.microsoft.com/en-us/windows/win32/direct3d9/alpha-testing-state)
+and [Alpha Texture Blending](https://learn.microsoft.com/en-us/windows/win32/direct3d9/alpha-texture-blending).
+Original implementation, not copied source or assets.
+
+Linux software workload counts actual covered pixel centers before
+texture-alpha rejection, separately counts approximate nonzero alpha,
+and supports a same-scene split at 450m camera depth. It does not simulate
+a particular GPU, filtering hardware or GTA depth buffer. Windows CI also
+runs paired `--benchmark 640 480` and `--benchmark-half 640 480` using the
+real backend, and checks the depth sentinel, RGB deviation and state
+restoration. The half-res path is deliberately optional.

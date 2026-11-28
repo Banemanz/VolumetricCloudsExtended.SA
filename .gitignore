@@ -7,3 +7,5 @@
 *.log
 VolumetricCloudsExtended.ini
 VolumetricCloudsExtended.cache*
+
+__pycache__/

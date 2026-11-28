@@ -60,6 +60,8 @@ jobs:
           if ($LASTEXITCODE -notin @(0,77)) { exit $LASTEXITCODE }
           & build/Release/d3d9_volume_test.exe --benchmark 1024 768
           if ($LASTEXITCODE -notin @(0,77)) { exit $LASTEXITCODE }
+          & build/Release/d3d9_volume_test.exe --benchmark-half 640 480
+          if ($LASTEXITCODE -notin @(0,77)) { exit $LASTEXITCODE }
       - name: Package Win32 plugin
         shell: pwsh
         run: |

@@ -31,7 +31,7 @@ inline double percentile(std::vector<double> values,unsigned p) {
     std::sort(values.begin(),values.end());
     return values[(values.size()-1)*p/100];
 }
-inline int benchmark(IDirect3DDevice9* device,const D3DCAPS9& caps) {
+inline int benchmark(IDirect3DDevice9* device,const D3DCAPS9& caps,bool half=false) {
     using namespace vc;
     using namespace vc::d3d9;
     D3DDEVICE_CREATION_PARAMETERS creation{};
@@ -87,7 +87,7 @@ inline int benchmark(IDirect3DDevice9* device,const D3DCAPS9& caps) {
         });
     for(int i=0;i<2;++i)farOwner[i].p=farAtlasTex[i];
     if(!a)return 1;
-    GpuStream hw;
+    GpuStream hw;FarLayer farLayer;
     const bool hardware=hw.create(device,caps,creation.BehaviorFlags);
     std::printf("Volume %s, canopy %s, atlas %s; hardware VS2: %s\n",
         bf==D3DFMT_A8L8?"A8L8":"RGBA",sf==D3DFMT_A8L8?"A8L8":"RGBA",ff==D3DFMT_A8L8?"A8L8":"RGBA",hardware?"yes":"no");
@@ -103,9 +103,9 @@ inline int benchmark(IDirect3DDevice9* device,const D3DCAPS9& caps) {
     // Fixed and moving camera samples; two clear/mixed-weather scenarios.
     // Use a short scene clip and a depth occluder, simulating sky visible
     // between buildings without loading a proprietary world.
-    for(float height:{30.f,317.f,400.f,523.f,1000.f})for(float coverage:{0.f,.5f}) {
+    for(float height:{30.f,443.f,535.f,635.f,1000.f})for(float coverage:{0.f,.5f}) {
         std::vector<double> prep,submit,complete,gpuTime,passed;
-        std::size_t input=0,submitted=0,bytes=0,skipped=0,tri=0;
+        std::size_t input=0,submitted=0,bytes=0,skipped=0,tri=0,halfFrames=0;
         canopy::Drift drift;
         for(int frame=0;frame<warm+frames;++frame) {
             const int moving=std::max(0,frame-warm-7);
@@ -139,7 +139,7 @@ inline int benchmark(IDirect3DDevice9* device,const D3DCAPS9& caps) {
                 for(const auto& v:card.vertices)pa.clip.push_back(clipVertex(v.pos,v.u,v.v,v.w,v.alpha*(atlasOpts.vertexFog?1.f:v.fog),v.fog,transform));
                 projectMesh(pa,vp,light,1.f,card.indices.data(),card.indices.size());
             }
-            GpuPasses passes;passes.stream=&hw;
+            GpuPasses passes;passes.stream=&hw;if(half)passes.farLayer=&farLayer;
             const bool useGpu=hardware&&passes.prepare(s,cam,range,drift,farReady,bankOpts.vertexFog,1.f,light,transform,projection,vp);
             UINT n=0,nt=0;
             if(useGpu) {
@@ -195,14 +195,14 @@ inline int benchmark(IDirect3DDevice9* device,const D3DCAPS9& caps) {
                 if(gpuValid)gpuTime.push_back(1000.*double(end-start)/double(hz));
                 if(samples)passed.push_back(double(pixels));
                 input+=n;submitted+=useGpu?passes.ranges[0].count()+passes.ranges[1].count():n;
-                bytes+=useGpu&&!reused?n*sizeof(banks::GpuVertex):0;skipped+=reused;
+                bytes+=useGpu&&!reused?n*sizeof(banks::GpuVertex):0;skipped+=reused;halfFrames+=passes.usedFarLayer;
                 tri+=ps.indices.size()/3+pa.indices.size()/3+(useGpu?(passes.ranges[0].count()+passes.ranges[1].count())/2:nt);
             }
         }
-        std::printf("Z=%4.0f weather=%.1f N=%d | CPU prep med/p95 %.3f/%.3f | submit %.3f/%.3f | completion %.3f/%.3f | GPU interval %.3f/%.3f (N=%zu) | avg verts %zu/%zu tris %zu, VB upload %zu B, reused %zu/%d, median passing samples %.0f\n",
+        std::printf("Z=%4.0f weather=%.1f N=%d | CPU prep med/p95 %.3f/%.3f | submit %.3f/%.3f | completion %.3f/%.3f | GPU interval %.3f/%.3f (N=%zu) | avg verts %zu/%zu tris %zu, VB upload %zu B, reused %zu/%d, median passing samples %.0f, half-res frames %zu\n",
             height,coverage,frames,percentile(prep,50),percentile(prep,95),percentile(submit,50),percentile(submit,95),
             percentile(complete,50),percentile(complete,95),percentile(gpuTime,50),percentile(gpuTime,95),gpuTime.size(),
-            input/frames,submitted/frames,tri/frames,bytes/frames,skipped,frames,percentile(passed,50));
+            input/frames,submitted/frames,tri/frames,bytes/frames,skipped,frames,percentile(passed,50),halfFrames);
     }
     std::puts("Benchmark complete. GPU -1 means unsupported/disjoint; completion includes synchronization, not in-game FPS.");
     return 0;

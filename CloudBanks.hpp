@@ -77,7 +77,8 @@ inline int verticalSteps(const Settings& s) {
 }
 inline Vec latticeSpacing(const Settings& s) {
     const float base=s.cumulusDetail?16.f:20.f;
-    return {base,base,(s.maxSpawnZ-s.minSpawnZ)/verticalSteps(s)};
+    const float xy=base*(s.cumulusDetail?1.f:clamp(s.sizeScale,1.f,1.125f));
+    return {xy,xy,(s.maxSpawnZ-s.minSpawnZ)/verticalSteps(s)};
 }
 struct TextureOrigin {float u,v,tile,band;};
 inline TextureOrigin textureOrigin(const Settings& s,const View& v,const canopy::Drift& drift) {
@@ -295,17 +296,25 @@ struct Volume {
         const int count=std::min(b-a+1,n);
         a=canopy::wrap(a,n);return {a,a+count};
     }
-    bool potentiallyOccupied(const CellBox& box,float weather) const {
+    // 0..255: conservative occupied Z cells; 256: allocation fallback.
+    // The same lookup that rejects an empty slice also supplies its vertical
+    // silhouette envelope, without scanning texels or querying more boxes.
+    unsigned rectangleBits(const CellBox& box,float weather) const {
         const auto [xa,xb]=box.axis[0];
         const auto [ya,yb]=box.axis[1];
         const auto [za,zb]=box.axis[2];
         const bool clear=weather<.999f,wet=weather>.001f;
-        if(!clear&&!wet)return false;
+        if(!clear&&!wet)return 0;
         const auto& table=rectangleMask[clear&&wet&&!rectangleMask[2].empty()?2:wet?1:0];
-        if(!table.empty()) {
-            const auto zMask=(1u<<zb)-(1u<<za);
-            return (table[rectangleIndex(xa,ya,xb-xa,yb-ya)]&zMask)!=0;
-        }
+        if(table.empty())return 256;
+        return table[rectangleIndex(xa,ya,xb-xa,yb-ya)]&((1u<<zb)-(1u<<za));
+    }
+    bool potentiallyOccupied(const CellBox& box,float weather) const {
+        const auto bits=rectangleBits(box,weather);
+        if(bits!=256)return bits!=0;
+        const auto [xa,xb]=box.axis[0];
+        const auto [ya,yb]=box.axis[1];
+        const auto [za,zb]=box.axis[2];
         const auto count=[&](int layer) {
             const auto& p=occupiedPrefix[layer];
             const auto at=[&](int x,int y,int z){return int(p[prefixIndex(x,y,z)]);};
@@ -430,7 +439,7 @@ inline bool planeCandidate(Vec closest,Vec deltaLo,Vec deltaHi,float axisDelta,f
 template<class MeshType>
 inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range& r,
                       const canopy::Drift& drift,float wx,float wy,const Volume* volume=nullptr,
-                      float weather=0.f,bool billboardAvailable=true) {
+                      float weather=0.f,bool billboardAvailable=true,bool tighten=true) {
     using OutputVertex=typename decltype(m.vertices)::value_type;
     constexpr bool gpu=std::is_same_v<OutputVertex,GpuVertex>;
     m.vertices.clear();if constexpr(gpu)m.spans.clear();else m.indices.clear();m.slices=0;
@@ -442,7 +451,7 @@ inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range
     const float base=s.cumulusDetail?16.f:20.f;
     const int nz=verticalSteps(s);
     const Vec step=latticeSpacing(s),origin{0,0,s.minSpawnZ};
-    const float brickSize=BrickSteps*base;
+    const float brickSize=BrickSteps*step.x;
     const auto radiusSquared=[](float distance){const float limit=distance+.01f;return limit*limit;};
     const float outerLimitSq=radiusSquared(levels.end),middleLimitSq=radiusSquared(std::min(levels.end,1300.f)),
         innerLimitSq=radiusSquared(std::min(levels.end,440.f));
@@ -535,11 +544,12 @@ inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range
     for(const auto& b:parents)collect(collect,b,true);
     // A patch's rectangle is entirely defined by its parent brick, axis
     // and plane position. Sort compact keys directly; no pointer chasing.
-    struct Patch {float depth,position;int axis,plane;};
+    struct Patch {float depth,position;unsigned axisMask;int plane;};
     std::array<Patch,3*BrickSteps> patches;
     for(const auto& b:bricks) {
         std::size_t patchCount=0;
         const auto spanStart=std::uint32_t(m.vertices.size());
+        const bool trim=tighten&&volume&&!s.cumulusDetail&&b.nearest>=1300.f*1300.f;
         const int stride=b.nearest>=1300.f*1300.f?4:b.nearest>=440.f*440.f?2:1;
         // Two axes of the occupancy box are constant across every slice.
         // Compute them once, respecting the same division and floor as the
@@ -560,10 +570,13 @@ inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range
             if(!(b.axes&(1u<<a)))return;
             const float eyeAxis=component(view.pos,a),axisOrigin=component(origin,a),axisStep=component(step,a);
             const float minAngularDistance=angularThreshold<a>(closest);
+            constexpr int j=(a+1)%3,k=(a+2)%3;
+            const float otherMax=std::max({std::abs(component(deltaLo,j)),std::abs(component(deltaHi,j)),
+                                          std::abs(component(deltaLo,k)),std::abs(component(deltaHi,k))});
             int i=b.first[a];const int rem=((i%stride)+stride)%stride;if(rem)i+=stride-rem;
             // Adjacent world planes often land in the same baked occupancy cell.
             // Other dimensions and active weather endpoints are constant here.
-            int lastCell=-1;bool lastOccupied=false;
+            int lastCell=-1;bool lastOccupied=false;unsigned lastBits=256;
             for(;i<b.last[a];i+=stride) {
                 // A single lattice plane at the center of its finest cell.
                 // Neither its position nor the density UV depends on the eye.
@@ -574,7 +587,8 @@ inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range
                     const auto cell=Volume::cells(uv,uv,a);
                     if(lastCell!=cell.first) {
                         auto query=box;query.axis[a]=cell;
-                        lastOccupied=volume->potentiallyOccupied(query,weather);
+                        lastBits=volume->rectangleBits(query,weather);
+                        lastOccupied=lastBits==256?volume->potentiallyOccupied(query,weather):lastBits!=0;
                         lastCell=cell.first;
                     }
                     if(!lastOccupied)continue;
@@ -584,7 +598,11 @@ inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range
                     Vec middle=center;
                     // Retain the original (lo+hi)*.5 expression for exact depth ordering.
                     setComponent(middle,a,(plane+plane)*.5f-eyeAxis);
-                    patches[patchCount++]={dot(middle,middle),plane,a,i};
+                    // Trim the upper/lower empty slab only on far, fully
+                    // dominant vertical slices. Fixed-function interpolation
+                    // varies least here; near/diagonal/quality paths are unchanged.
+                    const unsigned zMask=trim&&a!=2&&lastBits!=256&&otherMax<=std::abs(plane-eyeAxis)*.8f?lastBits:0;
+                    patches[patchCount++]={dot(middle,middle),plane,unsigned(a)|(zMask<<2),i};
                 }
             }
         };
@@ -592,15 +610,27 @@ inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range
         collectAxis(std::integral_constant<int,1>{});
         collectAxis(std::integral_constant<int,2>{});
         std::sort(patches.begin(),patches.begin()+patchCount,[](const Patch& a,const Patch& b){
-            return a.depth!=b.depth?a.depth<b.depth:a.axis!=b.axis?a.axis<b.axis:a.plane<b.plane;
+            return a.depth!=b.depth?a.depth<b.depth:(a.axisMask&3)!=(b.axisMask&3)?(a.axisMask&3)<(b.axisMask&3):a.plane<b.plane;
         });
         for(std::size_t index=0;index<patchCount;++index) {
             const auto& patch=patches[index];
             if(m.vertices.size()+4>MaxVertices)break;
             const auto offset=std::uint16_t(m.vertices.size());
-            const int a=patch.axis,j=(a+1)%3,k=(a+2)%3,i=patch.plane;
+            const int a=patch.axisMask&3,j=(a+1)%3,k=(a+2)%3,i=patch.plane;
+            const unsigned zMask=patch.axisMask>>2;
             const auto code=latticeCode(a,i);
-            Vec lower=b.lo,upper=b.hi;setComponent(lower,a,patch.position);setComponent(upper,a,patch.position);
+            Vec lower=b.lo,upper=b.hi;
+            if(zMask) {
+                int low=0,high=OccupancyZ;
+                while(!(zMask&(1u<<low)))++low;
+                while(!(zMask&(1u<<(high-1))))--high;
+                // A conservative halo in the occupancy table already
+                // covers trilinear filtering. Extra padding covers float UVs.
+                constexpr float pad=.08f;
+                lower.z=std::max(lower.z,origin.z+band*low/OccupancyZ-pad);
+                upper.z=std::min(upper.z,origin.z+band*high/OccupancyZ+pad);
+            }
+            setComponent(lower,a,patch.position);setComponent(upper,a,patch.position);
             for(int q=0;q<4;++q) {
                 Vec p=lower;
                 if(q&1)setComponent(p,j,component(upper,j));

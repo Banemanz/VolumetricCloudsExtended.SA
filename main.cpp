@@ -57,6 +57,7 @@ vc::banks::Volume bankVolume;
 vc::banks::Mesh bankMesh;
 vc::banks::GpuMesh bankGpuMesh;
 vc::d3d9::GpuStream bankGpu;
+vc::d3d9::FarLayer bankFarLayer;
 std::array<IDirect3DVolumeTexture9*,2> bankTextures{};
 IDirect3DDevice9* bankDevice=nullptr; // borrowed
 bool bankFailed=false,bankPrepared=false,bankDrawLogged=false,bankEmptyLogged=false;
@@ -70,6 +71,7 @@ IDirect3DDevice9* CurrentD3DDevice() {
     return *reinterpret_cast<IDirect3DDevice9**>(0xC97C28);
 }
 void ReleaseBankTextures() {
+    bankFarLayer.release();
     bankGpu.release();
     if(bankPixelQuery){bankPixelQuery->Release();bankPixelQuery=nullptr;}
     bankPixelQueryAttempted=false;bankQueryFrames=0;bankDownsampled=false;
@@ -547,6 +549,7 @@ bool DrawBanks(RwCamera* camera,const vc::View& view,const vc::Range& range,
     const auto bankLight=vc::banks::bankLight(light,climate);
     vc::d3d9::GpuPasses passes;
     passes.stream=&bankGpu;
+    if(settings.farHalfRes&&!settings.cumulusDetail)passes.farLayer=&bankFarLayer;
     bool useGpu=false;
     UINT gpuCount=0;
     const auto weather=bankOptions.dual?climate.coverage:(climate.coverage>=.5f?1.f:0.f);

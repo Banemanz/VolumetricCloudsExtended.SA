@@ -26,9 +26,9 @@ void competingSceneWork() {
     }
 }
 template<class BankMesh>
-void run(const Settings& s,const banks::Volume& volume,const billboards::Atlas& atlas,const canopyVolume::Relief& relief) {
+void run(const Settings& s,const banks::Volume& volume,const billboards::Atlas& atlas,const canopyVolume::Relief& relief,bool tighten) {
     canopyVolume::Mesh canopy;banks::Mesh cards;BankMesh bankMesh;
-    for(float z:{30.f,317.f,400.f,523.f,1000.f}) {
+    for(float z:{30.f,317.f,400.f,523.f,635.f,1000.f}) {
         std::vector<double> times;times.reserve(480);
         std::size_t sheet=0,volumeTris=0,cardTris=0;canopy::Drift drift;
         for(int frame=0;frame<480;++frame) {
@@ -41,7 +41,7 @@ void run(const Settings& s,const banks::Volume& volume,const billboards::Atlas& 
             drift.update(s,{.2f,.1f,0},.016f);
             const auto start=Clock::now();
             canopyVolume::mesh(canopy,relief,s,v,full,drift,.94f,.53f,blend,&local);
-            banks::buildMesh(bankMesh,s,v,local,drift,.94f,.53f,&volume,weather,distant);
+            banks::buildMesh(bankMesh,s,v,local,drift,.94f,.53f,&volume,weather,distant,tighten);
             if(distant)billboards::buildMesh(cards,s,v,local,drift,atlas,.94f,.53f,weather);
             else cards.indices.clear();
             times.push_back(std::chrono::duration<double,std::milli>(Clock::now()-start).count());
@@ -59,6 +59,7 @@ int main(int argc,char** argv) {
     banks::Volume volume;volume.build(s,map);billboards::Atlas atlas;atlas.build(s,volume);
     canopyVolume::Relief relief;relief.build(s,volume);
     std::cout<<"Cloud-only source preparation, no rasterization, no D3D driver or game timing\n";
-    run<banks::GpuMesh>(s,volume,atlas,relief);
-    run<banks::Mesh>(s,volume,atlas,relief);
+    const bool tighten=argc<=1||std::string(argv[1])!="--no-trim";
+    run<banks::GpuMesh>(s,volume,atlas,relief,tighten);
+    run<banks::Mesh>(s,volume,atlas,relief,tighten);
 }

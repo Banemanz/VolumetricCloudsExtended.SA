@@ -321,6 +321,115 @@ struct StateScope {
     StateScope(const StateScope&)=delete;
     StateScope& operator=(const StateScope&)=delete;
 };
+// Optional distant-only half-resolution accumulation. The original scene
+// depth buffer is never copied, sampled, cleared or downsampled. It is
+// rebound for the final premultiplied quad at the cleared far depth.
+// X8 destinations only: avoid altering alpha-bearing/deferred attachments.
+struct FarLayer {
+    IDirect3DTexture9* texture{};
+    IDirect3DSurface9* surface{};
+    UINT width{},height{};
+    bool disabled{};
+    StateScope snapshot;
+    void release() {
+        snapshot.release();
+        if(surface)surface->Release();
+        if(texture)texture->Release();
+        surface=nullptr;texture=nullptr;width=height=0;disabled=false;
+    }
+    ~FarLayer(){release();}
+    bool ensure(IDirect3DDevice9* d,UINT w,UINT h) {
+        if(disabled)return false;
+        if(texture&&width==w&&height==h)return true;
+        release();
+        if(FAILED(d->CreateTexture(w,h,1,D3DUSAGE_RENDERTARGET,D3DFMT_A8R8G8B8,D3DPOOL_DEFAULT,&texture,nullptr))||
+           FAILED(texture->GetSurfaceLevel(0,&surface))) {
+            release();disabled=true;return false;
+        }
+        width=w;height=h;return true;
+    }
+    template<class Draw>
+    Result render(IDirect3DDevice9* d,const D3DVIEWPORT9& vp,Draw&& draw,bool& used) {
+        used=false;
+        if(disabled||vp.Width<320||vp.Height<240)return {};
+        D3DCAPS9 caps{};
+        if(FAILED(d->GetDeviceCaps(&caps))||!(caps.PrimitiveMiscCaps&D3DPMISCCAPS_SEPARATEALPHABLEND)||
+           (caps.TextureFilterCaps&(D3DPTFILTERCAPS_MINFLINEAR|D3DPTFILTERCAPS_MAGFLINEAR))!=
+            (D3DPTFILTERCAPS_MINFLINEAR|D3DPTFILTERCAPS_MAGFLINEAR))return {};
+        struct SurfaceRef {IDirect3DSurface9* p{};~SurfaceRef(){if(p)p->Release();}};
+        SurfaceRef rt,depth;
+        if(FAILED(d->GetRenderTarget(0,&rt.p))||FAILED(d->GetDepthStencilSurface(&depth.p)))return {};
+        D3DSURFACE_DESC desc{};
+        if(FAILED(rt.p->GetDesc(&desc))||desc.Format!=D3DFMT_X8R8G8B8||desc.MultiSampleType!=D3DMULTISAMPLE_NONE)return {};
+        for(DWORD i=1;i<caps.NumSimultaneousRTs;++i) {
+            SurfaceRef extra;
+            if(SUCCEEDED(d->GetRenderTarget(i,&extra.p))&&extra.p)return {};
+        }
+        if(!ensure(d,(vp.Width+1)/2,(vp.Height+1)/2))return {};
+        if(!snapshot.capture(d))return {};
+        HRESULT hr=S_OK;
+        const auto check=[&](HRESULT value){if(SUCCEEDED(hr)&&FAILED(value))hr=value;};
+        const auto rs=[&](D3DRENDERSTATETYPE st,DWORD val){if(SUCCEEDED(hr))check(d->SetRenderState(st,val));};
+        const auto ts=[&](DWORD i,D3DTEXTURESTAGESTATETYPE st,DWORD val){if(SUCCEEDED(hr))check(d->SetTextureStageState(i,st,val));};
+        const auto ss=[&](D3DSAMPLERSTATETYPE st,DWORD val){if(SUCCEEDED(hr))check(d->SetSamplerState(0,st,val));};
+        check(d->SetDepthStencilSurface(nullptr));
+        if(SUCCEEDED(hr))check(d->SetRenderTarget(0,surface));
+        const D3DVIEWPORT9 small{0,0,width,height,0,1};
+        if(SUCCEEDED(hr))check(d->SetViewport(&small));
+        if(SUCCEEDED(hr))check(d->Clear(0,nullptr,D3DCLEAR_TARGET,0,1,0));
+        rs(D3DRS_ZENABLE,D3DZB_FALSE);
+        rs(D3DRS_SEPARATEALPHABLENDENABLE,TRUE);
+        rs(D3DRS_SRCBLENDALPHA,D3DBLEND_ONE);
+        rs(D3DRS_DESTBLENDALPHA,D3DBLEND_INVSRCALPHA);
+        rs(D3DRS_BLENDOPALPHA,D3DBLENDOP_ADD);
+        if(SUCCEEDED(hr))check(draw());
+        // Restore surfaces explicitly: D3DSBT_ALL does not capture them.
+        // Even an unsuccessful accumulation must leave the scene intact.
+        const auto restoreRT=d->SetRenderTarget(0,rt.p);
+        const auto restoreDepth=d->SetDepthStencilSurface(depth.p);
+        const auto restoreViewport=d->SetViewport(&vp);
+        if(FAILED(restoreRT)||FAILED(restoreDepth)||FAILED(restoreViewport)) {
+            snapshot.restore();
+            return failed(FAILED(restoreRT)?restoreRT:FAILED(restoreDepth)?restoreDepth:restoreViewport,"far layer surface restoration");
+        }
+        if(FAILED(hr)) {
+            const auto restored=snapshot.restore();disabled=true;
+            const auto vpResult=d->SetViewport(&vp);
+            return !restored?restored:failed(vpResult,"far layer viewport restore");
+        }
+        // Premultiplied alpha over the original colour target. The far
+        // depth test preserves solid world geometry and the original viewport.
+        check(d->SetVertexShader(nullptr));check(d->SetPixelShader(nullptr));
+        check(d->SetFVF(D3DFVF_XYZRHW|D3DFVF_TEX1));
+        check(d->SetTexture(0,texture));
+        rs(D3DRS_ZENABLE,D3DZB_TRUE);rs(D3DRS_ZWRITEENABLE,FALSE);
+        rs(D3DRS_ZFUNC,D3DCMP_LESSEQUAL);rs(D3DRS_FOGENABLE,FALSE);
+        rs(D3DRS_ALPHATESTENABLE,FALSE);rs(D3DRS_SRCBLEND,D3DBLEND_ONE);
+        rs(D3DRS_DESTBLEND,D3DBLEND_INVSRCALPHA);
+        rs(D3DRS_SEPARATEALPHABLENDENABLE,FALSE);
+        rs(D3DRS_COLORWRITEENABLE,D3DCOLORWRITEENABLE_RED|D3DCOLORWRITEENABLE_GREEN|D3DCOLORWRITEENABLE_BLUE);
+        ts(0,D3DTSS_COLOROP,D3DTOP_SELECTARG1);ts(0,D3DTSS_COLORARG1,D3DTA_TEXTURE);
+        ts(0,D3DTSS_ALPHAOP,D3DTOP_SELECTARG1);ts(0,D3DTSS_ALPHAARG1,D3DTA_TEXTURE);
+        ts(1,D3DTSS_COLOROP,D3DTOP_DISABLE);ts(1,D3DTSS_ALPHAOP,D3DTOP_DISABLE);
+        ss(D3DSAMP_ADDRESSU,D3DTADDRESS_CLAMP);ss(D3DSAMP_ADDRESSV,D3DTADDRESS_CLAMP);
+        ss(D3DSAMP_MINFILTER,D3DTEXF_LINEAR);ss(D3DSAMP_MAGFILTER,D3DTEXF_LINEAR);
+        ss(D3DSAMP_MIPFILTER,D3DTEXF_NONE);
+        struct QuadVertex {float x,y,z,rhw,u,v;};
+        const float x=float(vp.X)-.5f,y=float(vp.Y)-.5f,r=x+vp.Width,b=y+vp.Height,z=vp.MaxZ;
+        const QuadVertex quad[]={{x,y,z,1,0,0},{r,y,z,1,1,0},{x,b,z,1,0,1},{r,b,z,1,1,1}};
+        if(SUCCEEDED(hr)) {
+            // Never repeat a potentially partial write into the game target.
+            used=true;
+            check(d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP,2,quad,sizeof(QuadVertex)));
+        }
+        const auto restored=snapshot.restore();
+        if(!restored)return restored;
+        const auto vpResult=d->SetViewport(&vp);
+        if(FAILED(vpResult))return failed(vpResult,"far layer viewport restore");
+        if(FAILED(hr)&&!used){disabled=true;return {};}
+        return failed(hr,"far layer composite");
+    }
+};
 // Dynamic streaming avoids a driver-side UP copy; DISCARD lets the driver
 // rename busy buffers rather than stall the CPU waiting for the previous frame.
 struct GpuStream {
@@ -403,6 +512,8 @@ struct GpuStream {
 };
 struct GpuPasses {
     GpuStream* stream{};
+    FarLayer* farLayer{};
+    bool usedFarLayer{};
     std::array<std::array<float,4>,11> constants{};
     D3DMATRIX scene{},distant{};
     D3DVIEWPORT9 viewport{};
@@ -466,8 +577,20 @@ struct GpuPasses {
             }
             // Reversed IB: a subrange's last (farthest) vertex selects
             // its first index. No primitives are reordered or split.
-            if(FAILED(hr=d->DrawIndexedPrimitive(D3DPT_TRIANGLELIST,0,range.begin,range.count(),
-                UINT((banks::MaxVertices-range.end)/4*6),restrictedCount==count?range.count()/2:triangles)))break;
+            const auto draw=[&]{return d->DrawIndexedPrimitive(D3DPT_TRIANGLELIST,0,range.begin,range.count(),
+                UINT((banks::MaxVertices-range.end)/4*6),restrictedCount==count?range.count()/2:triangles);};
+            if(!pass&&farLayer&&range.count()>=1024) {
+                const auto result=farLayer->render(d,viewport,draw,usedFarLayer);
+                if(!result){hr=result.hr;break;}
+                // render() restores the ordinary scene viewport, including
+                // on recoverable failure. A native fallback must flatten it.
+                viewportChanged=false;
+                if(usedFarLayer)continue;
+                auto vp=viewport;vp.MinZ=vp.MaxZ;
+                if(FAILED(hr=d->SetViewport(&vp)))break;
+                viewportChanged=true;
+            }
+            if(FAILED(hr=draw()))break;
         }
         const auto restore=viewportChanged?d->SetViewport(&viewport):S_OK;
         return FAILED(restore)?failed(restore,"cloud viewport restore"):failed(hr,"hardware cloud draw");

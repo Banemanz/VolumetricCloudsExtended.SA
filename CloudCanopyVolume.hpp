@@ -106,11 +106,19 @@ struct Cell {int x,y;float squared;};
 inline Range volumeRange(const Settings& s,const Range& full,float playerZ,float blend) {
     if(blend>=1.f)return full;
     const float h=canopy::altitude(s);
-    const float climb=smooth((playerZ-s.minSpawnZ*.4f)/std::max(1.f,h*.85f-s.minSpawnZ*.4f));
+    const float climb=smooth((playerZ-s.minSpawnZ*.4f)/std::max(1.f,h*canopy::HandoverRatio-s.minSpawnZ*.4f));
     const float nearestRange=clamp((s.maxSpawnZ-s.minSpawnZ)*1.4f,600.f,900.f);
     const float local=std::min(full.end,mix(nearestRange,1200.f,climb));
     const float end=mix(local,full.end,blend);
     return {end,mix(local*.72f,full.begin,blend),0.f,end,end};
+}
+// Fixed-function approximation to splitting optical depth, rather than
+// splitting alpha linearly. Calibrated near a representative 60%-opaque
+// canopy column; endpoints are exact and there is no per-pixel exponent.
+// This removes a brightness dip at the middle of the overlapping LODs.
+inline float canopyWeight(float volumeWeight) {
+    const float w=1.f-sat(volumeWeight);
+    return w*(1.f+.4f*(1.f-w));
 }
 // One continuous, wind-anchored relief sheet; source triangles are capped
 // by a bounded grid, with invisible cells culled before emitting vertices.
@@ -130,11 +138,11 @@ inline void mesh(Mesh& out,const Relief& relief,const Settings& s,const View& v,
     if(stride>ReliefSize) {
         // Extremely tiny user-selected cloud scale: retain the bounded
         // original radial sheet with the same volume-derived texture.
-        const auto flat=canopy::mesh(s,v,r,drift,blend);
+        const auto flat=canopy::mesh(s,v,r,drift,volume?0.f:blend);
         out.vertices.assign(flat.vertices.begin(),flat.vertices.end());
         out.indices.assign(flat.indices.begin(),flat.indices.end());
         if(volume)for(auto& v:out.vertices)
-            v.alpha*=mix(1.f-banks::rangeWeight(*volume,v.distance),1.f,blend);
+            v.alpha*=canopyWeight(banks::rangeWeight(*volume,v.distance));
         return;
     }
     const float step=unit*stride;
@@ -153,8 +161,7 @@ inline void mesh(Mesh& out,const Relief& relief,const Settings& s,const View& v,
         +(relief.high-relief.low)*.5f*std::abs(planes[p].z);
     const float centerZ=(relief.low+relief.high)*.5f-v.pos.z;
     // During full-volume flight an underlay survives only at large distance.
-    const float inner=blend>=1.f?r.end*.58f:volume?
-        std::min(volume->begin,r.end*.58f):0.f;
+    const float inner=volume?volume->begin:0.f;
     const float inner2=inner*inner;
     const float maxZ=std::max(std::abs(relief.low-v.pos.z),std::abs(relief.high-v.pos.z));
     for(int y=y0;y<iy+span;++y) {
@@ -184,8 +191,9 @@ inline void mesh(Mesh& out,const Relief& relief,const Settings& s,const View& v,
         const Vec p{float(double(v.pos.x)+(x-ex)*step),float(double(v.pos.y)+(y-ey)*step),relief.at(x*stride,y*stride)};
         const float d=length(p-v.pos);
         const float radial=smooth((1.f-d/r.end)/.18f)*distanceAlpha(r,d);
-        const float originalUnderlay=.22f*smooth((d-r.end*.58f)/(r.end*.29f));
-        const float handover=mix(volume?1.f-banks::rangeWeight(*volume,d):1.f,originalUnderlay,blend);
+        // Local volume and canopy share density; the canopy is only the
+        // complement of the actual radial volume fade, not a second global fade.
+        const float handover=volume?canopyWeight(banks::rangeWeight(*volume,d)):1.f;
         const float alpha=smooth(d/fade)*radial*handover;
         index=std::uint16_t(out.vertices.size());
         out.vertices.push_back({p,float(x*stride-uBase)/ReliefSize,float(y*stride-vBase)/ReliefSize,alpha,d});
@@ -193,7 +201,11 @@ inline void mesh(Mesh& out,const Relief& relief,const Settings& s,const View& v,
     };
     for(const auto& c:cells) {
         const auto a=vertex(c.x,c.y),b=vertex(c.x+1,c.y),d=vertex(c.x,c.y+1),e=vertex(c.x+1,c.y+1);
-        out.indices.insert(out.indices.end(),{a,d,b,b,d,e});
+        // Zero vertex alpha remains zero across a whole triangle.
+        if(out.vertices[a].alpha>0.f||out.vertices[d].alpha>0.f||out.vertices[b].alpha>0.f)
+            out.indices.insert(out.indices.end(),{a,d,b});
+        if(out.vertices[b].alpha>0.f||out.vertices[d].alpha>0.f||out.vertices[e].alpha>0.f)
+            out.indices.insert(out.indices.end(),{b,d,e});
     }
 }
 } // namespace vc::canopyVolume

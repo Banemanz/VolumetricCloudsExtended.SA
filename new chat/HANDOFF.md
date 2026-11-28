@@ -1196,3 +1196,90 @@ native D3D9 workload counts/timings are useful independent comparisons,
 not an estimate of actual target frame time. No new screenshots needed
 for a lossless optimization; the native readback compares old/new shader,
 range trimming, exact resident VB use and state restoration.
+
+## Larger formations, 70% handover, overdraw and experimental half-res
+
+Same PR #1, SA 1.0 US, pinned 2025-10-25 SDK, no new external runtime
+dependencies. Current fresh INI: MinSpawnZ=450, MaxSpawnZ=800,
+TargetProcClouds=120, SizeScale=1.5, BillboardStartRatio=.65, FarHalfRes=0.
+Existing INI values are preserved; users must deliberately change the
+settings or use the supplied defaults. The procedural tile grows 2200 ->
+3300m (44.4% as many repeat tiles per equal area), with lower clear/wet
+coverage. No literal object spawn count exists in mode 2. Economy XY
+lattice spacing is capped at 22.5m; vertical and detail lattices retain
+their sampling rules. Atlas begins 5200m, finishes at 6000m; real 8000m
+cloud range remains, and FarBillboards=0 restores full volume.
+
+Altitude handover begins at 442.4m (70% of nominal 632m canopy altitude),
+completes at 632m, smooth both directions. The canopy complement is
+derived from the local volume range, not an independent global opacity
+fade; a cheap optical-depth correction w*(1+.4*(1-w)) reduces the
+crossfade opacity dip for a representative 60%-opaque vertical column.
+Conservative inner cull and exact zero-alpha triangle rejection reduce
+sheet overlay. No unrelated mask, camera recentering or additional pass.
+At very low altitude volume workload is small because the cloud base
+has been lifted. At 535m entry the camera may be inside a bank; the
+synthetic preview is not a controlled GTA appearance test.
+
+GPU Gems chapter 39, 2004 (NVIDIA primary source), Harris/Lastra's 2001
+cloud-rendering paper, and Microsoft D3D9 alpha blend/test documentation
+in README justify the proxy-geometry and low-resolution accumulation
+approaches. In far dominant-axis vertical slices, reuse the same
+8-bit rectangular occupancy query to bound occupied Z cells and
+tighten against their conservative filtered support. No extra lookup,
+draw or vertex count. Pack Z mask into the existing compact sort record.
+Near volume and diagonal blends unchanged. Full trim of both plane
+axes was rejected because the measured raster savings (~2%) didn't
+justify substantially more CPU work. The final vertical-only path has
+small interpolation differences, rather than claiming byte-identical
+rendering. Tests sampled 2905 tightened patches across weather and
+wrapped drift; every removed sample has alpha zero. All 11,796,480
+old occupancy booleans remain exact, plus direct Z-mask bit tests;
+83 fixed-world-ray intersections invariant to yaw/pitch.
+
+Experimental FarHalfRes=1, off by default: D3D9 VS2 distant pass only,
+quarter pixel area, A8R8G8B8 target, no depth buffer bound during
+accumulation, separated alpha blending, final native-resolution
+premultiplied quad at max scene depth, native depth test. Restrict to
+single X8R8G8B8 non-MSAA target with supported separate alpha and
+linear filtering, no alpha-bearing/deferred MRT. Use full-resolution
+fallback if unsupported or offscreen accumulation fails; do not
+repeat a potentially partial composite. Explicit restore of RT/depth/
+viewport in addition to all-state capture; release resources on lost/
+reset. Windows tests assert foreground depth sentinel and RGB
+deviation, and run paired timed workloads. Do not claim target device
+or actual in-game FPS; native CI and actual GTA testing remain required.
+
+Synthetic software raster at 640x360 (actual C++ world geometry/density,
+same camera, no GTA/depth sentinel, counts before alpha rejection):
+- Z535 entry 7,102,367 untrimmed -> 6,968,720 tightened (-1.88%).
+- Z673 flight 8,661,161 -> 8,479,580 (-2.10%).
+  PNG RGB mean delta 0.0004/255 entry, 0 flight (quantized diagnostic).
+- Half-res far volume plus one full-screen composite, compared to
+  tightened full-resolution: entry 6,968,720 -> 4,985,164 (-28.46%),
+  above 5,877,572 -> 3,600,214 (-38.75%), flight 8,479,580 ->
+  6,298,059 (-25.73%). RGB mean differences 0.092, 0.321, 0.0084/255.
+  Above max absolute delta 53, 0.018% pixels >32; not visually identical.
+  Counts don't include GPU driver state/RT-switch cost or actual depth
+  rejection; this is why feature remains opt-in before native timings.
+- New procedural screenshots in docs/previews/potato_*.png; actual
+  synthetic raster, not game captures. The preview supports
+  VC_PREVIEW_SIZE, VC_NO_TRIM, VC_HALF_RES.
+- Native test executable uses 320x240 and compares RGB and restored state
+  with/without experimental layer, plus --benchmark-half 640 480.
+
+Clean CPU source workload after preview tasks finished: taskset core 0,
+three baseline/new/untrimmed sequential runs (GCC -O3 -march=x86-64
+-mtune=sandybridge, 480 poses per altitude; median of each run median).
+Old/new GPU-source preparation in ms: Z30 .0313/.0102; Z317
+.0799/.0377; Z400 .1248/.0495; Z523 .2024/.0811; Z1000
+.1248/.0922. The new full-altitude Z635 case is .1368ms median,
+.2301ms p95, and 73/4059/110 canopy/volume/atlas source triangles.
+Same absolute altitudes are intentional, so timings reflect the new
+height/art/LOD defaults as well as geometry code, not a lossless algorithm
+speedup. Identical new settings without Z tightening were .1325ms
+at Z635 and .0888ms at Z1000; the trim adds about 3–4% source CPU
+cost at those heights in exchange for the measured ~2% raster reduction.
+No comparative claim for actual GPU or full game FPS. All five portable
+native GCC tests passed with -Wall -Wextra -Werror and the legacy
+near/far macros; generated default INI matches checked-in template.

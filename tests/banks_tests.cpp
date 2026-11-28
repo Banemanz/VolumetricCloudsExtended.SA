@@ -118,6 +118,16 @@ int main() {
         }
     }
     std::cout<<"Exact rectangular mask checks: "<<queries<<"\n";
+    for(int x=0;x<16;++x)for(int y=0;y<16;++y)for(int w=1;w<=16;w+=3)for(int h=1;h<=16;h+=3)
+        for(float weather:{0.f,.5f,1.f}) {
+            const banks::Volume::CellBox box{{{{x,x+w},{y,y+h},{0,8}}}};
+            const auto bits=b.rectangleBits(box,weather);
+            for(int z=0;z<8;++z) {
+                auto test=box;test.axis[2]={z,z+1};
+                CHECK(bool(bits&(1u<<z))==prefixOnly.potentiallyOccupied(test,weather));
+            }
+        }
+
     banks::Volume endpoints;
     endpoints.occupied[0][0]=255;
     endpoints.occupied[1][1]=255;
@@ -160,6 +170,14 @@ int main() {
         previousRange=local.end;
     }
     CHECK(previousRange==full.end);
+    CHECK(canopy::HandoverRatio==.70f&&std::abs(canopy::altitude(s)-632.f)<.001f);
+    CHECK(canopy::handover(s,442.4f)<.00001f&&canopy::handover(s,632.f)==1.f);
+    CHECK(canopyVolume::canopyWeight(0.f)==1.f&&canopyVolume::canopyWeight(1.f)==0.f);
+    for(int i=0;i<=100;++i) {
+        const float w=i/100.f,base=.60f;
+        const float ideal=1.f-std::pow(1.f-base,1.f-w);
+        CHECK(std::abs(base*canopyVolume::canopyWeight(w)-ideal)<=std::abs(base*(1.f-w)-ideal)+.00001f);
+    }
     std::cout<<"PASS: canopy shares exact column optical density, fixed periodic relief and continuous player-altitude local volume range\n";
     const View ground{{2266,-1271,30},{1,0,0},{0,0,1},{0,1,0},2200,1};
     const auto r=cloudRange(s);
@@ -206,6 +224,39 @@ int main() {
     banks::buildMesh(culled,s,flight,r,{},.94f,.53f,&b,0);
     CHECK(culled.indices.size()>0 && culled.indices.size()<raw.indices.size());
     const auto count=culled.indices.size()/3,unculled=raw.indices.size()/3;
+    // Test actual tightened geometry against untrimmed patches, including
+    // clear/mixed/wet endpoints and translated periodic texture seams.
+    std::size_t tightened=0;
+    for(float weather:{0.f,.5f,1.f})for(float offset:{0.f,1300.f,-4500.f}) {
+        auto v=flight;v.pos.x+=offset;v.pos.z=canopy::altitude(s);
+        banks::Mesh a,bounds;canopy::Drift drift;
+        drift.update(s,{.7f,-.3f,0},2.4f);
+        banks::buildMesh(a,s,v,r,drift,.94f,.53f,&b,weather,true,false);
+        banks::buildMesh(bounds,s,v,r,drift,.94f,.53f,&b,weather,true,true);
+        CHECK(a.vertices.size()==bounds.vertices.size());
+        for(std::size_t q=0;q<a.vertices.size();q+=4) {
+            const auto lo=a.vertices[q].pos,hi=a.vertices[q+3].pos;
+            const auto nlo=bounds.vertices[q].pos,nhi=bounds.vertices[q+3].pos;
+            if(lo.z==nlo.z&&hi.z==nhi.z)continue;
+            ++tightened;CHECK(nlo.z>=lo.z&&nhi.z<=hi.z&&nlo.z<nhi.z);
+            CHECK(lo.x==nlo.x&&lo.y==nlo.y&&hi.x==nhi.x&&hi.y==nhi.y);
+            const auto tex=banks::textureOrigin(s,v,drift);
+            for(int t=0;t<17;++t)for(int j=0;j<17;++j) {
+                const float f=t/16.f,g=j/16.f;
+                const auto test=[&](float z){
+                    const float x=mix(lo.x,hi.x,f),y=mix(lo.y,hi.y,f);
+                    const float u=x/tex.tile-tex.u,vv=y/tex.tile-tex.v,h=(z-s.minSpawnZ)/tex.band;
+                    if(weather<.999f)CHECK(b.sample(0,u,vv,h).a==0);
+                    if(weather>.001f)CHECK(b.sample(1,u,vv,h).a==0);
+                };
+                if(nlo.z>lo.z+.01f)test(mix(lo.z,nlo.z,g));
+                if(nhi.z<hi.z-.01f)test(mix(nhi.z,hi.z,g));
+            }
+        }
+    }
+    CHECK(tightened>0);
+    std::cout<<"Verified "<<tightened<<" tightened rectangles remove only zero-alpha texel support\n";
+
 
     // Actual same-world-ray sampling comparison, not just phase or normal.
     // Intersect triangle(s) in a fixed world direction across camera turns;
@@ -230,7 +281,7 @@ int main() {
         std::sort(hits.begin(),hits.end(),[](const auto& a,const auto& b){return a[0]>b[0];});
         return hits;
     };
-    auto pose=ground;pose.pos={2164,-1265,490.f};
+    auto pose=ground;pose.pos={2164,-1265,canopy::altitude(s)};
     pose.forward=unit(Vec{.96f,-.27f,-.04f});pose.right=unit(cross(pose.forward,{0,0,1}));pose.up=cross(pose.right,pose.forward);
     const auto ray=unit(pose.forward+pose.right*.024f+pose.up*.023f);
     canopy::Drift wind;wind.update(s,{1.2f,-.8f,0},2.7f);
@@ -273,7 +324,7 @@ int main() {
             const auto shifted=raySamples(culled,moving,line);
             int common=0;
             for(const auto& sample:fixed) {
-                if(sample[0]<1700.f||sample[0]>2800.f||sample[4]<.02f)continue;
+                if(sample[0]<1700.f||sample[0]>2800.f||sample[4]<.02f||sample[5]==0.f)continue;
                 const auto found=std::find_if(shifted.begin(),shifted.end(),[&](const auto& v) {
                     return std::abs(v[0]+advance-sample[0])<.02f;
                 });
@@ -343,7 +394,7 @@ int main() {
         banks::buildMesh(culled,s,flight,rr,{},.94f,.53f,&b,0);
         const auto d=farthest(culled);
         CHECK(d>previous && d>lod.end*.85f && d<=lod.end+.01f);
-        CHECK(lod.start>=std::min(range,5000.f) && lod.start>=range*.8f-.01f);
+        CHECK(lod.start>=std::min(range,5000.f) && lod.start>=range*s.billboardStartRatio-.01f);
         CHECK(culled.vertices.size()<44000);
         previous=d;std::cout<<"Range "<<range<<": volume reaches "<<d<<", "<<culled.indices.size()/3<<" triangles\n";
     }
@@ -351,8 +402,8 @@ int main() {
     banks::buildMesh(culled,s,flight,cloudRange(s),{},.94f,.53f,&b,0);
     CHECK(farthest(culled)>11000);
     s.farBillboards=true;s.cloudDrawDistance=8000;
-    const auto lod=banks::lod(s,cloudRange(s));CHECK(lod.start==6400.f&&lod.end==7200.f);
-    for(float d:{6400.f,6500.f,6800.f,7100.f,7200.f})CHECK(std::abs(lod.volume(d)+lod.billboard(d)-1.f)<.0001f);
+    const auto lod=banks::lod(s,cloudRange(s));CHECK(lod.start==5200.f&&lod.end==6000.f);
+    for(float d:{5200.f,5300.f,5600.f,5900.f,6000.f})CHECK(std::abs(lod.volume(d)+lod.billboard(d)-1.f)<.0001f);
     for(float x=.25f;x<=.75f;x+=.01f)CHECK(std::abs(billboards::window(x)+billboards::window(1.f-x)-1.f)<.0001f);
     billboards::Atlas atlas;atlas.build(s,b);
     CHECK(atlas.pixels[0].size()==512*512 && atlas.pixels[1].size()==512*512);

@@ -35,14 +35,15 @@ inline Vec unit(Vec a) { const float d = length(a); return d > 1e-5f ? a/d : Vec
 inline bool finite(Vec a) { return std::isfinite(a.x) && std::isfinite(a.y) && std::isfinite(a.z); }
 
 struct Settings {
-    int targetProcClouds = 160;
+    int targetProcClouds = 120;
     float badWeatherDensityMultiplier = 1.4f;
-    float minSpawnZ = 200.f, maxSpawnZ = 650.f;
+    float minSpawnZ = 450.f, maxSpawnZ = 800.f;
     float spawnRadiusMin = 300.f, spawnRadiusMax = 2200.f;
     float renderMaxDist = 2200.f, respawnMaxDist = 2800.f; // legacy cards only
     float cloudDrawDistance = 8000.f, cloudFogStart = 1600.f, cloudFogEnd = 8000.f; // mode 2 independent atmosphere
+    bool farHalfRes = false; // experimental distant-only premultiplied half-resolution pass
     bool farBillboards = true; // distant volume-projected impostors
-    float billboardStartDistance = 5000.f, billboardStartRatio = .80f;
+    float billboardStartDistance = 5000.f, billboardStartRatio = .65f;
     float windMoveScale = .9f, minSpacing2D = 45.f, spawnFadeInSpeed = .02f;
     float quadFacingMin = .2f, farClipFadeRange = 450.f, farClipFadeMargin = 80.f;
     float timecycFarClipScale = 1.8f;
@@ -58,7 +59,7 @@ struct Settings {
     float cumulusNightLight = 1.f;
     float interiorHaze = .85f; // near-cloud density visibility in mode 2
     int cumulusDetail = 0; // 0: economy, 1: higher texture detail
-    float sizeScale = 1.f, opacity = 1.f, nearFadeDistance = 25.f;
+    float sizeScale = 1.5f, opacity = 1.f, nearFadeDistance = 25.f;
     float bottomShade = 1.f, hazeStrength = 0.f;
     bool useGameFog = false;
     int seed = 17321;
@@ -105,7 +106,7 @@ inline bool boolean(const std::string& s, bool& v) {
     X(PuffsPerCloud,puffsPerCloud,1,MaxPuffs) X(Seed,seed,1,16777215)
 #define VC_BOOLS(X) X(UseTimecycTint,useTimecycTint) X(UseAdditionalTextures,useAdditionalTextures) \
     X(IncludeOriginalTextureInRandom,includeOriginalTextureInRandom) X(UseGameFog,useGameFog) \
-    X(HybridClouds,hybridClouds) X(FarBillboards,farBillboards)
+    X(HybridClouds,hybridClouds) X(FarBillboards,farBillboards) X(FarHalfRes,farHalfRes)
 
 inline void load(std::istream& in, Settings& c) {
     std::string line;
@@ -156,14 +157,15 @@ inline void write(std::ostream& out, const Settings& c) {
 #define FIELD(name,member,comment) out << "; " comment "\n" #name "=" << c.member << "\n";
     out << "[Renderer]\n";
     FIELD(RenderMode,renderMode,"2 = 3D cloud banks (recommended), 1 = clustered classic clouds, 0 = classic crossed clouds.")
-    FIELD(HybridClouds,hybridClouds,"Mode 2: 1 = nearby 3D clouds + distant canopy; full 3D distance expands above 85% of canopy height. 0 = canopy only.")
+    FIELD(HybridClouds,hybridClouds,"Mode 2: 1 = nearby 3D clouds + distant canopy; full 3D distance expands above 70% of canopy height. 0 = canopy only.")
+    FIELD(FarHalfRes,farHalfRes,"Experimental: half-resolution distant volume beyond scene far clip (economy mode, compatible targets only).")
     FIELD(CumulusDetail,cumulusDetail,"Mode 2: 0 = economy (recommended); 1 = finer textures and more samples.")
     out << "\n[Clouds]\n";
     FIELD(TargetProcClouds,targetProcClouds,"How much of the sky is covered (0-512; 0 disables all custom clouds). Classic modes use this as the group count.")
     FIELD(BadWeatherDensityMultiplier,badWeatherDensityMultiplier,"How much more cloud cover appears in bad weather (1 = unchanged; 0 = none).")
     FIELD(MinSpawnZ,minSpawnZ,"Bottom of the cloud layer above sea level.")
     FIELD(MaxSpawnZ,maxSpawnZ,"Top of the cloud layer above sea level. Must be higher than the bottom.")
-    FIELD(SizeScale,sizeScale,"Size of cloud formations (1 = normal, 2 = twice as wide).")
+    FIELD(SizeScale,sizeScale,"Horizontal pattern scale (1 = original, 1.5 = broader, fewer formations).")
     FIELD(WindMoveScale,windMoveScale,"How fast clouds drift with the game's wind (0 = stationary).")
     FIELD(Opacity,opacity,"Overall cloud thickness (0 = invisible, 1 = normal, 2 = thicker).")
     FIELD(Seed,seed,"Change this number for a different repeatable cloud pattern.")
@@ -171,7 +173,7 @@ inline void write(std::ostream& out, const Settings& c) {
     FIELD(CloudDrawDistance,cloudDrawDistance,"Mode 2: visibility of 3D clouds and distant layers, independent of the world.")
     FIELD(FarBillboards,farBillboards,"Mode 2: replace very distant 3D clouds with baked cloud images (1 = recommended; 0 = full volume).")
     FIELD(BillboardStartDistance,billboardStartDistance,"Minimum distance before the far billboard transition may start (at least 5000).")
-    FIELD(BillboardStartRatio,billboardStartRatio,"Also start no sooner than this fraction of CloudDrawDistance (0.8 = 80%).")
+    FIELD(BillboardStartRatio,billboardStartRatio,"Also start no sooner than this fraction of CloudDrawDistance (0.65 = 65%).")
     FIELD(CloudFogStart,cloudFogStart,"Mode 2: distance where clouds begin to blend into the sky.")
     FIELD(CloudFogEnd,cloudFogEnd,"Mode 2: distance where cloud colour fully blends into the sky. Set equal to CloudFogStart to disable colour fog.")
     FIELD(CumulusContrast,cumulusContrast,"Mode 2: cloud shading strength (0 = flat, 1 = stronger shadows).")

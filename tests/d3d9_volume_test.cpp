@@ -298,7 +298,7 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
         if(!result)return fail(result.operation,result.hr);
     }
     auto undersideOpts=canopyOpts;undersideOpts.dual=opts.dual;
-    for(float height:{30.f,317.f,400.f}) {
+    for(float height:{30.f,443.f,535.f}) {
         const Vec pos{2239,-1262,height},f=unit(Vec{.55f,.7f,.4f}),rt=unit(cross(f,{0,0,1})),u=cross(rt,f);
         const View cam{pos,rt,u,f,450,1};
         auto view=d3d9::identity();
@@ -471,6 +471,31 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
                 trimmed.stream=&referenceHw;
                 if(!renderHardware(trimmed)||!exact("Simplified lattice shader",full))return fail("VS2 parity simplification changed RGB");
                 trimmed.stream=&hw;
+                if(sceneDistance==450.f) {
+                    d3d9::FarLayer half;
+                    trimmed.farLayer=&half;
+                    if(!renderHardware(trimmed))return fail("Half-resolution distant draw");
+                    if(trimmed.usedFarLayer) {
+                        std::vector<DWORD> reduced;if(!capture(reduced))return fail("Half-resolution readback");
+                        std::uint64_t total=0;unsigned large=0;
+                        for(UINT y=0;y<desc.Height;++y)for(UINT x=0;x<desc.Width;++x) {
+                            const auto i=std::size_t(y)*desc.Width+x;
+                            if(x<desc.Width/4&&y<desc.Height/4&&(reduced[i]&0xFFFFFFu)!=(full[i]&0xFFFFFFu))
+                                return fail("Half-resolution clouds leaked past foreground depth");
+                            unsigned maximum=0;
+                            for(int shift:{0,8,16}) {
+                                const auto diff=unsigned(std::abs(int((reduced[i]>>shift)&255)-int((full[i]>>shift)&255)));
+                                total+=diff;maximum=std::max(maximum,diff);
+                            }
+                            large+=maximum>32;
+                        }
+                        const double mean=double(total)/(3*reduced.size());
+                        std::printf("Half-resolution distant layer: mean RGB delta %.3f/255; %u pixels >32; native depth sentinel preserved\n",mean,large);
+                        if(mean>10.||large>reduced.size()/8)return fail("Half-resolution distant visual deviation");
+                    } else std::puts("Half-resolution layer unavailable on this device/format; native fallback exercised.");
+                    trimmed.farLayer=nullptr;
+                    if(!renderHardware(trimmed)||!exact("Far layer restoration",full))return fail("Far-layer state/target restoration");
+                }
                 // Reuse a resident VB only for an exactly equal source mesh.
                 // Exercise both the first DISCARD and the no-lock path.
                 auto temp=gm;bool reused=false;
@@ -489,7 +514,7 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
     }
     // Test the actual distant atlas + projected card pipeline on the pure
     // device, with far fog and weather blending. Only geometry beyond the
-    // 6400m LOD start is submitted; scene far clip remains 450m.
+    // 5200m LOD start is submitted; scene far clip remains 450m.
     billboards::Atlas atlas;atlas.build(settings,volume);
     std::array<Com<IDirect3DTexture9>,2> farTextures;
     for(int layer=0;layer<2;++layer) {
@@ -611,8 +636,9 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
 }
 }
 int main(int argc,char** argv) {
-    const bool bench=argc==4&&std::strcmp(argv[1],"--benchmark")==0;
-    const UINT width=bench?UINT(std::atoi(argv[2])):128u,height=bench?UINT(std::atoi(argv[3])):128u;
+    const bool halfBench=argc==4&&std::strcmp(argv[1],"--benchmark-half")==0;
+    const bool bench=halfBench||(argc==4&&std::strcmp(argv[1],"--benchmark")==0);
+    const UINT width=bench?UINT(std::atoi(argv[2])):320u,height=bench?UINT(std::atoi(argv[3])):240u;
     if(!width||!height||width>1920||height>1080)return 1;
     const HWND window=CreateWindowExA(0,"STATIC","D3D9 volume test",WS_OVERLAPPEDWINDOW,
         0,0,128,128,nullptr,nullptr,GetModuleHandleA(nullptr),nullptr);
@@ -643,7 +669,7 @@ int main(int argc,char** argv) {
             }
             D3DCAPS9 actual{};
             if(FAILED(device->GetDeviceCaps(&actual)))return fail("GetDeviceCaps");
-            const int result=bench?synthetic::benchmark(device.p,actual):run(device.p,actual);
+            const int result=bench?synthetic::benchmark(device.p,actual,halfBench):run(device.p,actual);
             if(result==77)continue;
             if(result!=0)return result;
             any=true;pure|=(flags&D3DCREATE_PUREDEVICE)!=0;
