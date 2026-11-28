@@ -363,7 +363,8 @@ struct FarLayer {
         if(FAILED(rt.p->GetDesc(&desc))||desc.Format!=D3DFMT_X8R8G8B8||desc.MultiSampleType!=D3DMULTISAMPLE_NONE)return {};
         for(DWORD i=1;i<caps.NumSimultaneousRTs;++i) {
             SurfaceRef extra;
-            if(SUCCEEDED(d->GetRenderTarget(i,&extra.p))&&extra.p)return {};
+            const auto result=d->GetRenderTarget(i,&extra.p);
+            if((SUCCEEDED(result)&&extra.p)||(FAILED(result)&&result!=D3DERR_NOTFOUND))return {};
         }
         if(!ensure(d,(vp.Width+1)/2,(vp.Height+1)/2))return {};
         if(!snapshot.capture(d))return {};
@@ -374,8 +375,8 @@ struct FarLayer {
         const auto ss=[&](D3DSAMPLERSTATETYPE st,DWORD val){if(SUCCEEDED(hr))check(d->SetSamplerState(0,st,val));};
         check(d->SetDepthStencilSurface(nullptr));
         if(SUCCEEDED(hr))check(d->SetRenderTarget(0,surface));
-        const D3DVIEWPORT9 small{0,0,width,height,0,1};
-        if(SUCCEEDED(hr))check(d->SetViewport(&small));
+        const D3DVIEWPORT9 reducedViewport{0,0,width,height,0,1};
+        if(SUCCEEDED(hr))check(d->SetViewport(&reducedViewport));
         if(SUCCEEDED(hr))check(d->Clear(0,nullptr,D3DCLEAR_TARGET,0,1,0));
         rs(D3DRS_ZENABLE,D3DZB_FALSE);
         rs(D3DRS_SEPARATEALPHABLENDENABLE,TRUE);
