@@ -29,10 +29,46 @@ inline std::uint32_t latticeCode(int axis,int i) {
     const std::uint32_t parity=i%4==0?255u:i%2==0?128u:0u;
     return (parity<<24)|(255u<<((2-axis)*8));
 }
+// Each contiguous source span belongs to one world brick. Bounds enclose
+// every vertex in the span, even if some patches are omitted by occupancy.
+struct VertexSpan {Vec lo,hi;std::uint32_t begin,end;};
+struct VertexRange {
+    std::uint32_t begin{},end{};
+    std::uint32_t count() const{return end-begin;}
+};
+struct ClipPlane {
+    // A positive homogeneous clip distance is visible; error includes
+    // absolute terms of the original shader dot products, not just their
+    // potentially cancelling difference.
+    std::array<double,4> coefficient,absolute;
+    bool mayIntersect(const VertexSpan& span) const {
+        double maximum=coefficient[3],magnitude=absolute[3];
+        const float lo[]={span.lo.x,span.lo.y,span.lo.z},hi[]={span.hi.x,span.hi.y,span.hi.z};
+        for(int i=0;i<3;++i) {
+            maximum+=coefficient[i]*(coefficient[i]>=0?hi[i]:lo[i]);
+            magnitude+=absolute[i]*std::max(std::abs(lo[i]),std::abs(hi[i]));
+        }
+        // Leave ambiguous/boundary spans to hardware clipping. Cost of a
+        // false positive is extra vertices; false negatives are unacceptable.
+        return !std::isfinite(maximum)||!std::isfinite(magnitude)||maximum>=-(.001+1.e-5*magnitude);
+    }
+};
 struct GpuMesh {
     std::vector<GpuVertex> vertices;
+    std::vector<VertexSpan> spans;
     int slices{};
     std::size_t triangleCount() const{return std::size_t(slices)*2;}
+    VertexRange rangeFor(const ClipPlane& plane) const {
+        const auto count=std::uint32_t(vertices.size());
+        if(spans.empty()||spans.front().begin!=0||spans.back().end!=count)return {0,count};
+        // One contiguous range per pass, no draw-call multiplication or
+        // reordering. Interior irrelevant spans remain harmlessly clipped.
+        auto first=spans.begin(),last=spans.end();
+        while(first!=last&&!plane.mayIntersect(*first))++first;
+        if(first==last)return {};
+        do{--last;}while(last!=first&&!plane.mayIntersect(*last));
+        return {first->begin,last->end};
+    }
 };
 inline int verticalSteps(const Settings& s) {
     const float base=s.cumulusDetail?16.f:20.f;
@@ -200,26 +236,30 @@ struct Volume {
             }
         }
     }
-    bool potentiallyOccupied(float u0,float v0,float w0,float u1,float v1,float w1,float weather) const {
-        if(w1<0.f||w0>1.f)return false;
-        int xa=int(std::floor(u0*OccupancyXY)),xb=int(std::floor(u1*OccupancyXY));
-        int ya=int(std::floor(v0*OccupancyXY)),yb=int(std::floor(v1*OccupancyXY));
-        const int za=std::clamp(int(std::floor(w0*OccupancyZ)),0,OccupancyZ-1),
-                  zb=std::clamp(int(std::floor(w1*OccupancyZ)),0,OccupancyZ-1);
-        // More than a full period only needs one period. Use the doubled
-        // prefix to avoid splitting a query across a periodic boundary.
-        const auto wrapRange=[](int& a,int& b) {
-            const int n=std::min(b-a+1,OccupancyXY);
-            a=canopy::wrap(a,OccupancyXY);b=a+n;
-        };
-        wrapRange(xa,xb);wrapRange(ya,yb);
+    struct CellRange {int first,last;}; // half-open, wrapped XY / clamped Z
+    struct CellBox {std::array<CellRange,3> axis;};
+    static CellRange cells(float lo,float hi,int axis) {
+        const int n=axis==2?OccupancyZ:OccupancyXY;
+        int a=int(std::floor(lo*n)),b=int(std::floor(hi*n));
+        if(axis==2)return {std::clamp(a,0,n-1),std::clamp(b,0,n-1)+1};
+        const int count=std::min(b-a+1,n);
+        a=canopy::wrap(a,n);return {a,a+count};
+    }
+    bool potentiallyOccupied(const CellBox& box,float weather) const {
+        const auto [xa,xb]=box.axis[0];
+        const auto [ya,yb]=box.axis[1];
+        const auto [za,zb]=box.axis[2];
         const auto count=[&](int layer) {
             const auto& p=occupiedPrefix[layer];
             const auto at=[&](int x,int y,int z){return int(p[prefixIndex(x,y,z)]);};
             const auto area=[&](int z){return at(xb,yb,z)-at(xa,yb,z)-at(xb,ya,z)+at(xa,ya,z);};
-            return area(zb+1)-area(za);
+            return area(zb)-area(za);
         };
         return (weather<.999f&&count(0)>0)||(weather>.001f&&count(1)>0);
+    }
+    bool potentiallyOccupied(float u0,float v0,float w0,float u1,float v1,float w1,float weather) const {
+        if(w1<0.f||w0>1.f)return false;
+        return potentiallyOccupied({{cells(u0,u1,0),cells(v0,v1,1),cells(w0,w1,2)}},weather);
     }
     canopy::Pixel sample(int layer,float u,float v,float w) const {
         if(!width||pixels[layer].empty())return {};
@@ -303,7 +343,7 @@ inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range
                       float weather=0.f,bool billboardAvailable=true) {
     using OutputVertex=typename decltype(m.vertices)::value_type;
     constexpr bool gpu=std::is_same_v<OutputVertex,GpuVertex>;
-    m.vertices.clear();if constexpr(!gpu)m.indices.clear();m.slices=0;
+    m.vertices.clear();if constexpr(gpu)m.spans.clear();else m.indices.clear();m.slices=0;
     const float band=s.maxSpawnZ-s.minSpawnZ;
     if(!s.hybridClouds||!s.targetProcClouds||r.end<5.f||band<1.f||
        !std::isfinite(wx)||!std::isfinite(wy)||wx<=0||wy<=0||wx>10.f||wy>10.f)return;
@@ -340,8 +380,8 @@ inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range
     // Split only nearby bricks: identical planes and lattice phase on both
     // sides of subdivision. The smaller patches resolve angular weighting
     // and fog accurately where they subtend a large screen area.
-    const auto collect=[&](auto&& self,Brick b)->void {
-        if(b.nearest>=levels.end*levels.end||!inView(b)||!occupied(b.lo,b.hi))return;
+    const auto collect=[&](auto&& self,Brick b,bool pretested)->void {
+        if((!pretested&&(b.nearest>=levels.end*levels.end||!inView(b)))||!occupied(b.lo,b.hi))return;
         const int n=std::max({b.last[0]-b.first[0],b.last[1]-b.first[1],b.last[2]-b.first[2]});
         const int axes=int(axisPossible(b,view.pos,0))+int(axisPossible(b,view.pos,1))+int(axisPossible(b,view.pos,2));
         // Diagonal views need finer patches so alpha interpolation doesn't
@@ -361,7 +401,7 @@ inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range
             // preserves ordering for shared rays through unequal-sized cells.
             for(int j=1;j<count;++j)for(int k=j;k>0&&closer(children[k],children[k-1]);--k)
                 std::swap(children[k],children[k-1]);
-            for(int j=0;j<count;++j)self(self,children[j]);
+            for(int j=0;j<count;++j)self(self,children[j],false);
         } else bricks.push_back(b);
     };
     const int x0=int(std::floor((view.pos.x-levels.end)/brickSize)),x1=int(std::floor((view.pos.x+levels.end)/brickSize));
@@ -374,17 +414,24 @@ inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range
     // Sorting siblings recursively keeps whole spatial cells in order.
     // Only intersecting planes inside the diagonal crossfade are approximate.
     std::sort(parents.begin(),parents.end(),closer);
-    for(const auto& b:parents)collect(collect,b);
-    // Record only bounds and lattice metadata. Do not construct/copy
-    // four output vertices for rejected patches or during sorting.
-    struct Patch {Vec lo,hi;float depth;int axis,plane,order;};
-    static thread_local std::vector<Patch> patches;
-    static thread_local std::vector<std::size_t> order;
-    if(patches.capacity()<96)patches.reserve(96);
-    if(order.capacity()<96)order.reserve(96);
+    for(const auto& b:parents)collect(collect,b,true);
+    // A patch's rectangle is entirely defined by its parent brick, axis
+    // and plane position. Sort compact keys directly; no pointer chasing.
+    struct Patch {float depth,position;int axis,plane;};
+    std::array<Patch,3*BrickSteps> patches;
     for(const auto& b:bricks) {
-        patches.clear();order.clear();
+        std::size_t patchCount=0;
+        const auto spanStart=std::uint32_t(m.vertices.size());
         const int stride=b.nearest>=1300.f*1300.f?4:b.nearest>=440.f*440.f?2:1;
+        // Two axes of the occupancy box are constant across every slice.
+        // Compute them once, respecting the same division and floor as the
+        // original query; only the sliced axis changes inside the loop.
+        const auto uvCoord=[&](float p,int a){
+            return a==0?p/tile-uOffset:a==1?p/tile-vOffset:(p-origin.z)/band;
+        };
+        Volume::CellBox box{};
+        if(volume)for(int a=0;a<3;++a)
+            box.axis[a]=Volume::cells(uvCoord(component(b.lo,a),a),uvCoord(component(b.hi,a),a),a);
         for(int a=0;a<3;++a) {
             if(!axisPossible(b,view.pos,a))continue;
             const int j=(a+1)%3,k=(a+2)%3;
@@ -395,7 +442,13 @@ inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range
                 Vec lo=b.lo,hi=b.hi;
                 const float plane=component(origin,a)+(i+.5f)*component(step,a);
                 setComponent(lo,a,plane);setComponent(hi,a,plane);
-                if(!occupied(lo,hi))continue;
+                if(volume) {
+                    auto query=box;
+                    const float uv=uvCoord(plane,a);
+                    if(a==2&&(uv<0.f||uv>1.f))continue;
+                    query.axis[a]=Volume::cells(uv,uv,a);
+                    if(!volume->potentiallyOccupied(query,weather))continue;
+                }
                 bool any=false;
                 const float limit=(i%4==0?levels.end:i%2==0?std::min(levels.end,1300.f):std::min(levels.end,440.f))+.01f;
                 const float limitSq=limit*limit;
@@ -414,24 +467,24 @@ inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range
                 }
                 if(any) {
                     const auto center=(lo+hi)*.5f-view.pos;
-                    order.push_back(patches.size());
-                    patches.push_back({lo,hi,dot(center,center),a,i,int(patches.size())});
+                    patches[patchCount++]={dot(center,center),plane,a,i};
                 }
             }
         }
-        std::sort(order.begin(),order.end(),[&](std::size_t i,std::size_t j){
-            const auto& a=patches[i];const auto& b=patches[j];return a.depth!=b.depth?a.depth<b.depth:a.order<b.order;
+        std::sort(patches.begin(),patches.begin()+patchCount,[](const Patch& a,const Patch& b){
+            return a.depth!=b.depth?a.depth<b.depth:a.axis!=b.axis?a.axis<b.axis:a.plane<b.plane;
         });
-        for(const auto index:order) {
+        for(std::size_t index=0;index<patchCount;++index) {
             const auto& patch=patches[index];
             if(m.vertices.size()+4>MaxVertices)break;
             const auto offset=std::uint16_t(m.vertices.size());
             const int a=patch.axis,j=(a+1)%3,k=(a+2)%3,i=patch.plane;
             const auto code=latticeCode(a,i);
+            Vec lower=b.lo,upper=b.hi;setComponent(lower,a,patch.position);setComponent(upper,a,patch.position);
             for(int q=0;q<4;++q) {
-                Vec p=patch.lo;
-                if(q&1)setComponent(p,j,component(patch.hi,j));
-                if(q&2)setComponent(p,k,component(patch.hi,k));
+                Vec p=lower;
+                if(q&1)setComponent(p,j,component(upper,j));
+                if(q&2)setComponent(p,k,component(upper,k));
                 if constexpr(gpu) {
                     m.vertices.push_back({p,code});
                 } else {
@@ -450,6 +503,8 @@ inline void buildMesh(MeshType& m,const Settings& s,const View& view,const Range
                 std::uint16_t(offset+1),std::uint16_t(offset+3),std::uint16_t(offset+2)});
             ++m.slices;
         }
+        if constexpr(gpu)if(m.vertices.size()>spanStart)
+            m.spans.push_back({b.lo,b.hi,spanStart,std::uint32_t(m.vertices.size())});
         if(m.vertices.size()+4>MaxVertices)break;
     }
     if constexpr(!gpu)std::reverse(m.indices.begin(),m.indices.end()); // far first, culling disabled

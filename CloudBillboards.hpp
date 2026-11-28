@@ -77,17 +77,25 @@ inline void buildMesh(banks::Mesh& mesh,const Settings& s,const View& view,const
     // worse than leaving the volume active. Caller checks eligibility.
     const int span=int(std::ceil((r.end+extent)/cell));
     if(span>80)return;
-    std::vector<Card> cards;cards.reserve(256);
+    static thread_local std::vector<Card> cards;
+    cards.clear();if(cards.capacity()<256)cards.reserve(256);
+    const float wxExtent=extent*std::sqrt(1+wx*wx),wyExtent=extent*std::sqrt(1+wy*wy);
+    // Reject the strictly zero-fade regions before a square root.
+    // Keep a world-unit guard around each endpoint for rounding.
+    const float inner=std::max(0.f,levels.start-1.f),outer=r.end+1.f;
+    const float inner2=inner*inner,outer2=outer*outer;
     for(int y=iy-span;y<=iy+span;++y)for(int x=ix-span;x<=ix+span;++x) {
         const Vec delta{float((x+.5-ex)*cell),float((y+.5-ey)*cell),base-view.pos.z};
-        const float d=length(delta);
+        const float squared=dot(delta,delta);
+        if(squared<inner2||squared>outer2)continue;
+        const float d=std::sqrt(squared);
         // The center controls the smooth optical LOD, no arbitrary per-frame
         // recycling. Conservative sphere/frustum reject, independent of yaw.
         const float fade=levels.billboard(d)*banks::rangeWeight(r,d);
         if(fade<=1.f/255.f)continue;
         const float forward=dot(delta,view.forward);
-        if(forward+extent<=0||std::abs(dot(delta,view.right))>wx*forward+extent*std::sqrt(1+wx*wx)||
-            std::abs(dot(delta,view.up))>wy*forward+extent*std::sqrt(1+wy*wy))continue;
+        if(forward+extent<=0||std::abs(dot(delta,view.right))>wx*forward+wxExtent||
+            std::abs(dot(delta,view.up))>wy*forward+wyExtent)continue;
         const Vec radial=unit(Vec{delta.x,delta.y,0});
         if(horizontalSq(radial)<.5f)continue;
         float angle=std::atan2(radial.y,radial.x)*Directions/(2.f*Pi);

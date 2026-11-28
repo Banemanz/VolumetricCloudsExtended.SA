@@ -6,6 +6,7 @@
 #endif
 #include <d3d9.h>
 #include <cstring>
+#include <bitset>
 #include "CloudBanks.hpp"
 #ifdef VC_GPU_VERTEX
 #include "CloudBankVS.hpp"
@@ -365,6 +366,8 @@ struct GpuPasses {
     std::array<std::array<float,4>,11> constants{};
     D3DMATRIX scene{},distant{};
     D3DVIEWPORT9 viewport{};
+    std::array<banks::VertexRange,2> ranges{};
+    UINT restrictedCount=0;
     // Hardware clips both sides of the old far plane with complementary
     // projections. The distant pass flattens only viewport depth; XY and W
     // remain identical, so clouds never move and near scene geometry wins.
@@ -375,7 +378,7 @@ struct GpuPasses {
            projection._33<=1.f||projection._43>=0.f||std::abs(projection._13)>.0001f||std::abs(projection._23)>.0001f)return false;
         const float farClip=projection._43/(1.f-projection._33);
         if(!std::isfinite(farClip)||farClip<=0.f)return false;
-        scene=transform;distant=transform;viewport=vp;
+        scene=transform;distant=transform;viewport=vp;restrictedCount=0;
         const float extended=std::max(farClip+100.f,2.f*r.end+farClip);
         const float a=extended/(extended-farClip),b=-a*farClip;
         distant._13=a*scene._14;distant._23=a*scene._24;distant._33=a*scene._34;distant._43=a*scene._44+b;
@@ -390,38 +393,82 @@ struct GpuPasses {
         const auto step=banks::latticeSpacing(s);constants[10]={step.x,step.y,step.z,0.f};
         return true;
     }
+    void restrictTo(const banks::GpuMesh& mesh) {
+        banks::ClipPlane distantPlane{},scenePlane{};
+        for(int i=0;i<4;++i) {
+            const double z=scene.m[i][2],w=scene.m[i][3],dz=distant.m[i][2];
+            distantPlane.coefficient[i]=dz;distantPlane.absolute[i]=std::abs(dz);
+            scenePlane.coefficient[i]=w-z;scenePlane.absolute[i]=std::abs(w)+std::abs(z);
+        }
+        ranges={mesh.rangeFor(distantPlane),mesh.rangeFor(scenePlane)};
+        restrictedCount=UINT(mesh.vertices.size());
+    }
     Result draw(IDirect3DDevice9* d,UINT count,UINT triangles) {
         HRESULT hr;
         if(FAILED(hr=d->SetStreamSource(0,stream->vb,0,sizeof(banks::GpuVertex))))return failed(hr,"cloud stream");
         if(FAILED(hr=d->SetStreamSourceFreq(0,1)))return failed(hr,"cloud stream frequency");
         if(FAILED(hr=d->SetIndices(stream->ib)))return failed(hr,"cloud indices");
         for(int pass=0;pass<2;++pass) {
+            const auto range=restrictedCount==count?ranges[pass]:banks::VertexRange{0,count};
+            if(!range.count())continue;
             const auto& m=pass?scene:distant;
             for(int i=0;i<4;++i)constants[i]={m.m[0][i],m.m[1][i],m.m[2][i],m.m[3][i]};
             if(FAILED(hr=d->SetVertexShaderConstantF(0,constants[0].data(),UINT(constants.size()))))break;
             auto vp=viewport;if(!pass)vp.MinZ=vp.MaxZ;
             if(FAILED(hr=d->SetViewport(&vp)))break;
-            if(FAILED(hr=d->DrawIndexedPrimitive(D3DPT_TRIANGLELIST,0,0,count,UINT((banks::MaxVertices-count)/4*6),triangles)))break;
+            // Reversed IB: a subrange's last (farthest) vertex selects
+            // its first index. No primitives are reordered or split.
+            if(FAILED(hr=d->DrawIndexedPrimitive(D3DPT_TRIANGLELIST,0,range.begin,range.count(),
+                UINT((banks::MaxVertices-range.end)/4*6),restrictedCount==count?range.count()/2:triangles)))break;
         }
         const auto restore=d->SetViewport(&viewport);
         return FAILED(restore)?failed(restore,"cloud viewport restore"):failed(hr,"hardware cloud draw");
+    }
+};
+// Only used between capture/restore of one cloud group. All first uses
+// are sent to D3D (the game/mods may have changed anything). DrawUP/VS
+// changes don't touch these states. No cross-frame guesses or device gets.
+struct DrawState {
+    template<std::size_t N> struct Values {
+        std::array<DWORD,N> value;
+        std::bitset<N> known;
+        template<class Setter> HRESULT set(std::size_t index,DWORD v,Setter&& setter,unsigned& calls,unsigned& skipped) {
+            if(index<N&&known[index]&&value[index]==v){++skipped;return S_OK;}
+            ++calls;const HRESULT hr=setter();
+            if(SUCCEEDED(hr)&&index<N){known[index]=true;value[index]=v;}
+            return hr;
+        }
+    };
+    Values<256> render;
+    Values<4*33> stage;
+    Values<2*14> sampler;
+    unsigned calls=0,skipped=0;
+    HRESULT rs(IDirect3DDevice9* d,D3DRENDERSTATETYPE st,DWORD v) {
+        return render.set(unsigned(st),v,[&]{return d->SetRenderState(st,v);},calls,skipped);
+    }
+    HRESULT ts(IDirect3DDevice9* d,DWORD i,D3DTEXTURESTAGESTATETYPE st,DWORD v) {
+        return stage.set(i*33+unsigned(st),v,[&]{return d->SetTextureStageState(i,st,v);},calls,skipped);
+    }
+    HRESULT ss(IDirect3DDevice9* d,DWORD i,D3DSAMPLERSTATETYPE st,DWORD v) {
+        return sampler.set(i*14+unsigned(st),v,[&]{return d->SetSamplerState(i,st,v);},calls,skipped);
     }
 };
 inline Result drawRaw(IDirect3DDevice9* d,const std::array<IDirect3DBaseTexture9*,2>& textures,
                    const Options& opts,const void* vertices,UINT count,UINT stride,DWORD fvf,
                    const std::uint16_t* indices,UINT triangles,float coverage,bool fog,
                    bool projected,bool mipmaps,DWORD fogColor,
-                   const D3DMATRIX* view=nullptr,const D3DMATRIX* projection=nullptr,bool ownState=true,GpuPasses* gpu=nullptr) {
+                   const D3DMATRIX* view=nullptr,const D3DMATRIX* projection=nullptr,bool ownState=true,GpuPasses* gpu=nullptr,DrawState* states=nullptr) {
     if(!count||!triangles)return {};
     StateScope scoped;
+    if(ownState)states=nullptr; // a standalone scope may restore different states
     if(ownState){const auto capture=scoped.capture(d);if(!capture)return capture;}
     // CreateStateBlock already captures state, including on pure devices.
     // Do not use GetTransform, GetRenderState, etc., which pure devices prohibit.
     Result result;
     const auto check=[&](HRESULT hr,const char* op){if(!SUCCEEDED(hr)&&result)result=failed(hr,op);};
-    const auto rs=[&](D3DRENDERSTATETYPE st,DWORD value){check(d->SetRenderState(st,value),"SetRenderState");};
-    const auto ts=[&](DWORD stage,D3DTEXTURESTAGESTATETYPE st,DWORD value){check(d->SetTextureStageState(stage,st,value),"SetTextureStageState");};
-    const auto ss=[&](DWORD stage,D3DSAMPLERSTATETYPE st,DWORD value){check(d->SetSamplerState(stage,st,value),"SetSamplerState");};
+    const auto rs=[&](D3DRENDERSTATETYPE st,DWORD value){check(states?states->rs(d,st,value):d->SetRenderState(st,value),"SetRenderState");};
+    const auto ts=[&](DWORD stage,D3DTEXTURESTAGESTATETYPE st,DWORD value){check(states?states->ts(d,stage,st,value):d->SetTextureStageState(stage,st,value),"SetTextureStageState");};
+    const auto ss=[&](DWORD stage,D3DSAMPLERSTATETYPE st,DWORD value){check(states?states->ss(d,stage,st,value):d->SetSamplerState(stage,st,value),"SetSamplerState");};
     const auto world=identity();
     if(!projected)check(d->SetTransform(D3DTS_WORLD,&world),"SetTransform(WORLD)");
     if(view)check(d->SetTransform(D3DTS_VIEW,view),"SetTransform(VIEW)");
@@ -496,10 +543,10 @@ inline Result draw(IDirect3DDevice9* d,const std::array<IDirect3DVolumeTexture9*
 }
 inline Result drawProjected(IDirect3DDevice9* d,const std::array<IDirect3DBaseTexture9*,2>& textures,
                             const Options& opts,const ProjectedMesh& mesh,float coverage,bool volume,
-                            RGB fogColor,bool fog=true,bool ownState=true) {
+                            RGB fogColor,bool fog=true,bool ownState=true,DrawState* states=nullptr) {
     return drawRaw(d,textures,opts,mesh.vertices.data(),UINT(mesh.vertices.size()),sizeof(ScreenVertex),
         D3DFVF_XYZRHW|D3DFVF_DIFFUSE|D3DFVF_SPECULAR|D3DFVF_TEX1|D3DFVF_TEXCOORDSIZE3(0),
         mesh.indices.data(),UINT(mesh.indices.size()/3),coverage,fog&&opts.vertexFog,true,!volume&&opts.mip,
-        D3DCOLOR_XRGB(byte(fogColor.r),byte(fogColor.g),byte(fogColor.b)),nullptr,nullptr,ownState);
+        D3DCOLOR_XRGB(byte(fogColor.r),byte(fogColor.g),byte(fogColor.b)),nullptr,nullptr,ownState,nullptr,states);
 }
 } // namespace vc::d3d9

@@ -997,3 +997,50 @@ remained a credible source of the swimming seen in flight.
   support, depth sentinel and CPU/GPU parity remain CI gates. Verify
   cache hit/preload log and actual in-game stutter on the Celeron before
   claiming FPS or target hardware success.
+
+## Exact-output pass trimming and state/visibility optimization
+
+- Prior CI 46084519550 (2305562) passed 5 Linux and 6 Win32 tests:
+  real D3D9 pure-device A8L8 volume, canopy and atlas readbacks differed
+  from RGBA by at most 1 RGB level out of 255. Hardware-vs-CPU mean
+  error remained .032/.042/.070. Preloaded v2 cache 4,237,892 bytes.
+- This pass keeps texture bakes, cache version, lighting, defaults, LOD
+  and sampling lattice intact. GPU source mesh retains a contiguous
+  range + enclosing AABB per brick. Each of the complementary
+  projections identifies the first/last span that may survive its
+  homogeneous clipping plane; skip the fully clipped ends of the
+  existing reversed IB. Use double bounds plus conservative floating
+  dot-product guard, including cancellation in scene w-z. Ambiguous
+  spans and interior gaps are still hardware-clipped. Empty projection
+  can be skipped completely. Never reorder alpha slices or add draws.
+- D3D9 DrawState removes repeated render/sampler/texture-stage setters
+  exclusively within the existing captured cloud state scope. It does
+  not cache across frames, modify state-block lifetime, skip first
+  setters, or query pure-device state. Standalone draws bypass cache.
+  No cache for shader/declaration/texture transitions. Single-layer
+  ground render bypasses state dedup. Device reset unchanged.
+- Compute two constant axes of occupancy query once per brick; reuse
+  wrapped integer cells, skip duplicate root visibility test, sort
+  compact 16-byte patch descriptors directly with original tie order.
+  Ground canopy static topology/radii + reuse already computed vertex
+  distance for fog; skip zero-weight canopy and single-pass alpha
+  backup. Far atlas scratch persists; test strictly zero-fade radial
+  cells before square root with 1m endpoint guard. No changes to alpha.
+- Same-host 480 varying camera positions, default economy, 450m
+  scene far clip: packed GPU source 0.323 -> 0.250ms mesh only,
+  0.268ms including range selection; CPU fallback 0.918 -> 0.848ms.
+  Source CPU vertex+index hashes and packed GPU vertex hashes are
+  exactly unchanged. 7276 triangles and 14552 vertices average;
+  old two projections submit 29105 vertices average, new 19025
+  (-34.6%). Canopy 3.59 -> 3.12us, atlas 17.93 -> 12.33us on same
+  480 poses; canopy position/UV/alpha/topology and atlas buffer
+  hashes unchanged. No target-device FPS claim.
+- Native Win32 regression compares full and subrange hardware
+  submissions at scene clips 75/450/1800/12000m in clear, mixed
+  and overcast scenes. Requires exact RGB framebuffer parity,
+  long-clip distant pass omitted, and actual submission reduction.
+  Also compares complete multi-pass fixed-function state sequences
+  with/without dedup including 2D/3D, dual/single stages, fog and
+  sampler settings. Portable tests validate every AABB span and
+  omitted vertex against both clip sides. Keep any future changes
+  conservative and validate against full uncropped reference.

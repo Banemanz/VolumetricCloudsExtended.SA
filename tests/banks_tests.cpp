@@ -183,6 +183,32 @@ int main() {
         banks::buildMesh(hardware,s,test,r,wind,.94f,.53f,&b,w);
         CHECK(hardware.triangleCount()==raw.indices.size()/3&&hardware.vertices.size()==raw.vertices.size());
         for(std::size_t i=0;i<raw.vertices.size();++i)CHECK(length(hardware.vertices[i].pos-raw.vertices[i].pos)<.0001f);
+        // Every retained world vertex lies inside its contiguous brick span.
+        std::uint32_t next=0;
+        for(const auto& span:hardware.spans) {
+            CHECK(span.begin==next&&span.end>span.begin&&span.end<=hardware.vertices.size()&&span.end%4==0);
+            for(std::uint32_t i=span.begin;i<span.end;++i) {
+                const auto p=hardware.vertices[i].pos;
+                CHECK(p.x>=span.lo.x&&p.x<=span.hi.x&&p.y>=span.lo.y&&p.y<=span.hi.y&&p.z>=span.lo.z&&p.z<=span.hi.z);
+            }
+            next=span.end;
+        }
+        CHECK(next==hardware.vertices.size());
+        // Simulate both sides of several clip distances. The shortened
+        // intervals may overinclude but must never exclude a point inside.
+        for(float distance:{75.f,450.f,1800.f,12000.f})for(double sign:{-1.,1.}) {
+            const auto f=test.forward;
+            const double clip=double(distance)+double(dot(test.pos,f));
+            banks::ClipPlane plane{{sign*f.x,sign*f.y,sign*f.z,-sign*clip},
+                {std::abs(f.x),std::abs(f.y),std::abs(f.z),std::abs(clip)}};
+            const auto selection=hardware.rangeFor(plane);
+            CHECK(selection.begin<=selection.end&&selection.end<=hardware.vertices.size());
+            CHECK(selection.begin%4==0&&selection.end%4==0);
+            for(std::uint32_t i=0;i<hardware.vertices.size();++i)if(i<selection.begin||i>=selection.end) {
+                const auto p=hardware.vertices[i].pos;
+                CHECK(sign*(double(p.x)*f.x+double(p.y)*f.y+double(p.z)*f.z-clip)<0.);
+            }
+        }
     }
     std::cout<<"PASS: CPU and hardware source lattice and order are identical in 12 altitude/weather combinations\n";
 

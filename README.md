@@ -238,6 +238,16 @@ and [pure-device GetViewport documentation](https://learn.microsoft.com/en-us/wi
   all 7276 average triangles and 14552 vertices. Each hardware vertex is
   16 bytes instead of 28 (43% less streamed data); the static index buffer
   eliminates CPU index generation entirely on the hardware path.
+  The next optimization skips the portion of the reversed static index
+  buffer that lies wholly outside each pass's homogeneous clip plane.
+  Per-brick conservative bounds include a float precision guard; the
+  remaining submission keeps original order and crossing geometry, with
+  at most one draw per projection. No sampling or opacity changes.
+  On 480 moving poses with a 450m scene far clip, average hardware input
+  shrank from 29,105 to 19,025 vertices across both passes (-34.6%).
+  The GPU-input mesh (including range selection) took 0.268ms vs 0.323ms;
+  CPU fallback mesh 0.848ms vs 0.918ms on the local host. Both CPU and
+  hardware source buffers are byte-identical to the previous revision.
   The GPU still bears the fill-rate cost of translucent clouds.
   All generated textures are greyscale with independent 8-bit opacity:
   use lossless A8L8 when the device advertises the format and required
@@ -291,6 +301,8 @@ not a recreation of Rockstar assets or renderer. References:
 [GPU Gems 1, chapter 39: Volume Rendering Techniques](https://developer.nvidia.com/gpugems/gpugems/part-vi-beyond-triangles/chapter-39-volume-rendering-techniques),
 [Direct3D 9 volume textures](https://learn.microsoft.com/en-us/windows/win32/direct3d9/volume-texture-resources),
 [Direct3D 9 texture formats (A8L8)](https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dformat),
+[Direct3D 9 performance optimizations](https://learn.microsoft.com/en-us/windows/win32/direct3d9/performance-optimizations),
+[Indexed draw ranges](https://learn.microsoft.com/en-us/windows/win32/direct3d9/rendering-from-vertex-and-index-buffers),
 [Direct3D 9 resource management](https://learn.microsoft.com/en-us/windows/win32/direct3d9/managing-resources),
 [Unity community cloud renderer](https://github.com/jaagupku/volumetric-clouds)
 (weather mask, vertical profile, erosion), and

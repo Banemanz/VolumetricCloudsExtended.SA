@@ -197,10 +197,25 @@ struct Drift {
         x+=wind.x*k;y+=wind.y*k;x-=std::floor(x);y-=std::floor(y);
     }
 };
-struct Vertex { Vec pos;float u,v,alpha; };
+struct Vertex { Vec pos;float u,v,alpha,distance; };
+// The index order does not depend on the eye, wind, weather or altitude.
+constexpr auto topology() {
+    std::array<std::uint16_t,IndexCount> indices{};
+    int k=0;
+    const auto index=[](int ring,int j) { return std::uint16_t(1+(ring-1)*Segments+j%Segments); };
+    for(int j=0;j<Segments;++j) {
+        indices[k++]=0;indices[k++]=index(1,j);indices[k++]=index(1,j+1);
+    }
+    for(int i=2;i<=Rings;++i)for(int j=0;j<Segments;++j) {
+        const auto a=index(i-1,j),b=index(i-1,j+1),c=index(i,j),d=index(i,j+1);
+        indices[k++]=a;indices[k++]=c;indices[k++]=b;
+        indices[k++]=b;indices[k++]=c;indices[k++]=d;
+    }
+    return indices;
+}
 struct Mesh {
     std::array<Vertex,VertexCount> vertices{};
-    std::array<std::uint16_t,IndexCount> indices{};
+    static inline constexpr auto indices=topology();
 };
 inline const auto& directions() {
     static const auto d=[] {
@@ -247,24 +262,19 @@ inline Mesh mesh(const Settings& s,const View& v,const Range& r,const Drift& dri
         // The faint distant underlay follows the radial range; the actual
         // density field (or its volume-projected billboards) supplies shape.
         const float blend=mix(1.f,.22f*smooth((dist-r.end*.58f)/(r.end*.29f)),hybridFade);
-        return Vertex{p,originU+delta.x/tile,originV+delta.y/tile,a*strength*blend};
+        return Vertex{p,originU+delta.x/tile,originV+delta.y/tile,a*strength*blend,dist};
     };
     m.vertices[0]=vertex({},0);
+    static const auto radii=[] {
+        std::array<float,Rings> f{};
+        for(int ring=1;ring<=Rings;++ring)f[ring-1]=std::pow(float(ring)/Rings,1.65f);
+        return f;
+    }();
     for(int ring=1;ring<=Rings;++ring) {
-        // Denser rings close to the eye; this also localizes the flight fade.
-        const float f=std::pow(float(ring)/Rings,1.65f);
+        // Same nonuniform radial positions, computed once.
+        const float f=radii[ring-1];
         for(int j=0;j<Segments;++j)
             m.vertices[1+(ring-1)*Segments+j]=vertex(directions()[j]*(radius*f),f);
-    }
-    int k=0;
-    const auto index=[](int ring,int j) { return std::uint16_t(1+(ring-1)*Segments+j%Segments); };
-    for(int j=0;j<Segments;++j) {
-        m.indices[k++]=0;m.indices[k++]=index(1,j);m.indices[k++]=index(1,j+1);
-    }
-    for(int i=2;i<=Rings;++i) for(int j=0;j<Segments;++j) {
-        const auto a=index(i-1,j),b=index(i-1,j+1),c=index(i,j),d=index(i,j+1);
-        m.indices[k++]=a;m.indices[k++]=c;m.indices[k++]=b;
-        m.indices[k++]=b;m.indices[k++]=c;m.indices[k++]=d;
     }
     return m;
 }

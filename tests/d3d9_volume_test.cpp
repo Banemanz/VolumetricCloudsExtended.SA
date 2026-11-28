@@ -91,6 +91,13 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
             name,maxError,double(sum)/(3*actual.size()));
         return maxError<=2;
     };
+    const auto exact=[&](const char* name,const std::vector<DWORD>& expected)->bool {
+        std::vector<DWORD> actual;if(!capture(actual)||actual.size()!=expected.size())return false;
+        unsigned differences=0;
+        for(std::size_t i=0;i<actual.size();++i)differences+=((actual[i]^expected[i])&0x00FFFFFFu)!=0;
+        std::printf("%s: %u differing RGB pixels\n",name,differences);
+        return differences==0;
+    };
     for(float coverage:{0.f,.5f,1.f}) {
         if(coverage==.5f&&!opts.dual){std::puts("No dual-volume blend support; endpoints only.");continue;}
         if(FAILED(hr=device->Clear(0,nullptr,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER,0xFF000000,1.f,0)))
@@ -351,6 +358,36 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
             const float mean=float(error)/(3*desc.Width*desc.Height);
             std::printf("Hardware vertex readback: mean RGB error %.3f /255, %u pixels with >24 error\n",mean,large);
             if(mean>6.f||large>desc.Width*desc.Height/12)return fail("Hardware vertex visual parity");
+            // Compare actual clip-range submissions with the old full two
+            // passes, including a short map clip and an extended modded clip.
+            const auto renderHardware=[&](d3d9::GpuPasses& selected)->bool {
+                if(FAILED(device->Clear(0,nullptr,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER,0xFF000000,1.f,0)))return false;
+                if(FAILED(device->Clear(1,&sentinel,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER,0xFF008000,.5f,0)))return false;
+                if(FAILED(device->BeginScene()))return false;
+                const auto result=d3d9::drawRaw(device,{textures[0],textures[1]},opts,gm.vertices.data(),UINT(gm.vertices.size()),
+                    sizeof(banks::GpuVertex),0,nullptr,UINT(gm.triangleCount()),coverage,opts.vertexFog,true,false,
+                    D3DCOLOR_XRGB(90,120,160),nullptr,nullptr,true,&selected);
+                return SUCCEEDED(device->EndScene())&&bool(result);
+            };
+            std::size_t saved=0;
+            for(float sceneDistance:{75.f,450.f,1800.f,12000.f}) {
+                auto pr=projection;
+                pr._33=sceneDistance/(sceneDistance-camera.nearClip);
+                pr._43=-camera.nearClip*pr._33;
+                const auto mat=d3d9::multiply(view,pr);
+                d3d9::GpuPasses trimmed;trimmed.stream=&hw;
+                if(!trimmed.prepare(settings,camera,cloudRange(settings),{},true,opts.vertexFog,1,{208,208,208},mat,pr,viewport))return fail("Trim projection setup");
+                if(!renderHardware(trimmed))return fail("Full two-pass reference");
+                std::vector<DWORD> full;if(!capture(full))return fail("Full two-pass capture");
+                trimmed.restrictTo(gm);
+                const auto submitted=trimmed.ranges[0].count()+trimmed.ranges[1].count();
+                saved+=2*gm.vertices.size()-submitted;
+                if(!renderHardware(trimmed))return fail("Range-trimmed draw");
+                std::printf("Scene clip %.0f: %u of %zu two-pass input vertices\n",sceneDistance,submitted,2*gm.vertices.size());
+                if(!exact("Range-trimmed two-pass draw",full))return fail("Visual regression from pass range trimming");
+                if(sceneDistance==12000.f&&trimmed.ranges[0].count()!=0)return fail("Failed to omit empty distant pass");
+            }
+            if(!saved)return fail("Pass range trimming failed to reduce submissions");
         }
     }
     // Test the actual distant atlas + projected card pipeline on the pure
@@ -411,6 +448,34 @@ int run(IDirect3DDevice9* device,const D3DCAPS9& caps) {
         if(FAILED(hr=device->EndScene()))return fail("Compact atlas end",hr);
         if(!result)return fail(result.operation,result.hr);
         if(!compare("Distant cloud atlas",reference))return fail("Compact atlas visual parity");
+    }
+    // Compare a complete mixed sequence with and without the within-scope
+    // state cache. Includes stage 1/2 enable/disable, filter/fog toggles,
+    // different texture types and repeated coverage. Never use state getters.
+    std::vector<DWORD> uncached;
+    for(int fast=0;fast<2;++fast) {
+        if(FAILED(hr=device->Clear(0,nullptr,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER,0xFF000000,1.f,0)))return fail("State sequence clear",hr);
+        if(FAILED(hr=device->BeginScene()))return fail("State sequence begin",hr);
+        d3d9::StateScope scope;if(!scope.capture(device))return fail("State sequence capture");
+        d3d9::DrawState states;
+        auto* cache=fast?&states:nullptr;
+        for(int i=0;i<2;++i) {
+            const auto result=d3d9::drawProjected(device,{canopyTex.p,canopyTex.p},canopyOpts,projected,0,false,{90,120,160},true,false,cache);
+            if(!result)return fail(result.operation,result.hr);
+        }
+        for(float coverage:{.5f,1.f,0.f,.25f}) {
+            auto result=d3d9::drawProjected(device,{farTextures[0].p,farTextures[1].p},atlasOpts,farBatch,coverage,false,{90,120,160},true,false,cache);
+            if(!result)return fail(result.operation,result.hr);
+            result=d3d9::drawProjected(device,{textures[0],textures[1]},opts,projected,coverage,true,{90,120,160},false,false,cache);
+            if(!result)return fail(result.operation,result.hr);
+        }
+        if(!scope.restore())return fail("State sequence restore");
+        if(FAILED(hr=device->EndScene()))return fail("State sequence end",hr);
+        if(fast) {
+            if(!exact("Scoped render-state deduplication",uncached))return fail("State deduplication visual regression");
+            std::printf("State calls: %u of %u sent, %u skipped\n",states.calls,states.calls+states.skipped,states.skipped);
+            if(states.skipped<=states.calls)return fail("State deduplication failed to remove repeated calls");
+        } else if(!capture(uncached))return fail("Uncached state sequence readback");
     }
     return 0;
 }
