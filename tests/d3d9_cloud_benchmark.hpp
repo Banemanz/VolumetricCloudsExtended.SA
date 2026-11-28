@@ -64,7 +64,7 @@ inline int benchmark(IDirect3DDevice9* device,const D3DCAPS9& caps) {
     sheetOpts.filter=atlasOpts.filter=(caps.TextureFilterCaps&linear)==linear?D3DTEXF_LINEAR:D3DTEXF_POINT;
     sheetOpts.mip=(caps.TextureFilterCaps&D3DPTFILTERCAPS_MIPFLINEAR)!=0;atlasOpts.mip=false;
     std::array<IDirect3DVolumeTexture9*,2> bank{};
-    std::array<IDirect3DTexture9*,2> sheet{},far{};
+    std::array<IDirect3DTexture9*,2> sheet{},farAtlasTex{};
     // Put the textures under RAII even if a later pair fails.
     std::array<Owner<IDirect3DVolumeTexture9>,2> bankOwner;
     std::array<Owner<IDirect3DTexture9>,2> sheetOwner,farOwner;
@@ -81,11 +81,11 @@ inline int benchmark(IDirect3DDevice9* device,const D3DCAPS9& caps) {
         });
     for(int i=0;i<2;++i)sheetOwner[i].p=sheet[i];
     if(!c)return 1;
-    const auto a=uploadPair(far,compactFormat(device,D3DRTYPE_TEXTURE,atlasOpts.filter==D3DTEXF_LINEAR),ff,
+    const auto a=uploadPair(farAtlasTex,compactFormat(device,D3DRTYPE_TEXTURE,atlasOpts.filter==D3DTEXF_LINEAR),ff,
         [&](int i,IDirect3DTexture9** out,bool managed,D3DFORMAT f){
             return uploadCanopy(device,atlas.pixels[i],billboards::AtlasSize,out,managed,false,f);
         });
-    for(int i=0;i<2;++i)farOwner[i].p=far[i];
+    for(int i=0;i<2;++i)farOwner[i].p=farAtlasTex[i];
     if(!a)return 1;
     GpuStream hw;
     const bool hardware=hw.create(device,caps,creation.BehaviorFlags);
@@ -162,14 +162,14 @@ inline int benchmark(IDirect3DDevice9* device,const D3DCAPS9& caps) {
             if(samples&&FAILED(occlusion.p->Issue(D3DISSUE_BEGIN)))return 1;
             const auto submittedStart=Clock::now();
             if(!scoped.capture(device))return 1;
-            DrawState states;
+            vc::d3d9::DrawState states;
             if(!drawProjected(device,{sheet[0],sheet[1]},sheetOpts,ps,coverage,false,fog,true,false,&states))return 1;
-            if(!drawProjected(device,{far[0],far[1]},atlasOpts,pa,coverage,false,fog,true,false,&states))return 1;
+            if(!drawProjected(device,{farAtlasTex[0],farAtlasTex[1]},atlasOpts,pa,coverage,false,fog,true,false,&states))return 1;
             bool reused=false;
             if(useGpu&&n) {
                 if(!hw.uploadReusable(gpu,&reused))return 1;
                 if(!drawRaw(device,{bank[0],bank[1]},bankOpts,nullptr,n,sizeof(banks::GpuVertex),0,nullptr,nt,
-                    coverage,bankOpts.vertexFog,true,false,D3DCOLOR_XRGB(byte(fog.r),byte(fog.g),byte(fog.b)),
+                    coverage,bankOpts.vertexFog,true,false,D3DCOLOR_XRGB(vc::d3d9::byte(fog.r),vc::d3d9::byte(fog.g),vc::d3d9::byte(fog.b)),
                     nullptr,nullptr,false,&passes,&states))return 1;
             } else if(!useGpu&&nt) {
                 if(!drawProjected(device,{bank[0],bank[1]},bankOpts,pb,coverage,true,fog,true,false,&states))return 1;
